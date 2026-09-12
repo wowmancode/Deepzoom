@@ -160,5 +160,4 @@ class ExportManager(private val view: MandelbrotView) {
             else -> screenAspect
         }
     }
-    }
 }

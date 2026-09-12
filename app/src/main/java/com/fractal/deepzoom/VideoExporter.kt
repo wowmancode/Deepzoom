@@ -117,7 +117,8 @@ class VideoExporter(
         var best: Pair<Int, Int>? = null
         for (p in caps.profileLevels) {
             if (p.profile == MediaCodecInfo.CodecProfileLevel.AVCProfileHigh) {
-                if (best == null || p.level > best!!.second) {
+                val current = best
+                if (current == null || p.level > current.second) {
                     best = Pair(p.profile, p.level)
                 }
             }

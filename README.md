@@ -141,6 +141,14 @@ Other optimisations:
   slow on mobile GPUs. Texture widths are powers of two specifically for this.
 - **Analytic interior tests** for the main cardioid and period-2 bulb.
 
+### Verification
+
+`tools/validate_bla.py` mirrors the Kotlin BLA construction and the GLSL iteration
+loop in Python, then checks escape counts against arbitrary-precision ground truth.
+It is what the epsilon choice above is based on, and it is worth re-running if the
+table construction or the shader loop is ever changed — a wrong merge formula produces
+images that look plausible rather than obviously broken.
+
 ### Going deeper than 1e60
 
 The limit is float32 exponent range, not the algorithm. Past this point deltas need
