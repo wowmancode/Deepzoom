@@ -5,8 +5,7 @@ import android.opengl.GLSurfaceView
 import android.util.AttributeSet
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
-import kotlin.math.max
-import kotlin.math.roundToInt
+
 
 class MandelbrotView @JvmOverloads constructor(
     context: Context,
@@ -17,18 +16,25 @@ class MandelbrotView @JvmOverloads constructor(
     val renderer = MandelbrotRenderer(state)
 
     /**
-     * Fraction of native resolution rendered when idle. The GL surface is genuinely
-     * allocated at this size and the display hardware upscales it, so this is real
-     * work avoided rather than a render-then-downsample.
+     * Highest resolution the fractal is rendered at, as a power-of-two step below the
+     * screen: 0 is native, 1 is half, 2 is quarter, 3 is eighth.
+     *
+     * Rendering now happens into an offscreen target rather than by resizing the
+     * surface, so changing this no longer reallocates anything.
      */
-    var renderScale: Float = 1.0f
+    var finestLevel: Int
+        get() = renderer.finestLevel
         set(value) {
-            field = value.coerceIn(0.1f, 1.0f)
-            applySurfaceSize(field)
+            renderer.finestLevel = value
+            requestRender()
         }
 
-    /** Extra reduction applied while a gesture is in flight. */
-    var interactiveScale: Float = 0.5f
+    var motionQuality: Int
+        get() = renderer.motionQuality
+        set(value) {
+            renderer.motionQuality = value
+            requestRender()
+        }
 
     var onViewChanged: (() -> Unit)? = null
 
@@ -53,20 +59,6 @@ class MandelbrotView @JvmOverloads constructor(
         isFocusable = true
     }
 
-    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
-        super.onSizeChanged(w, h, oldw, oldh)
-        applySurfaceSize(if (gesturing) renderScale * interactiveScale else renderScale)
-    }
-
-    private fun applySurfaceSize(scale: Float) {
-        if (width == 0 || height == 0) return
-        holder.setFixedSize(
-            max(1, (width * scale).roundToInt()),
-            max(1, (height * scale).roundToInt())
-        )
-        requestRender()
-    }
-
     // --- Gestures ---------------------------------------------------------------------
     // All touch maths happens in view pixels and plain doubles. Offsets within a frame
     // are small even at extreme depth, so only the accumulated centre needs BigDecimal.
@@ -89,6 +81,7 @@ class MandelbrotView @JvmOverloads constructor(
 
         state.panBy(dxPix * perPixel, -dyPix * perPixel)
 
+        renderer.markDirty()
         requestRender()
         onViewChanged?.invoke()
     }
@@ -144,18 +137,23 @@ class MandelbrotView @JvmOverloads constructor(
     private fun beginGesture() {
         if (gesturing) return
         gesturing = true
-        applySurfaceSize(renderScale * interactiveScale)
+        renderer.interactive = true
+        renderer.resetAdaptive()
     }
 
     private fun endGesture() {
         if (!gesturing) return
         gesturing = false
-        applySurfaceSize(renderScale)
+        renderer.interactive = false
+        // Refine back up to the target resolution now that nothing is moving.
+        renderer.markDirty()
+        requestRender()
     }
 
     fun resetView() {
         state.reset()
         renderer.invalidateOrbit()
+        renderer.markDirty()
         requestRender()
         onViewChanged?.invoke()
     }
@@ -164,12 +162,14 @@ class MandelbrotView @JvmOverloads constructor(
     fun applyState(target: ViewState) {
         state.copyFrom(target)
         renderer.invalidateOrbit()
+        renderer.markDirty()
         requestRender()
         onViewChanged?.invoke()
     }
 
     fun setMaxIter(value: Int) {
         state.maxIter = value
+        renderer.markDirty()
         requestRender()
         onViewChanged?.invoke()
     }

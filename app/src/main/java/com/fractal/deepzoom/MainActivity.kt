@@ -28,6 +28,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var controls: View
     private lateinit var iterSlider: Slider
     private lateinit var resSlider: Slider
+    private lateinit var motionSlider: Slider
+    private lateinit var motionLabel: TextView
     private lateinit var readout: TextView
     private lateinit var status: TextView
     private lateinit var exporter: ExportManager
@@ -43,6 +45,8 @@ class MainActivity : AppCompatActivity() {
         controls = findViewById(R.id.controls)
         iterSlider = findViewById(R.id.iter_slider)
         resSlider = findViewById(R.id.res_slider)
+        motionSlider = findViewById(R.id.motion_slider)
+        motionLabel = findViewById(R.id.motion_label)
         readout = findViewById(R.id.readout)
         status = findViewById(R.id.status)
         exporter = ExportManager(view)
@@ -59,19 +63,33 @@ class MainActivity : AppCompatActivity() {
             wake()
         }
 
-        resSlider.valueFrom = 0.25f
-        resSlider.valueTo = 1.0f
-        resSlider.stepSize = 0.125f
-        resSlider.value = 1.0f
+        // Discrete power-of-two steps below native. Anything in between would mean
+        // resampling, and the whole point of this control is sharpness.
+        resSlider.valueFrom = 0f
+        resSlider.valueTo = 3f
+        resSlider.stepSize = 1f
+        resSlider.value = 0f
         resSlider.addOnChangeListener { _, v, _ ->
-            view.renderScale = v
+            view.finestLevel = v.toInt()
             updateReadout()
             wake()
         }
 
+        motionSlider.valueFrom = 0f
+        motionSlider.valueTo = 2f
+        motionSlider.stepSize = 1f
+        motionSlider.value = 1f
+        motionSlider.addOnChangeListener { _, v, _ ->
+            view.motionQuality = v.toInt()
+            updateMotionLabel()
+            wake()
+        }
+        updateMotionLabel()
+
         findViewById<Button>(R.id.reset).setOnClickListener {
             view.resetView()
             iterSlider.value = 9f
+            resSlider.value = 0f
             wake()
         }
         findViewById<Button>(R.id.colors).setOnClickListener { showPaletteDialog() }
@@ -101,10 +119,24 @@ class MainActivity : AppCompatActivity() {
     @SuppressLint("SetTextI18n")
     private fun updateReadout() {
         val mode = if (view.state.needsPerturbation()) "perturbed" else "direct"
-        readout.text = "Zoom 1e%.1f  ·  %d iter  ·  %d%%  ·  %s".format(
-            view.state.zoomDepth(), view.state.maxIter,
-            (view.renderScale * 100).roundToInt(), mode
+        val res = when (view.finestLevel) {
+            0 -> "native"
+            1 -> "1/2"
+            2 -> "1/4"
+            else -> "1/8"
+        }
+        readout.text = "Zoom 1e%.1f  ·  %d iter  ·  %s  ·  %s".format(
+            view.state.zoomDepth(), view.state.maxIter, res, mode
         )
+    }
+
+    @SuppressLint("SetTextI18n")
+    private fun updateMotionLabel() {
+        motionLabel.text = "While moving — " + when (view.motionQuality) {
+            MandelbrotRenderer.QUALITY_FULL -> "always full resolution"
+            MandelbrotRenderer.QUALITY_FAST -> "always fast"
+            else -> "full unless frames get slow"
+        }
     }
 
     private fun wake() {

@@ -108,6 +108,44 @@ object Shaders {
         }
     """.trimIndent()
 
+
+    /**
+     * Presents an already-rendered frame, optionally reprojected.
+     *
+     * While a gesture is in progress the fractal is not recomputed at all. The last
+     * completed frame is resampled according to how far the view has moved since it was
+     * made, which costs one texture fetch per pixel instead of a full iteration loop.
+     * Panning and pinching therefore run at the same speed whatever the depth or the
+     * iteration count.
+     */
+    val BLIT = """
+        #version 310 es
+        precision highp float;
+        precision highp sampler2D;
+
+        out vec4 fragColor;
+
+        uniform sampler2D uScene;
+        uniform vec2  uResolution;
+        uniform vec2  uValidFrac;   // portion of the scene texture actually rendered
+        uniform vec2  uShift;       // view movement since the frame was made
+        uniform float uZoom;        // span ratio since the frame was made
+        uniform vec3  uBackground;
+
+        void main() {
+            vec2 s = gl_FragCoord.xy / uResolution;
+            vec2 q = vec2(0.5) + uShift + (s - vec2(0.5)) * uZoom;
+
+            // Anything the old frame never covered stays background rather than
+            // smearing the edge pixels across newly exposed area.
+            if (any(lessThan(q, vec2(0.0))) || any(greaterThan(q, vec2(1.0)))) {
+                fragColor = vec4(uBackground, 1.0);
+                return;
+            }
+            fragColor = vec4(texture(uScene, q * uValidFrac).rgb, 1.0);
+        }
+    """.trimIndent()
+
     /**
      * Perturbation, with rebasing and bivariate linear approximation.
      *

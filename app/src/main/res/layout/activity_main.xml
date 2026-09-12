@@ -73,6 +73,22 @@
             app:trackColorActive="#7FA6D8"
             app:trackColorInactive="#2A2F38" />
 
+        <TextView
+            android:id="@+id/motion_label"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:textColor="#8A93A3"
+            android:textSize="12sp" />
+
+        <com.google.android.material.slider.Slider
+            android:id="@+id/motion_slider"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            app:labelBehavior="gone"
+            app:thumbColor="#E4E8F0"
+            app:trackColorActive="#7FA6D8"
+            app:trackColorInactive="#2A2F38" />
+
         <HorizontalScrollView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"

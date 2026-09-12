@@ -10,6 +10,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 import kotlin.math.ceil
+import kotlin.math.max
 import kotlin.math.min
 
 /** An orbit together with the zoom-dependent data derived from it. */
@@ -29,7 +30,40 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
 
     private var directProgram = 0
     private var perturbProgram = 0
+    private var blitProgram = 0
     private var vao = 0
+
+    // The scene is rendered here, possibly at reduced size, and presented from here.
+    // Keeping the last completed frame around is what makes gestures free.
+    private var sceneFbo = 0
+    private var sceneTex = 0
+    private var sceneW = 0
+    private var sceneH = 0
+
+    private var snapValid = false
+    private var snapCenterX: java.math.BigDecimal = java.math.BigDecimal.ZERO
+    private var snapCenterY: java.math.BigDecimal = java.math.BigDecimal.ZERO
+    private var snapSpanY = 1.0
+    private var snapW = 0
+    private var snapH = 0
+
+    /** Levels are powers of two below native: 3 is eighth-size, 0 is native. */
+    private var refineLevel = -1
+    var finestLevel: Int = 0
+        set(value) {
+            field = value.coerceIn(0, 3)
+            markDirty()
+        }
+
+    @Volatile var interactive = false
+
+    /** 0 = always native, 1 = drop resolution only if frames get slow, 2 = always fast. */
+    @Volatile var motionQuality: Int = QUALITY_ADAPTIVE
+
+    // Adaptive state. Only consulted while moving, and it walks back to native as soon
+    // as frames are cheap again.
+    private var adaptiveLevel = 0
+    private var lastRenderMs = 0.0
 
     private var orbitTexture = 0
     private var blaAbTexture = 0
@@ -59,6 +93,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
 
     private val direct = HashMap<String, Int>()
     private val perturb = HashMap<String, Int>()
+    private val blit = HashMap<String, Int>()
 
     private var fbo = 0
     private var fboTex = 0
@@ -83,6 +118,10 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
             "uBlaLevels", "uBlaOffset[0]", "uBlaCount[0]", "uDeltaCenter", "uPixelSpan",
             "uInvScale", "uBailoutScaled")
 
+        blitProgram = buildProgram(Shaders.VERTEX, Shaders.BLIT)
+        cacheUniforms(blitProgram, blit,
+            "uScene", "uResolution", "uValidFrac", "uShift", "uZoom", "uBackground")
+
         val ids = IntArray(1)
         GLES31.glGenVertexArrays(1, ids, 0)
         vao = ids[0]
@@ -101,6 +140,10 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         paletteDirty = true
         fbo = 0
         fboW = 0
+        sceneFbo = 0
+        sceneW = 0
+        snapValid = false
+        markDirty()
     }
 
     /** Data arrays addressed in 2D. Any filtering would be corruption. */
@@ -131,26 +174,190 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         surfaceW = width
         surfaceH = height
         GLES31.glViewport(0, 0, width, height)
+        ensureSceneTarget(width, height)
+        snapValid = false
+        markDirty()
     }
 
+    /** Restart progressive refinement from the coarsest level. */
+    fun markDirty() {
+        refineLevel = min(3, finestLevel + COARSE_STEPS)
+    }
+
+    /** Called when a gesture starts, so adaptation begins from the native target. */
+    fun resetAdaptive() {
+        adaptiveLevel = finestLevel
+    }
+
+    fun lastFrameMs(): Double = lastRenderMs
+
     override fun onDrawFrame(unused: GL10?) {
-        GLES31.glClear(GLES31.GL_COLOR_BUFFER_BIT)
         uploadPaletteIfDirty()
 
         pending?.let {
             pending = null
             active = it
             upload(it.gpu)
+            markDirty()
         }
+
+        // Resolution while moving. Full res is the default target: at this point a
+        // frame is mostly texture fetches and a short BLA loop, so native usually
+        // sustains interactive rates. The adaptive mode only gives ground when the
+        // measured frame time says it has to, and takes it straight back.
+        if (interactive) {
+            val level = motionLevel()
+            renderSceneAtLevel(level, measure = motionQuality == QUALITY_ADAPTIVE)
+            presentScene(reproject = false)
+            return
+        }
+
+        if (refineLevel < 0) {
+            if (snapValid) presentScene(reproject = true) else GLES31.glClear(GLES31.GL_COLOR_BUFFER_BIT)
+            return
+        }
+
+        renderSceneAtLevel(refineLevel, measure = false)
+        presentScene(reproject = false)
+
+        // Step down one level per frame. The coarse pass appears almost immediately and
+        // each refinement replaces it, so the wait for native resolution is hidden
+        // behind something already on screen.
+        refineLevel = if (refineLevel > finestLevel) refineLevel - 1 else -1
+        if (refineLevel >= 0) requestRender?.invoke()
+    }
+
+    private fun ensureSceneTarget(w: Int, h: Int) {
+        if (sceneW == w && sceneH == h && sceneFbo != 0) return
+        releaseSceneTarget()
+
+        val ids = IntArray(1)
+        GLES31.glGenTextures(1, ids, 0)
+        sceneTex = ids[0]
+        GLES31.glBindTexture(GLES31.GL_TEXTURE_2D, sceneTex)
+        GLES31.glTexImage2D(
+            GLES31.GL_TEXTURE_2D, 0, GLES31.GL_RGBA8, w, h, 0,
+            GLES31.GL_RGBA, GLES31.GL_UNSIGNED_BYTE, null
+        )
+        // Linear so coarse passes upscale smoothly rather than showing blocks.
+        GLES31.glTexParameteri(GLES31.GL_TEXTURE_2D, GLES31.GL_TEXTURE_MIN_FILTER, GLES31.GL_LINEAR)
+        GLES31.glTexParameteri(GLES31.GL_TEXTURE_2D, GLES31.GL_TEXTURE_MAG_FILTER, GLES31.GL_LINEAR)
+        GLES31.glTexParameteri(GLES31.GL_TEXTURE_2D, GLES31.GL_TEXTURE_WRAP_S, GLES31.GL_CLAMP_TO_EDGE)
+        GLES31.glTexParameteri(GLES31.GL_TEXTURE_2D, GLES31.GL_TEXTURE_WRAP_T, GLES31.GL_CLAMP_TO_EDGE)
+
+        GLES31.glGenFramebuffers(1, ids, 0)
+        sceneFbo = ids[0]
+        GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, sceneFbo)
+        GLES31.glFramebufferTexture2D(
+            GLES31.GL_FRAMEBUFFER, GLES31.GL_COLOR_ATTACHMENT0,
+            GLES31.GL_TEXTURE_2D, sceneTex, 0
+        )
+        GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, 0)
+
+        sceneW = w
+        sceneH = h
+    }
+
+    private fun releaseSceneTarget() {
+        val ids = IntArray(1)
+        if (sceneFbo != 0) { ids[0] = sceneFbo; GLES31.glDeleteFramebuffers(1, ids, 0); sceneFbo = 0 }
+        if (sceneTex != 0) { ids[0] = sceneTex; GLES31.glDeleteTextures(1, ids, 0); sceneTex = 0 }
+        sceneW = 0; sceneH = 0
+    }
+
+    private fun motionLevel(): Int = when (motionQuality) {
+        QUALITY_FULL -> finestLevel
+        QUALITY_FAST -> min(3, finestLevel + 2)
+        else -> adaptiveLevel.coerceIn(finestLevel, min(3, finestLevel + 3))
+    }
+
+    /**
+     * Frame timing needs glFinish to mean anything — without it the call returns long
+     * before the GPU has done the work, and the adaptation would chase noise. The stall
+     * costs a little pipelining, which is a fair trade for not guessing.
+     */
+    private fun updateAdaptive(startNs: Long) {
+        GLES31.glFinish()
+        lastRenderMs = (System.nanoTime() - startNs) / 1e6
+        if (lastRenderMs > SLOW_FRAME_MS) {
+            adaptiveLevel = min(adaptiveLevel + 1, min(3, finestLevel + 3))
+        } else if (lastRenderMs < FAST_FRAME_MS) {
+            adaptiveLevel = max(adaptiveLevel - 1, finestLevel)
+        }
+    }
+
+    /** Renders the fractal into the lower-left sub-rect of the scene texture. */
+    private fun renderSceneAtLevel(level: Int, measure: Boolean) {
+        val startNs = if (measure) System.nanoTime() else 0L
+        ensureSceneTarget(surfaceW, surfaceH)
+        val w = max(1, surfaceW shr level)
+        val h = max(1, surfaceH shr level)
+
+        GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, sceneFbo)
+        GLES31.glViewport(0, 0, w, h)
+        GLES31.glClear(GLES31.GL_COLOR_BUFFER_BIT)
 
         if (state.needsPerturbation()) {
             ensureBundleAsync()
             val b = active
-            if (b != null) drawPerturbation(state, b, surfaceW, surfaceH)
-            else drawDirect(state, surfaceW, surfaceH)
+            if (b != null) drawPerturbation(state, b, w, h) else drawDirect(state, w, h)
         } else {
-            drawDirect(state, surfaceW, surfaceH)
+            drawDirect(state, w, h)
         }
+
+        GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, 0)
+        GLES31.glViewport(0, 0, surfaceW, surfaceH)
+        if (measure) updateAdaptive(startNs)
+
+        snapCenterX = state.centerX
+        snapCenterY = state.centerY
+        snapSpanY = state.spanY
+        snapW = w
+        snapH = h
+        snapValid = true
+    }
+
+    /**
+     * Draws the scene texture to the screen.
+     *
+     * When reprojecting, the shift and zoom describe how far the view has moved since
+     * the frame was rendered. The centre difference is tiny in absolute terms even at
+     * extreme depth, so plain doubles carry it safely.
+     */
+    private fun presentScene(reproject: Boolean) {
+        if (!snapValid || sceneTex == 0) return
+
+        var shiftX = 0.0
+        var shiftY = 0.0
+        var zoom = 1.0
+        if (reproject) {
+            val mc = state.mathContext
+            val spanX = snapSpanY * (surfaceW.toDouble() / surfaceH)
+            shiftX = state.centerX.subtract(snapCenterX, mc).toDouble() / spanX
+            shiftY = state.centerY.subtract(snapCenterY, mc).toDouble() / snapSpanY
+            zoom = state.spanY / snapSpanY
+        }
+
+        GLES31.glUseProgram(blitProgram)
+        GLES31.glBindVertexArray(vao)
+        GLES31.glUniform2f(blit["uResolution"]!!, surfaceW.toFloat(), surfaceH.toFloat())
+        GLES31.glUniform2f(
+            blit["uValidFrac"]!!,
+            snapW.toFloat() / sceneW, snapH.toFloat() / sceneH
+        )
+        GLES31.glUniform2f(blit["uShift"]!!, shiftX.toFloat(), shiftY.toFloat())
+        GLES31.glUniform1f(blit["uZoom"]!!, zoom.toFloat())
+        val p = palette
+        GLES31.glUniform3f(
+            blit["uBackground"]!!,
+            ((p.interior shr 16) and 0xFF) / 255f,
+            ((p.interior shr 8) and 0xFF) / 255f,
+            (p.interior and 0xFF) / 255f
+        )
+        bindTexture(4, sceneTex, blit["uScene"]!!)
+
+        GLES31.glDrawArrays(GLES31.GL_TRIANGLES, 0, 3)
+        GLES31.glBindVertexArray(0)
     }
 
     // --- Draw paths -------------------------------------------------------------------
@@ -557,5 +764,17 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         const val MAX_POINTS = 1024 * 128
         const val MAX_BLA_ENTRIES = 1024 * 256
         const val BAILOUT = 8.0
+
+        /** How many extra coarse passes precede the final one. */
+        const val COARSE_STEPS = 2
+
+        const val QUALITY_FULL = 0
+        const val QUALITY_ADAPTIVE = 1
+        const val QUALITY_FAST = 2
+
+        // Roughly 30 fps and 60 fps. Backing off above one and recovering below the
+        // other leaves a gap so the level does not oscillate every frame.
+        private const val SLOW_FRAME_MS = 33.0
+        private const val FAST_FRAME_MS = 15.0
     }
 }

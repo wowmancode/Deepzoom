@@ -12,8 +12,9 @@ fragment shader; the CPU only tracks view state and uploads four uniforms per fr
   size and the display hardware upscales it, so lowering it is a real cost saving
 - Controls fade back after a couple of seconds so they stop competing with the image
 
-Rendering is on-demand (`RENDERMODE_WHEN_DIRTY`), and drops to half the chosen
-resolution while a gesture is in progress.
+Rendering is on-demand (`RENDERMODE_WHEN_DIRTY`). A fresh view is drawn coarse first
+and refined to the target over the next couple of frames, so something is on screen
+immediately and the wait for native resolution happens behind it.
 
 ## Building
 
@@ -160,6 +161,24 @@ Other optimisations:
 - **Mask-and-shift table indexing** instead of integer division and modulo, which are
   slow on mobile GPUs. Texture widths are powers of two specifically for this.
 - **Analytic interior tests** for the main cardioid and period-2 bulb.
+### Resolution
+
+At native resolution a modern phone screen is three to four million pixels, each
+running the iteration loop, so pixel count rather than pixel cost is what limits the
+frame rate now.
+
+The fractal is rendered into an offscreen target and presented through a second pass,
+rather than by resizing the surface as before. That makes the render resolution
+independent of the window, so changing it reallocates nothing, and it allows a coarse
+pass to be shown while a finer one is still coming.
+
+While moving, the default is to render at full resolution and only give ground if the
+measured frame time says it must — backing off a power of two above ~33 ms and
+recovering below ~15 ms, with the gap between those keeping it from oscillating. The
+measurement uses `glFinish`, because without it the draw call returns long before the
+GPU has finished and the adaptation would be chasing noise. Both extremes are available
+directly if you would rather not have it decide: always-native or always-fast.
+
 - **Parallel YUV conversion** during video export. It is the dominant CPU cost per
   frame and every row is independent, so it is split across all cores.
 
