@@ -30,7 +30,15 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
 
     private var directProgram = 0
     private var perturbProgram = 0
+    private var directTileProgram = 0
+    private var perturbTileProgram = 0
     private var blitProgram = 0
+
+    // One texel per tile: 1 means the border pass proved the tile entirely interior.
+    private var tileFbo = 0
+    private var tileTex = 0
+    private var tileTexW = 0
+    private var tileTexH = 0
     private var vao = 0
 
     // The scene is rendered here, possibly at reduced size, and presented from here.
@@ -94,6 +102,8 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
     private val direct = HashMap<String, Int>()
     private val perturb = HashMap<String, Int>()
     private val blit = HashMap<String, Int>()
+    private val directTile = HashMap<String, Int>()
+    private val perturbTile = HashMap<String, Int>()
 
     private var fbo = 0
     private var fboTex = 0
@@ -109,14 +119,13 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         directProgram = buildProgram(Shaders.VERTEX, Shaders.DIRECT)
         perturbProgram = buildProgram(Shaders.VERTEX, Shaders.PERTURBATION)
 
-        cacheUniforms(directProgram, direct,
-            "uResolution", "uMaxIter", "uPalette", "uCycle", "uOffset", "uInterior",
-            "uCenter", "uSpanY")
-        cacheUniforms(perturbProgram, perturb,
-            "uResolution", "uMaxIter", "uPalette", "uCycle", "uOffset", "uInterior",
-            "uOrbit", "uBlaAB", "uBlaR", "uWidthMask", "uWidthShift", "uOrbitLen",
-            "uBlaLevels", "uBlaOffset[0]", "uBlaCount[0]", "uDeltaCenter", "uPixelSpan",
-            "uInvScale", "uBailoutScaled")
+        cacheUniforms(directProgram, direct, *DIRECT_UNIFORMS)
+        cacheUniforms(perturbProgram, perturb, *PERTURB_UNIFORMS)
+
+        directTileProgram = buildProgram(Shaders.VERTEX, Shaders.DIRECT_TILE)
+        perturbTileProgram = buildProgram(Shaders.VERTEX, Shaders.PERTURB_TILE)
+        cacheUniforms(directTileProgram, directTile, *DIRECT_UNIFORMS)
+        cacheUniforms(perturbTileProgram, perturbTile, *PERTURB_UNIFORMS)
 
         blitProgram = buildProgram(Shaders.VERTEX, Shaders.BLIT)
         cacheUniforms(blitProgram, blit,
@@ -142,6 +151,8 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         fboW = 0
         sceneFbo = 0
         sceneW = 0
+        tileFbo = 0
+        tileTexW = 0
         snapValid = false
         markDirty()
     }
@@ -258,6 +269,43 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         sceneH = h
     }
 
+    /** One texel per tile, sized for the largest frame we might render. */
+    private fun ensureTileTarget() = ensureTileTargetFor(surfaceW, surfaceH)
+
+    private fun ensureTileTargetFor(frameW: Int, frameH: Int) {
+        val w = (frameW + TILE_SIZE - 1) / TILE_SIZE
+        val h = (frameH + TILE_SIZE - 1) / TILE_SIZE
+        if (tileTexW == w && tileTexH == h && tileFbo != 0) return
+
+        val ids = IntArray(1)
+        if (tileFbo != 0) { ids[0] = tileFbo; GLES31.glDeleteFramebuffers(1, ids, 0) }
+        if (tileTex != 0) { ids[0] = tileTex; GLES31.glDeleteTextures(1, ids, 0) }
+
+        GLES31.glGenTextures(1, ids, 0)
+        tileTex = ids[0]
+        GLES31.glBindTexture(GLES31.GL_TEXTURE_2D, tileTex)
+        GLES31.glTexImage2D(
+            GLES31.GL_TEXTURE_2D, 0, GLES31.GL_R8, w, h, 0,
+            GLES31.GL_RED, GLES31.GL_UNSIGNED_BYTE, null
+        )
+        GLES31.glTexParameteri(GLES31.GL_TEXTURE_2D, GLES31.GL_TEXTURE_MIN_FILTER, GLES31.GL_NEAREST)
+        GLES31.glTexParameteri(GLES31.GL_TEXTURE_2D, GLES31.GL_TEXTURE_MAG_FILTER, GLES31.GL_NEAREST)
+        GLES31.glTexParameteri(GLES31.GL_TEXTURE_2D, GLES31.GL_TEXTURE_WRAP_S, GLES31.GL_CLAMP_TO_EDGE)
+        GLES31.glTexParameteri(GLES31.GL_TEXTURE_2D, GLES31.GL_TEXTURE_WRAP_T, GLES31.GL_CLAMP_TO_EDGE)
+
+        GLES31.glGenFramebuffers(1, ids, 0)
+        tileFbo = ids[0]
+        GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, tileFbo)
+        GLES31.glFramebufferTexture2D(
+            GLES31.GL_FRAMEBUFFER, GLES31.GL_COLOR_ATTACHMENT0,
+            GLES31.GL_TEXTURE_2D, tileTex, 0
+        )
+        GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, 0)
+
+        tileTexW = w
+        tileTexH = h
+    }
+
     private fun releaseSceneTarget() {
         val ids = IntArray(1)
         if (sceneFbo != 0) { ids[0] = sceneFbo; GLES31.glDeleteFramebuffers(1, ids, 0); sceneFbo = 0 }
@@ -293,16 +341,35 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         val w = max(1, surfaceW shr level)
         val h = max(1, surfaceH shr level)
 
+        // Tile pass first: classify which tiles are entirely interior, so the main
+        // pass can fill them without iterating. Only worth it once the frame is big
+        // enough that the perimeter is a small fraction of the tile.
+        val tiles = w >= TILE_MIN_WIDTH
+        val bundle = if (state.needsPerturbation()) {
+            ensureBundleAsync()
+            active
+        } else null
+
+        if (tiles) {
+            val tw = (w + TILE_SIZE - 1) / TILE_SIZE
+            val th = (h + TILE_SIZE - 1) / TILE_SIZE
+            ensureTileTarget()
+            GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, tileFbo)
+            GLES31.glViewport(0, 0, tw, th)
+            GLES31.glClear(GLES31.GL_COLOR_BUFFER_BIT)
+            if (bundle != null) drawPerturbation(state, bundle, w, h, false, tilePass = true)
+            else drawDirect(state, w, h, false, tilePass = true)
+        }
+
         GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, sceneFbo)
         GLES31.glViewport(0, 0, w, h)
         GLES31.glClear(GLES31.GL_COLOR_BUFFER_BIT)
 
         if (state.needsPerturbation()) {
-            ensureBundleAsync()
-            val b = active
-            if (b != null) drawPerturbation(state, b, w, h) else drawDirect(state, w, h)
+            if (bundle != null) drawPerturbation(state, bundle, w, h, tiles)
+            else drawDirect(state, w, h, tiles)
         } else {
-            drawDirect(state, w, h)
+            drawDirect(state, w, h, tiles)
         }
 
         GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, 0)
@@ -375,58 +442,71 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         bindTexture(3, paletteTexture, u["uPalette"]!!)
     }
 
-    private fun drawDirect(s: ViewState, w: Int, h: Int) {
-        GLES31.glUseProgram(directProgram)
+    private fun drawDirect(s: ViewState, w: Int, h: Int, tiles: Boolean, tilePass: Boolean = false) {
+        val u = if (tilePass) directTile else direct
+        GLES31.glUseProgram(if (tilePass) directTileProgram else directProgram)
         GLES31.glBindVertexArray(vao)
 
-        GLES31.glUniform2f(direct["uResolution"]!!, w.toFloat(), h.toFloat())
-        GLES31.glUniform1i(direct["uMaxIter"]!!, s.maxIter)
-        applyColorUniforms(direct)
-        GLES31.glUniform2f(direct["uCenter"]!!, s.centerX.toFloat(), s.centerY.toFloat())
-        GLES31.glUniform1f(direct["uSpanY"]!!, s.spanY.toFloat())
+        GLES31.glUniform2f(u["uResolution"]!!, w.toFloat(), h.toFloat())
+        GLES31.glUniform1i(u["uMaxIter"]!!, s.maxIter)
+        applyColorUniforms(u)
+        applyTileUniforms(u, tiles && !tilePass)
+        GLES31.glUniform2f(u["uCenter"]!!, s.centerX.toFloat(), s.centerY.toFloat())
+        GLES31.glUniform1f(u["uSpanY"]!!, s.spanY.toFloat())
 
         GLES31.glDrawArrays(GLES31.GL_TRIANGLES, 0, 3)
         GLES31.glBindVertexArray(0)
     }
 
-    private fun drawPerturbation(s: ViewState, b: OrbitBundle, w: Int, h: Int) {
-        GLES31.glUseProgram(perturbProgram)
+    private fun drawPerturbation(
+        s: ViewState, b: OrbitBundle, w: Int, h: Int,
+        tiles: Boolean, tilePass: Boolean = false
+    ) {
+        val u = if (tilePass) perturbTile else perturb
+        GLES31.glUseProgram(if (tilePass) perturbTileProgram else perturbProgram)
         GLES31.glBindVertexArray(vao)
 
         val scale = b.gpu.scale
         val offset = s.offsetFrom(b.orbit)
         val pixelSpan = s.spanY / h
 
-        GLES31.glUniform2f(perturb["uResolution"]!!, w.toFloat(), h.toFloat())
-        GLES31.glUniform1i(perturb["uMaxIter"]!!, min(s.maxIter, b.orbit.iterBuilt))
-        applyColorUniforms(perturb)
+        GLES31.glUniform2f(u["uResolution"]!!, w.toFloat(), h.toFloat())
+        GLES31.glUniform1i(u["uMaxIter"]!!, min(s.maxIter, b.orbit.iterBuilt))
+        applyColorUniforms(u)
+        applyTileUniforms(u, tiles && !tilePass)
 
         // Pre-scaled on the way in, so the shader never has to represent 1e-50.
         GLES31.glUniform2f(
-            perturb["uDeltaCenter"]!!,
+            u["uDeltaCenter"]!!,
             (offset[0] * scale).toFloat(),
             (offset[1] * scale).toFloat()
         )
-        GLES31.glUniform1f(perturb["uPixelSpan"]!!, (pixelSpan * scale).toFloat())
-        GLES31.glUniform1f(perturb["uInvScale"]!!, (1.0 / scale).toFloat())
-        GLES31.glUniform1f(perturb["uBailoutScaled"]!!, (BAILOUT * scale).toFloat())
+        GLES31.glUniform1f(u["uPixelSpan"]!!, (pixelSpan * scale).toFloat())
+        GLES31.glUniform1f(u["uInvScale"]!!, (1.0 / scale).toFloat())
+        GLES31.glUniform1f(u["uBailoutScaled"]!!, (BAILOUT * scale).toFloat())
 
-        GLES31.glUniform1i(perturb["uWidthMask"]!!, TEX_WIDTH - 1)
-        GLES31.glUniform1i(perturb["uWidthShift"]!!, TEX_SHIFT)
-        GLES31.glUniform1i(perturb["uOrbitLen"]!!, uploadedLen)
+        GLES31.glUniform1i(u["uWidthMask"]!!, TEX_WIDTH - 1)
+        GLES31.glUniform1i(u["uWidthShift"]!!, TEX_SHIFT)
+        GLES31.glUniform1i(u["uOrbitLen"]!!, uploadedLen)
 
-        GLES31.glUniform1i(perturb["uBlaLevels"]!!, uploadedBlaLevels)
+        GLES31.glUniform1i(u["uBlaLevels"]!!, uploadedBlaLevels)
         if (uploadedBlaLevels > 0) {
-            GLES31.glUniform1iv(perturb["uBlaOffset[0]"]!!, uploadedBlaLevels, uploadedBlaOffset, 0)
-            GLES31.glUniform1iv(perturb["uBlaCount[0]"]!!, uploadedBlaLevels, uploadedBlaCount, 0)
+            GLES31.glUniform1iv(u["uBlaOffset[0]"]!!, uploadedBlaLevels, uploadedBlaOffset, 0)
+            GLES31.glUniform1iv(u["uBlaCount[0]"]!!, uploadedBlaLevels, uploadedBlaCount, 0)
         }
 
-        bindTexture(0, orbitTexture, perturb["uOrbit"]!!)
-        bindTexture(1, blaAbTexture, perturb["uBlaAB"]!!)
-        bindTexture(2, blaRTexture, perturb["uBlaR"]!!)
+        bindTexture(0, orbitTexture, u["uOrbit"]!!)
+        bindTexture(1, blaAbTexture, u["uBlaAB"]!!)
+        bindTexture(2, blaRTexture, u["uBlaR"]!!)
 
         GLES31.glDrawArrays(GLES31.GL_TRIANGLES, 0, 3)
         GLES31.glBindVertexArray(0)
+    }
+
+    private fun applyTileUniforms(u: HashMap<String, Int>, enabled: Boolean) {
+        GLES31.glUniform1i(u["uTileSize"]!!, TILE_SIZE)
+        GLES31.glUniform1i(u["uUseTiles"]!!, if (enabled) 1 else 0)
+        bindTexture(5, tileTex, u["uTiles"]!!)
     }
 
     private fun bindTexture(unit: Int, texture: Int, location: Int) {
@@ -688,13 +768,26 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         GLES31.glViewport(0, 0, w, h)
         GLES31.glClear(GLES31.GL_COLOR_BUFFER_BIT)
 
+        // Exports are the largest frames the app produces, so the tile pass matters
+        // most here. It runs against the export's own dimensions, not the screen's.
+        val tiles = w >= TILE_MIN_WIDTH
         var used: OrbitBundle? = null
-        if (s.needsPerturbation()) {
-            used = bundleForExport(s, w.toDouble() / h, cached)
-            drawPerturbation(s, used, w, h)
-        } else {
-            drawDirect(s, w, h)
+        if (s.needsPerturbation()) used = bundleForExport(s, w.toDouble() / h, cached)
+
+        if (tiles) {
+            ensureTileTargetFor(w, h)
+            GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, tileFbo)
+            GLES31.glViewport(0, 0, (w + TILE_SIZE - 1) / TILE_SIZE, (h + TILE_SIZE - 1) / TILE_SIZE)
+            GLES31.glClear(GLES31.GL_COLOR_BUFFER_BIT)
+            if (used != null) drawPerturbation(s, used, w, h, false, tilePass = true)
+            else drawDirect(s, w, h, false, tilePass = true)
         }
+
+        GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, fbo)
+        GLES31.glViewport(0, 0, w, h)
+
+        if (used != null) drawPerturbation(s, used, w, h, tiles)
+        else drawDirect(s, w, h, tiles)
 
         out.position(0)
         GLES31.glReadPixels(0, 0, w, h, GLES31.GL_RGBA, GLES31.GL_UNSIGNED_BYTE, out)
@@ -710,6 +803,8 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
 
     fun releaseExportResources() {
         releaseFbo()
+        // The tile target was resized for the export; put it back for the screen.
+        ensureTileTarget()
     }
 
     fun shutdown() {
@@ -767,6 +862,27 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
 
         /** How many extra coarse passes precede the final one. */
         const val COARSE_STEPS = 2
+
+        private val SHARED_UNIFORMS = arrayOf(
+            "uResolution", "uMaxIter", "uPalette", "uCycle", "uOffset", "uInterior",
+            "uTiles", "uTileSize", "uUseTiles"
+        )
+        private val DIRECT_UNIFORMS = SHARED_UNIFORMS + arrayOf("uCenter", "uSpanY")
+        private val PERTURB_UNIFORMS = SHARED_UNIFORMS + arrayOf(
+            "uOrbit", "uBlaAB", "uBlaR", "uWidthMask", "uWidthShift", "uOrbitLen",
+            "uBlaLevels", "uBlaOffset[0]", "uBlaCount[0]", "uDeltaCenter", "uPixelSpan",
+            "uInvScale", "uBailoutScaled"
+        )
+
+        /**
+         * Tile edge in render pixels. At 32 the border is 124 of 1024 pixels, so a
+         * solid tile costs about an eighth of rendering it. Smaller tiles classify
+         * more finely but spend a larger fraction of themselves on the perimeter.
+         */
+        const val TILE_SIZE = 32
+
+        /** Below this width the tile pass costs more than it saves. */
+        const val TILE_MIN_WIDTH = 512
 
         const val QUALITY_FULL = 0
         const val QUALITY_ADAPTIVE = 1

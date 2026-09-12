@@ -26,10 +26,14 @@ object Shaders {
         uniform float uOffset;
         uniform vec3  uInterior;
 
+        uniform sampler2D uTiles;
+        uniform int   uTileSize;
+        uniform int   uUseTiles;
+
         // Colour depends only on the escape count, never on zoom. An escape count does
         // not change as you descend, so a pixel keeps its colour at any depth. The
-        // palette texture is sampled with repeat wrapping, so no fract() is needed and
-        // the seam blends.
+        // palette is sampled with repeat wrapping, so no fract() is needed and the
+        // seam blends.
         vec3 shade(int n, vec2 z) {
             float sn = float(n) + 1.0 - log2(0.5 * log2(dot(z, z)));
             return texture(uPalette, vec2(sn / uCycle + uOffset, 0.5)).rgb;
@@ -38,16 +42,65 @@ object Shaders {
         vec2 cmul(vec2 a, vec2 b) {
             return vec2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
         }
+
+        // True when this pixel's tile was proven entirely interior by the border pass.
+        bool tileIsSolid() {
+            if (uUseTiles == 0) return false;
+            ivec2 t = ivec2(gl_FragCoord.xy) / uTileSize;
+            return texelFetch(uTiles, t, 0).r > 0.5;
+        }
     """.trimIndent()
 
     /**
-     * Direct iteration, used above ~1e-4 span where float32 still resolves pixels and
-     * perturbation would be pure overhead.
+     * The border test behind tile skipping.
+     *
+     * If every pixel on a tile's border fails to escape within uMaxIter, so does every
+     * pixel inside it. The truncated level set — points whose orbit stays bounded for
+     * the first uMaxIter steps — is a closed topological disk, so its complement is
+     * connected: an escaping point inside the tile would need a path to infinity
+     * through escaping points, and that path has to cross the border. So this is exact,
+     * not a heuristic, and it never touches the filaments.
+     *
+     * Written as a serial loop in one invocation per tile rather than as a compute
+     * workgroup, specifically so it can bail the moment a border pixel escapes. Tiles
+     * that straddle the boundary — the ones that cannot be skipped — therefore cost
+     * close to nothing, and only genuinely solid tiles pay for the whole perimeter.
      */
-    val DIRECT = """
-        #version 310 es
-        $COMMON
+    private val TILE_BODY = """
+        void main() {
+            ivec2 tile = ivec2(gl_FragCoord.xy);
+            int x0 = tile.x * uTileSize;
+            int y0 = tile.y * uTileSize;
+            int x1 = min(x0 + uTileSize - 1, int(uResolution.x) - 1);
+            int y1 = min(y0 + uTileSize - 1, int(uResolution.y) - 1);
 
+            if (x0 > x1 || y0 > y1) { fragColor = vec4(0.0); return; }
+
+            int n;
+            vec2 z;
+
+            for (int x = x0; x <= x1; x++) {
+                if (escapes(vec2(float(x) + 0.5, float(y0) + 0.5), n, z)) {
+                    fragColor = vec4(0.0); return;
+                }
+                if (y1 != y0 && escapes(vec2(float(x) + 0.5, float(y1) + 0.5), n, z)) {
+                    fragColor = vec4(0.0); return;
+                }
+            }
+            for (int y = y0 + 1; y < y1; y++) {
+                if (escapes(vec2(float(x0) + 0.5, float(y) + 0.5), n, z)) {
+                    fragColor = vec4(0.0); return;
+                }
+                if (x1 != x0 && escapes(vec2(float(x1) + 0.5, float(y) + 0.5), n, z)) {
+                    fragColor = vec4(0.0); return;
+                }
+            }
+            fragColor = vec4(1.0);
+        }
+    """.trimIndent()
+
+    /** Direct float32 iteration, used above ~1e-4 span. */
+    private val DIRECT_CORE = """
         uniform vec2  uCenter;
         uniform float uSpanY;
 
@@ -62,14 +115,13 @@ object Shaders {
             return dot(d, d) <= 0.0625;
         }
 
-        void main() {
+        bool escapes(vec2 frag, out int outN, out vec2 outZ) {
             float pixelSpan = uSpanY / uResolution.y;
-            vec2 c = uCenter + (gl_FragCoord.xy - 0.5 * uResolution) * pixelSpan;
+            vec2 c = uCenter + (frag - 0.5 * uResolution) * pixelSpan;
+            outN = uMaxIter;
+            outZ = vec2(0.0);
 
-            if (inMainBulbs(c)) {
-                fragColor = vec4(uInterior, 1.0);
-                return;
-            }
+            if (inMainBulbs(c)) return false;
 
             vec2 z = vec2(0.0);
             float d = 0.0;
@@ -77,8 +129,6 @@ object Shaders {
 
             // Periodicity check: interior points settle into a cycle, and comparing
             // against a lazily-updated earlier value detects that in O(1) space.
-            // Catching an interior pixel at iteration 200 instead of 65536 is the
-            // largest saving available on this path.
             vec2 hare = vec2(0.0);
             int period = 1;
             int periodLimit = 1;
@@ -86,12 +136,9 @@ object Shaders {
             for (i = 0; i < uMaxIter; i++) {
                 z = vec2(z.x * z.x - z.y * z.y, 2.0 * z.x * z.y) + c;
                 d = dot(z, z);
-                if (d > 65536.0) break;
+                if (d > 65536.0) { outN = i; outZ = z; return true; }
 
-                if (abs(z.x - hare.x) < 1e-9 && abs(z.y - hare.y) < 1e-9) {
-                    i = uMaxIter;
-                    break;
-                }
+                if (abs(z.x - hare.x) < 1e-9 && abs(z.y - hare.y) < 1e-9) return false;
                 period--;
                 if (period == 0) {
                     hare = z;
@@ -99,50 +146,7 @@ object Shaders {
                     period = periodLimit;
                 }
             }
-
-            if (i >= uMaxIter) {
-                fragColor = vec4(uInterior, 1.0);
-                return;
-            }
-            fragColor = vec4(shade(i, z), 1.0);
-        }
-    """.trimIndent()
-
-
-    /**
-     * Presents an already-rendered frame, optionally reprojected.
-     *
-     * While a gesture is in progress the fractal is not recomputed at all. The last
-     * completed frame is resampled according to how far the view has moved since it was
-     * made, which costs one texture fetch per pixel instead of a full iteration loop.
-     * Panning and pinching therefore run at the same speed whatever the depth or the
-     * iteration count.
-     */
-    val BLIT = """
-        #version 310 es
-        precision highp float;
-        precision highp sampler2D;
-
-        out vec4 fragColor;
-
-        uniform sampler2D uScene;
-        uniform vec2  uResolution;
-        uniform vec2  uValidFrac;   // portion of the scene texture actually rendered
-        uniform vec2  uShift;       // view movement since the frame was made
-        uniform float uZoom;        // span ratio since the frame was made
-        uniform vec3  uBackground;
-
-        void main() {
-            vec2 s = gl_FragCoord.xy / uResolution;
-            vec2 q = vec2(0.5) + uShift + (s - vec2(0.5)) * uZoom;
-
-            // Anything the old frame never covered stays background rather than
-            // smearing the edge pixels across newly exposed area.
-            if (any(lessThan(q, vec2(0.0))) || any(greaterThan(q, vec2(1.0)))) {
-                fragColor = vec4(uBackground, 1.0);
-                return;
-            }
-            fragColor = vec4(texture(uScene, q * uValidFrac).rgb, 1.0);
+            return false;
         }
     """.trimIndent()
 
@@ -157,8 +161,6 @@ object Shaders {
      * coordinates need 60 decimal digits. Deltas are carried pre-multiplied by the
      * orbit's scale, because the true values sit below float32's denormal floor.
      *
-     * Two accelerations sit on top of that recurrence:
-     *
      * Rebasing (Zhuoran) — when a pixel's true value falls below its own delta in
      * magnitude, the reference has stopped being informative, so the pixel restarts at
      * orbit index 0 carrying its full value forward. Exact, rather than detecting
@@ -166,14 +168,11 @@ object Shaders {
      *
      * BLA (Zhuoran) — where the squared term is negligible the recurrence is linear,
      * and composed runs of it are precomputed at every power-of-two length. A pixel
-     * takes the longest jump whose validity radius still contains its delta. Because
-     * radii shrink monotonically as levels merge, the lookup climbs from level 0 and
-     * stops at the first failure instead of searching.
+     * takes the longest jump whose validity radius contains its delta. Radii shrink
+     * monotonically as levels merge, so the lookup climbs from level 0 and stops at the
+     * first failure instead of searching.
      */
-    val PERTURBATION = """
-        #version 310 es
-        $COMMON
-
+    private val PERTURB_CORE = """
         uniform sampler2D uOrbit;
         uniform sampler2D uBlaAB;
         uniform sampler2D uBlaR;
@@ -194,17 +193,17 @@ object Shaders {
         vec4 fetchZ(int i) {
             return texelFetch(uOrbit, ivec2(i & uWidthMask, i >> uWidthShift), 0);
         }
-
         vec4 fetchAB(int i) {
             return texelFetch(uBlaAB, ivec2(i & uWidthMask, i >> uWidthShift), 0);
         }
-
         float fetchR(int i) {
             return texelFetch(uBlaR, ivec2(i & uWidthMask, i >> uWidthShift), 0).r;
         }
 
-        void main() {
-            vec2 dc = uDeltaCenter + (gl_FragCoord.xy - 0.5 * uResolution) * uPixelSpan;
+        bool escapes(vec2 frag, out int outN, out vec2 outZ) {
+            vec2 dc = uDeltaCenter + (frag - 0.5 * uResolution) * uPixelSpan;
+            outN = uMaxIter;
+            outZ = vec2(0.0);
 
             vec2 dz = vec2(0.0);
             int m = 0;
@@ -214,8 +213,6 @@ object Shaders {
             while (n < uMaxIter) {
                 float dzMag = max(abs(dz.x), abs(dz.y));
 
-                // Longest valid jump from here. Radii are non-increasing with level,
-                // so the first failure ends the climb.
                 int skip = 0;
                 int chosen = -1;
                 if (m >= 1) {
@@ -257,8 +254,9 @@ object Shaders {
 
                 if (zMag > uBailoutScaled) {
                     // Escaped values are O(1), so unscaling is safe here.
-                    fragColor = vec4(shade(n, zs * uInvScale), 1.0);
-                    return;
+                    outN = n;
+                    outZ = zs * uInvScale;
+                    return true;
                 }
 
                 if (zMag < max(abs(dz.x), abs(dz.y)) || m >= uOrbitLen) {
@@ -267,8 +265,62 @@ object Shaders {
                     t = fetchZ(0);
                 }
             }
+            return false;
+        }
+    """.trimIndent()
 
-            fragColor = vec4(uInterior, 1.0);
+    private val MAIN_BODY = """
+        void main() {
+            if (tileIsSolid()) {
+                fragColor = vec4(uInterior, 1.0);
+                return;
+            }
+            int n;
+            vec2 z;
+            if (!escapes(gl_FragCoord.xy, n, z)) {
+                fragColor = vec4(uInterior, 1.0);
+                return;
+            }
+            fragColor = vec4(shade(n, z), 1.0);
+        }
+    """.trimIndent()
+
+    val DIRECT = "#version 310 es\n$COMMON\n$DIRECT_CORE\n$MAIN_BODY"
+    val DIRECT_TILE = "#version 310 es\n$COMMON\n$DIRECT_CORE\n$TILE_BODY"
+    val PERTURBATION = "#version 310 es\n$COMMON\n$PERTURB_CORE\n$MAIN_BODY"
+    val PERTURB_TILE = "#version 310 es\n$COMMON\n$PERTURB_CORE\n$TILE_BODY"
+
+    /**
+     * Presents an already-rendered frame, optionally reprojected.
+     *
+     * When the view has moved since the frame was made, the old frame is resampled
+     * rather than recomputed, which costs one texture fetch per pixel.
+     */
+    val BLIT = """
+        #version 310 es
+        precision highp float;
+        precision highp sampler2D;
+
+        out vec4 fragColor;
+
+        uniform sampler2D uScene;
+        uniform vec2  uResolution;
+        uniform vec2  uValidFrac;   // portion of the scene texture actually rendered
+        uniform vec2  uShift;       // view movement since the frame was made
+        uniform float uZoom;        // span ratio since the frame was made
+        uniform vec3  uBackground;
+
+        void main() {
+            vec2 s = gl_FragCoord.xy / uResolution;
+            vec2 q = vec2(0.5) + uShift + (s - vec2(0.5)) * uZoom;
+
+            // Anything the old frame never covered stays background rather than
+            // smearing edge pixels across newly exposed area.
+            if (any(lessThan(q, vec2(0.0))) || any(greaterThan(q, vec2(1.0)))) {
+                fragColor = vec4(uBackground, 1.0);
+                return;
+            }
+            fragColor = vec4(texture(uScene, q * uValidFrac).rgb, 1.0);
         }
     """.trimIndent()
 }

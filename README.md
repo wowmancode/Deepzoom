@@ -179,6 +179,27 @@ measurement uses `glFinish`, because without it the draw call returns long befor
 GPU has finished and the adaptation would be chasing noise. Both extremes are available
 directly if you would rather not have it decide: always-native or always-fast.
 
+- **Interior tile skipping.** The frame is divided into 32-pixel tiles and a first pass
+  iterates only each tile's border. If no border pixel escapes, none of the interior
+  does either, and the whole tile is filled flat without touching it.
+
+  This is exact rather than approximate. The truncated level set — points whose orbit
+  stays bounded for the first `maxIter` steps — is a closed topological disk, so its
+  complement is connected; an escaping point inside the tile would need a path to
+  infinity through escaping points, and that path must cross the border. Checked
+  against a full-grid reference at 1e-6, 1e-20 and 1e-30: zero violations.
+
+  The border pass runs as one fragment invocation per tile rather than as a compute
+  workgroup, specifically so the serial loop can bail the instant a border pixel
+  escapes. Tiles straddling the boundary — the ones that cannot be skipped — therefore
+  cost almost nothing, and only genuinely solid tiles pay for the full perimeter.
+
+  Measured pixel savings were 58% on a view with mixed structure and 88% on an
+  interior-heavy one, the latter being the ceiling: a solid tile still costs its 124
+  border pixels out of 1024. Savings scale with resolution, since tiles cover more
+  pixels, and with depth, since more of the screen is interior. Skipped below 512 px
+  wide, where the perimeter is too large a fraction to be worth it.
+
 - **Parallel YUV conversion** during video export. It is the dominant CPU cost per
   frame and every row is independent, so it is split across all cores.
 
