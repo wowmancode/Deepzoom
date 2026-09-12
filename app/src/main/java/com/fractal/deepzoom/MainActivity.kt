@@ -451,12 +451,22 @@ class MainActivity : AppCompatActivity() {
             .create()
         dialog.show()
 
-        exporter.saveVideo(this, settings, { frame, count ->
-            runOnUiThread {
-                label.text = "Rendering frame $frame of $count"
-                bar.progress = (frame * 100 / count)
+        val progress = object : ExportManager.Progress {
+            override fun onProgress(frame: Int, total: Int) {
+                runOnUiThread {
+                    label.text = "Rendering frame $frame of $total"
+                    bar.progress = frame * 100 / total
+                }
             }
-        }) { uri, error ->
+            override fun onStripBuild(rowsDone: Int, rowsTarget: Int) {
+                runOnUiThread {
+                    label.text = "Building strip — row $rowsDone of $rowsTarget"
+                    bar.progress = rowsDone * 100 / rowsTarget.coerceAtLeast(1)
+                }
+            }
+        }
+
+        exporter.saveVideo(this, settings, progress) { uri, error ->
             runOnUiThread {
                 dialog.dismiss()
                 reportResult(uri, error, "Saved to Movies/DeepZoom")

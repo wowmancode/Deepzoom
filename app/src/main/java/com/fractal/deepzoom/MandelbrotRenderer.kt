@@ -94,6 +94,13 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
     /** Owned by the builder thread. */
     private var workingOrbit: ReferenceOrbit? = null
 
+    /**
+     * Export runs on the GL thread and would otherwise mutate the same orbit the
+     * builder thread is extending, so it keeps its own.
+     */
+    private var exportOrbit: ReferenceOrbit? = null
+    private var buildingForExport = false
+
     /** Owned by the GL thread. */
     private var active: OrbitBundle? = null
 
@@ -161,6 +168,11 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         blaAbTexture = createDataTexture()
         blaRTexture = createDataTexture()
         paletteTexture = createRampTexture()
+
+        // Every program binds the tile sampler, including paths that never run the
+        // tile pass. Binding texture 0 to a sampler is an incomplete texture, which
+        // some drivers treat as a failed draw.
+        ensureTileTarget()
 
         val sizeQuery = IntArray(1)
         GLES31.glGetIntegerv(GLES31.GL_MAX_TEXTURE_SIZE, sizeQuery, 0)
@@ -595,13 +607,13 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
             it.centerX = cx; it.centerY = cy; it.spanY = span; it.maxIter = iter
         }
 
-        var orbit = workingOrbit
+        var orbit = if (buildingForExport) exportOrbit else workingOrbit
         if (orbit == null || !probe.canReuse(orbit, aspect)) {
             orbit = ReferenceOrbit.compute(cx, cy, iter, span)
         } else if (iter > orbit.iterBuilt) {
             orbit.extendTo(iter)
         }
-        workingOrbit = orbit
+        if (buildingForExport) exportOrbit = orbit else workingOrbit = orbit
 
         val snap = orbit.snapshot()
         return OrbitBundle(snap, OrbitGpuData.build(snap, exp, maxC))
@@ -616,10 +628,15 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
             BlaTable.maxCFor(s.spanY, aspect) <= cached.gpu.maxC
         ) return cached
 
-        val built = buildBundle(
-            s.centerX, s.centerY, s.spanY, s.maxIter,
-            s.deltaScaleExponent(), BlaTable.maxCFor(s.spanY, aspect), aspect
-        )
+        buildingForExport = true
+        val built = try {
+            buildBundle(
+                s.centerX, s.centerY, s.spanY, s.maxIter,
+                s.deltaScaleExponent(), BlaTable.maxCFor(s.spanY, aspect), aspect
+            )
+        } finally {
+            buildingForExport = false
+        }
         upload(built.gpu)
         return built
     }
@@ -839,6 +856,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         ensureStrip(geom.width, geom.ringHeight)
         stripRowsDone = 0
         stripStarted = true
+        exportOrbit = null
     }
 
     private fun ensureStrip(w: Int, ring: Int) {
@@ -880,6 +898,8 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
     }
 
     /** Extends the strip so every row up to and including lastRow exists. */
+    var onStripProgress: ((rowsDone: Int, rowsTarget: Int) -> Unit)? = null
+
     fun stripExtendTo(s: ViewState, geom: StripGeometry, lastRow: Int, cached: OrbitBundle?): OrbitBundle? {
         if (!stripStarted) stripBegin(geom)
         var bundle = cached
@@ -902,6 +922,9 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
                 val crossing = ((ln(ViewState.DIRECT_LIMIT) - geom.logR0) / geom.step).toInt() - row
                 if (crossing in 1 until count) count = crossing
             }
+            // A chunk must always advance. If any of the arithmetic above ever yields
+            // zero or less, the loop would spin forever rather than fail.
+            if (count < 1) count = 1
 
             val probe = s.snapshot()
             probe.spanY = max(radius * 2.0, s.minSpan())
@@ -954,6 +977,10 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
             GLES31.glDrawArrays(GLES31.GL_TRIANGLES, 0, 3)
             GLES31.glBindVertexArray(0)
             row += count
+            // The first frame builds the whole window at once — thousands of rows
+            // against a handful for every frame after it — so it needs its own
+            // progress or it reads as a freeze.
+            onStripProgress?.invoke(row, lastRow + 1)
         }
 
         GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, 0)

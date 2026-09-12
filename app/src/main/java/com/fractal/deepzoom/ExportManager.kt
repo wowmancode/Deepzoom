@@ -31,8 +31,10 @@ class ExportManager(private val view: MandelbrotView) {
         val holdFrames: Int = 12
     )
 
-    fun interface Progress {
+    interface Progress {
         fun onProgress(frame: Int, total: Int)
+        /** Strip rows built, for the first frame where that dominates. */
+        fun onStripBuild(rowsDone: Int, rowsTarget: Int) {}
     }
 
     fun savePng(
@@ -98,7 +100,12 @@ class ExportManager(private val view: MandelbrotView) {
                 val geom = stripFor(
                     settings, snapshot.spanY, view.renderer.maxTextureSizeCached
                 )
-                if (geom != null) view.renderer.stripBegin(geom)
+                if (geom != null) {
+                    view.renderer.stripBegin(geom)
+                    view.renderer.onStripProgress = { done, target ->
+                        progress.onStripBuild(done, target)
+                    }
+                }
 
                 for (i in 0 until total) {
                     if (i < total - settings.holdFrames) {
@@ -135,6 +142,7 @@ class ExportManager(private val view: MandelbrotView) {
                 error = e.message ?: e.javaClass.simpleName
                 encoder.abort()
             } finally {
+                view.renderer.onStripProgress = null
                 view.renderer.stripEnd()
                 view.renderer.releaseExportResources()
                 view.renderer.invalidateOrbit()
