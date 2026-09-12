@@ -6,34 +6,44 @@ import kotlin.math.ceil
 import kotlin.math.log10
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.pow
 
 /**
  * A single point's orbit, iterated in arbitrary precision on the CPU.
  *
- * This is the only place in the app that needs precision beyond float32. Every pixel
- * is then rendered as a small offset from this orbit, and those offsets stay large
- * enough for float32 to handle no matter how deep the reference itself sits. That
- * asymmetry is the whole trick: precision cost is paid once per frame, not once per
- * pixel.
+ * Precision beyond float32 lives only here. Every pixel renders as a small offset
+ * from this orbit, and those offsets stay representable no matter how deep the
+ * reference sits — so 90-digit arithmetic is paid for once per frame rather than
+ * two million times.
+ *
+ * The delta scale is fixed at build time rather than derived per frame. An orbit is
+ * only reused across a 4x zoom range, so a scale chosen for the build span stays
+ * within two binary orders of ideal, which is nothing against 46 orders of headroom.
+ * Fixing it here is what lets the GPU-side data be stored pre-scaled.
  */
 class ReferenceOrbit(
     val centerX: BigDecimal,
     val centerY: BigDecimal,
-    /** Interleaved x,y pairs: [x0, y0, x1, y1, ...]. Values are O(1), so float is fine. */
+    /**
+     * Four floats per point: (2*Zx, 2*Zy, Zx*scale, Zy*scale).
+     *
+     * Both forms are needed every iteration — the doubled value for the 2*Z*d term,
+     * the scaled value to reconstruct the true position — so precomputing both here
+     * removes two multiplies from the inner loop at the cost of texture width.
+     */
     val data: FloatArray,
-    /** Number of valid orbit points, i.e. data holds indices 0..count. */
+    /** Valid point indices are 0..count. */
     val count: Int,
+    val scaleExp: Int,
     val spanAtBuild: Double,
     val iterAtBuild: Int
 ) {
+    val scale: Double get() = 2.0.pow(scaleExp)
+
     companion object {
         private val TWO = BigDecimal(2)
         private const val ESCAPE_SQ = 4.0
 
-        /**
-         * Digits required to resolve a pixel at this zoom, plus guard digits for
-         * error accumulated across the iteration.
-         */
         fun precisionFor(spanY: Double): Int {
             val decades = max(0.0, ceil(-log10(spanY)))
             return 30 + decades.toInt()
@@ -43,38 +53,43 @@ class ReferenceOrbit(
             cx: BigDecimal,
             cy: BigDecimal,
             maxIter: Int,
-            spanY: Double
+            spanY: Double,
+            scaleExp: Int
         ): ReferenceOrbit {
             val mc = MathContext(precisionFor(spanY))
+            val scale = 2.0.pow(scaleExp)
 
-            val data = FloatArray((maxIter + 2) * 2)
+            val data = FloatArray((maxIter + 2) * 4)
             var x = BigDecimal.ZERO
             var y = BigDecimal.ZERO
             var n = 0
 
             while (n <= maxIter) {
-                data[n * 2] = x.toFloat()
-                data[n * 2 + 1] = y.toFloat()
+                val xd = x.toDouble()
+                val yd = y.toDouble()
+                val i = n * 4
+                data[i] = (xd * 2.0).toFloat()
+                data[i + 1] = (yd * 2.0).toFloat()
+                data[i + 2] = (xd * scale).toFloat()
+                data[i + 3] = (yd * scale).toFloat()
 
                 val x2 = x.multiply(x, mc)
                 val y2 = y.multiply(y, mc)
 
-                // The reference itself escaping is fine and common — it just bounds
-                // how many points the shader can walk before it has to rebase.
+                // The reference escaping is normal and expected. It just bounds how
+                // far the shader can walk before it has to rebase.
                 if (x2.add(y2, mc).toDouble() > ESCAPE_SQ) break
 
                 val nx = x2.subtract(y2, mc).add(cx, mc)
                 val ny = x.multiply(y, mc).multiply(TWO, mc).add(cy, mc)
-
                 x = nx.round(mc)
                 y = ny.round(mc)
                 n++
             }
 
-            // On a normal exit n has run one past the last written index; on an escape
-            // break it points at it. Clamp so count is always the last valid point.
-            val valid = min(n, maxIter)
-            return ReferenceOrbit(cx, cy, data, valid, spanY, maxIter)
+            // A normal exit leaves n one past the last written index; an escape break
+            // leaves it pointing at it.
+            return ReferenceOrbit(cx, cy, data, min(n, maxIter), scaleExp, spanY, maxIter)
         }
     }
 }

@@ -29,6 +29,28 @@ The APK is signed with the standard debug key: fine for sideloading onto your ow
 device, not for distribution. No Gradle wrapper JAR is committed; the workflow
 supplies the Gradle CLI instead.
 
+## Export
+
+- **Save PNG** — renders offscreen at screen size, 1080p, 4K, or 8K and writes to
+  Pictures/DeepZoom. Export resolution is independent of the render-resolution slider.
+- **Save video** — renders a zoom-out from wherever you are back to the whole set.
+  You choose resolution, frame rate, and how much to widen per frame; the dialog shows
+  the resulting frame count and duration before you commit. Output goes to
+  Movies/DeepZoom as H.264 MP4.
+- **Copy position / Go to** — the current location as a text code, and back again.
+
+Zoom-out steps are multiplicative, not additive: a constant percentage per frame reads
+as constant speed, whereas constant additive steps would crawl at depth and lurch at
+the end.
+
+Position codes write the centre as a plain decimal string rather than a double. At
+depth the coordinate needs more digits than a double holds, so round-tripping through
+one would silently land you somewhere else.
+
+Both exports run on the GL thread and block the interactive view while they work.
+Every video frame is a full deep-zoom render, so wall-clock cost scales with depth as
+much as with frame count.
+
 ## How deep it goes
 
 Roughly **1e60**, set by float32's exponent range rather than by precision.
@@ -68,6 +90,26 @@ references, there are no glitch blobs to patch and no second reference orbit.
 across pans and small zooms and only rebuilt when it leaves the visible region, the
 zoom moves by more than 4x, or the iteration count rises. Rebuilds happen on a
 background thread; the old orbit keeps rendering meanwhile.
+
+### Performance notes
+
+There is no `-O3` for shaders. GLSL is compiled by the GPU driver at runtime and is
+always optimised at full strength; there is no flag to turn. The Kotlin side is a
+rounding error against per-pixel GPU work, so build-level optimisation would not move
+anything either. The wins available are algorithmic:
+
+- **Periodicity detection** on the direct path. Interior points settle into a cycle,
+  and comparing against a lazily-updated earlier value detects that in O(1) space.
+  Catching an interior pixel at iteration 200 instead of 65536 is the single largest
+  saving on that path.
+- **Pre-scaled orbit data.** The orbit texture stores `2*Z` and `Z*scale` already
+  computed, removing two multiplies from every iteration of every pixel. The delta
+  scale is fixed when the orbit is built rather than per frame, which is what makes
+  this possible.
+- **Mask-and-shift orbit indexing** instead of integer division and modulo, which are
+  slow on mobile GPUs. The texture width is a power of two specifically for this.
+- **One texture fetch per iteration**, carried across the loop rather than re-fetched.
+- **Analytic interior tests** for the main cardioid and period-2 bulb.
 
 ### Going deeper than 1e60
 

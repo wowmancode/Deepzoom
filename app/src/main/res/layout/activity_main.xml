@@ -20,7 +20,7 @@
         android:paddingStart="20dp"
         android:paddingEnd="20dp"
         android:paddingTop="14dp"
-        android:paddingBottom="28dp"
+        android:paddingBottom="24dp"
         android:fitsSystemWindows="true">
 
         <TextView
@@ -39,7 +39,6 @@
             android:layout_height="wrap_content"
             android:textColor="#D8DCE4"
             android:textSize="13sp"
-            android:letterSpacing="0.01"
             android:paddingBottom="6dp" />
 
         <TextView
@@ -74,15 +73,62 @@
             app:trackColorActive="#7FA6D8"
             app:trackColorInactive="#2A2F38" />
 
-        <Button
-            android:id="@+id/reset"
-            style="?android:attr/borderlessButtonStyle"
-            android:layout_width="wrap_content"
+        <HorizontalScrollView
+            android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_gravity="start"
-            android:text="Reset view"
-            android:textColor="#7FA6D8"
-            android:textSize="14sp"
-            android:paddingStart="0dp" />
+            android:scrollbars="none"
+            android:paddingTop="2dp">
+
+            <LinearLayout
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+
+                <Button
+                    android:id="@+id/reset"
+                    style="?android:attr/borderlessButtonStyle"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Reset"
+                    android:textColor="#7FA6D8"
+                    android:textSize="14sp" />
+
+                <Button
+                    android:id="@+id/save_png"
+                    style="?android:attr/borderlessButtonStyle"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Save PNG"
+                    android:textColor="#7FA6D8"
+                    android:textSize="14sp" />
+
+                <Button
+                    android:id="@+id/save_video"
+                    style="?android:attr/borderlessButtonStyle"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Save video"
+                    android:textColor="#7FA6D8"
+                    android:textSize="14sp" />
+
+                <Button
+                    android:id="@+id/share_pos"
+                    style="?android:attr/borderlessButtonStyle"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Copy position"
+                    android:textColor="#7FA6D8"
+                    android:textSize="14sp" />
+
+                <Button
+                    android:id="@+id/goto_pos"
+                    style="?android:attr/borderlessButtonStyle"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Go to"
+                    android:textColor="#7FA6D8"
+                    android:textSize="14sp" />
+            </LinearLayout>
+        </HorizontalScrollView>
     </LinearLayout>
 </FrameLayout>

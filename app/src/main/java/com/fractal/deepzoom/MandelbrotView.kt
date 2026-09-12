@@ -160,6 +160,14 @@ class MandelbrotView @JvmOverloads constructor(
         onViewChanged?.invoke()
     }
 
+    /** Jumps to a position loaded from a shared code. */
+    fun applyState(target: ViewState) {
+        state.copyFrom(target)
+        renderer.invalidateOrbit()
+        requestRender()
+        onViewChanged?.invoke()
+    }
+
     fun setMaxIter(value: Int) {
         state.maxIter = value
         requestRender()
