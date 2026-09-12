@@ -10,6 +10,8 @@ import android.net.Uri
 import android.os.ParcelFileDescriptor
 import android.provider.MediaStore
 import java.nio.ByteBuffer
+import kotlin.math.max
+import kotlin.math.min
 
 /**
  * Encodes rendered frames to an H.264 MP4 in Movies/DeepZoom.
@@ -44,7 +46,10 @@ class VideoExporter(
     private var frameIndex = 0L
 
     private val bufferInfo = MediaCodec.BufferInfo()
-    private var rgbaRow: ByteArray = ByteArray(0)
+    private var rgbaFrame: ByteArray = ByteArray(0)
+
+    private val threads = max(1, Runtime.getRuntime().availableProcessors())
+    private val pool = java.util.concurrent.Executors.newFixedThreadPool(threads)
 
     fun start() {
         val encoder = MediaCodec.createEncoderByType(MIME)
@@ -153,6 +158,11 @@ class VideoExporter(
      *
      * Plane strides are read from the Image rather than assumed, because encoders
      * differ on whether chroma is planar or interleaved, and on row padding.
+     *
+     * This is the dominant CPU cost of an export — a few tens of milliseconds per 1080p
+     * frame single-threaded — and every row is independent, so it is split across the
+     * available cores. For a long zoom-out that is the difference between an export you
+     * wait through and one you leave running.
      */
     private fun fillYuv(image: android.media.Image, rgba: ByteBuffer) {
         val yPlane = image.planes[0]
@@ -169,62 +179,91 @@ class VideoExporter(
         val uPixStride = uPlane.pixelStride
         val vPixStride = vPlane.pixelStride
 
-        if (rgbaRow.size < width * 4 * 2) rgbaRow = ByteArray(width * 4 * 2)
+        // Pull the frame into a heap array once: random access into a direct buffer is
+        // far slower than into a ByteArray, and every worker reads from it.
+        if (rgbaFrame.size < width * height * 4) rgbaFrame = ByteArray(width * height * 4)
+        rgba.position(0)
+        rgba.get(rgbaFrame, 0, width * height * 4)
 
-        // Two source rows at a time: luma needs both, chroma averages across them.
-        var y = 0
-        while (y < height) {
-            val srcY0 = height - 1 - y
-            val srcY1 = if (y + 1 < height) height - 1 - (y + 1) else srcY0
+        val rowPairs = (height + 1) / 2
+        val workers = min(threads, max(1, rowPairs))
+        val chunk = (rowPairs + workers - 1) / workers
 
-            rgba.position(srcY0 * width * 4)
-            rgba.get(rgbaRow, 0, width * 4)
-            rgba.position(srcY1 * width * 4)
-            rgba.get(rgbaRow, width * 4, width * 4)
-
-            var x = 0
-            while (x < width) {
-                val a0 = x * 4
-                val r0 = rgbaRow[a0].toInt() and 0xFF
-                val g0 = rgbaRow[a0 + 1].toInt() and 0xFF
-                val b0 = rgbaRow[a0 + 2].toInt() and 0xFF
-                yBuf.put(y * yRowStride + x, lumaOf(r0, g0, b0))
-
-                if (y + 1 < height) {
-                    val a1 = width * 4 + x * 4
-                    val r1 = rgbaRow[a1].toInt() and 0xFF
-                    val g1 = rgbaRow[a1 + 1].toInt() and 0xFF
-                    val b1 = rgbaRow[a1 + 2].toInt() and 0xFF
-                    yBuf.put((y + 1) * yRowStride + x, lumaOf(r1, g1, b1))
+        val tasks = (0 until workers).map { w ->
+            java.util.concurrent.Callable {
+                val from = w * chunk
+                val to = min(rowPairs, from + chunk)
+                for (pair in from until to) {
+                    val y = pair * 2
+                    convertRowPair(
+                        y, yBuf, uBuf, vBuf,
+                        yRowStride, uRowStride, vRowStride, uPixStride, vPixStride
+                    )
                 }
-                x++
+                true
             }
+        }
+        pool.invokeAll(tasks).forEach { it.get() }
+    }
 
-            // Chroma at half resolution, averaged over each 2x2 block so fine detail
-            // dithers instead of aliasing to whichever corner got sampled.
-            val cy = y / 2
-            var cx = 0
-            while (cx < width / 2) {
-                val x0 = cx * 2
-                val x1 = if (x0 + 1 < width) x0 + 1 else x0
-                var rs = 0; var gs = 0; var bs = 0
-                for (o in intArrayOf(0, width * 4)) {
-                    for (px in intArrayOf(x0, x1)) {
-                        val a = o + px * 4
-                        rs += rgbaRow[a].toInt() and 0xFF
-                        gs += rgbaRow[a + 1].toInt() and 0xFF
-                        bs += rgbaRow[a + 2].toInt() and 0xFF
-                    }
+    /**
+     * Two source rows at a time: luma needs both, and chroma averages across them so
+     * fine detail dithers rather than aliasing to whichever corner got sampled.
+     */
+    private fun convertRowPair(
+        y: Int,
+        yBuf: ByteBuffer, uBuf: ByteBuffer, vBuf: ByteBuffer,
+        yRowStride: Int, uRowStride: Int, vRowStride: Int,
+        uPixStride: Int, vPixStride: Int
+    ) {
+        val row0 = (height - 1 - y) * width * 4
+        val row1 = if (y + 1 < height) (height - 1 - (y + 1)) * width * 4 else row0
+
+        var x = 0
+        while (x < width) {
+            val a0 = row0 + x * 4
+            yBuf.put(
+                y * yRowStride + x,
+                lumaOf(
+                    rgbaFrame[a0].toInt() and 0xFF,
+                    rgbaFrame[a0 + 1].toInt() and 0xFF,
+                    rgbaFrame[a0 + 2].toInt() and 0xFF
+                )
+            )
+            if (y + 1 < height) {
+                val a1 = row1 + x * 4
+                yBuf.put(
+                    (y + 1) * yRowStride + x,
+                    lumaOf(
+                        rgbaFrame[a1].toInt() and 0xFF,
+                        rgbaFrame[a1 + 1].toInt() and 0xFF,
+                        rgbaFrame[a1 + 2].toInt() and 0xFF
+                    )
+                )
+            }
+            x++
+        }
+
+        val cy = y / 2
+        var cx = 0
+        while (cx < width / 2) {
+            val x0 = cx * 2
+            val x1 = if (x0 + 1 < width) x0 + 1 else x0
+            var rs = 0; var gs = 0; var bs = 0
+            for (base in intArrayOf(row0, row1)) {
+                for (px in intArrayOf(x0, x1)) {
+                    val a = base + px * 4
+                    rs += rgbaFrame[a].toInt() and 0xFF
+                    gs += rgbaFrame[a + 1].toInt() and 0xFF
+                    bs += rgbaFrame[a + 2].toInt() and 0xFF
                 }
-                val r = rs shr 2
-                val g = gs shr 2
-                val b = bs shr 2
-                uBuf.put(cy * uRowStride + cx * uPixStride, chromaU(r, g, b))
-                vBuf.put(cy * vRowStride + cx * vPixStride, chromaV(r, g, b))
-                cx++
             }
-
-            y += 2
+            val r = rs shr 2
+            val g = gs shr 2
+            val b = bs shr 2
+            uBuf.put(cy * uRowStride + cx * uPixStride, chromaU(r, g, b))
+            vBuf.put(cy * vRowStride + cx * vPixStride, chromaV(r, g, b))
+            cx++
         }
     }
 
@@ -303,6 +342,7 @@ class VideoExporter(
     }
 
     private fun release() {
+        pool.shutdownNow()
         try { codec?.stop() } catch (_: Exception) {}
         try { codec?.release() } catch (_: Exception) {}
         codec = null

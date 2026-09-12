@@ -9,6 +9,7 @@ import android.os.Bundle
 import android.view.LayoutInflater
 import android.view.View
 import android.widget.Button
+import android.graphics.drawable.GradientDrawable
 import android.widget.EditText
 import android.widget.ProgressBar
 import android.widget.TextView
@@ -17,6 +18,7 @@ import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.WindowCompat
 import com.google.android.material.slider.Slider
+import kotlin.math.ln
 import kotlin.math.pow
 import kotlin.math.roundToInt
 
@@ -72,6 +74,7 @@ class MainActivity : AppCompatActivity() {
             iterSlider.value = 9f
             wake()
         }
+        findViewById<Button>(R.id.colors).setOnClickListener { showPaletteDialog() }
         findViewById<Button>(R.id.save_png).setOnClickListener { showPngDialog() }
         findViewById<Button>(R.id.save_video).setOnClickListener { showVideoDialog() }
         findViewById<Button>(R.id.share_pos).setOnClickListener { copyPosition() }
@@ -117,7 +120,7 @@ class MainActivity : AppCompatActivity() {
     // --- Position sharing -------------------------------------------------------------
 
     private fun copyPosition() {
-        val code = PositionCodec.encode(view.state)
+        val code = PositionCodec.encode(view.state, view.renderer.palette)
         val clip = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
         clip.setPrimaryClip(ClipData.newPlainText("DeepZoom position", code))
         toast("Position copied")
@@ -145,11 +148,100 @@ class MainActivity : AppCompatActivity() {
                 if (parsed == null) {
                     toast("That does not look like a position code")
                 } else {
-                    view.applyState(parsed)
-                    iterSlider.value = (kotlin.math.ln(parsed.maxIter.toDouble()) /
+                    view.applyState(parsed.state)
+                    parsed.palette?.let { view.renderer.palette = it }
+                    iterSlider.value = (kotlin.math.ln(parsed.state.maxIter.toDouble()) /
                         kotlin.math.ln(2.0)).toFloat().coerceIn(5f, 16f)
                     updateReadout()
                 }
+                wake()
+            }
+            .show()
+    }
+
+
+    // --- Colours ----------------------------------------------------------------------
+
+    @SuppressLint("SetTextI18n")
+    private fun showPaletteDialog() {
+        val content = LayoutInflater.from(this).inflate(R.layout.dialog_palette, null)
+        val preview = content.findViewById<View>(R.id.c_preview)
+        val presetSlider = content.findViewById<Slider>(R.id.c_preset)
+        val cycleSlider = content.findViewById<Slider>(R.id.c_cycle)
+        val offsetSlider = content.findViewById<Slider>(R.id.c_offset)
+        val presetLabel = content.findViewById<TextView>(R.id.c_preset_label)
+        val cycleLabel = content.findViewById<TextView>(R.id.c_cycle_label)
+        val offsetLabel = content.findViewById<TextView>(R.id.c_offset_label)
+        val custom = content.findViewById<EditText>(R.id.c_custom)
+        val interior = content.findViewById<EditText>(R.id.c_interior)
+
+        val startingPalette = view.renderer.palette
+        presetSlider.valueTo = (Palettes.PRESETS.size - 1).toFloat()
+
+        val presetIndex = Palettes.PRESETS.indexOfFirst { it.name == startingPalette.name }
+        presetSlider.value = (if (presetIndex >= 0) presetIndex else 0).toFloat()
+        // Cycle length is a log slider: the useful range spans 4 to 8192 iterations per
+        // trip, and a linear control would bunch everything usable into one end.
+        cycleSlider.value = (ln(startingPalette.cycleLength.toDouble()) / ln(2.0))
+            .toFloat().coerceIn(2f, 13f)
+        offsetSlider.value = startingPalette.offset.coerceIn(0f, 1f)
+        if (presetIndex < 0) {
+            custom.setText(startingPalette.colors.joinToString(", ") { "#%06x".format(it) })
+        }
+        interior.setText("#%06x".format(startingPalette.interior and 0xFFFFFF))
+
+        fun current(): PaletteSpec {
+            val base = Palettes.PRESETS[presetSlider.value.toInt()]
+            val typed = PaletteSpec.parseColors(custom.text.toString())
+            val inside = PaletteSpec.parseColors(
+                interior.text.toString() + "," + interior.text.toString()
+            )?.firstOrNull() ?: 0x000000
+            return base.copy(
+                name = if (typed != null) "Custom" else base.name,
+                colors = typed ?: base.colors,
+                interior = inside,
+                cycleLength = 2.0.pow(cycleSlider.value.toDouble()).toFloat(),
+                offset = offsetSlider.value
+            )
+        }
+
+        fun refresh() {
+            val spec = current()
+            presetLabel.text = "Palette — ${spec.name}"
+            cycleLabel.text = "Band width — %.0f iterations per cycle".format(spec.cycleLength)
+            offsetLabel.text = "Rotation — %.0f%%".format(spec.offset * 100)
+
+            // Repeat the first stop at the end so the preview shows the wrap-around the
+            // shader actually samples.
+            val stops = (spec.colors + spec.colors.first())
+                .map { 0xFF000000.toInt() or it }.toIntArray()
+            preview.background = GradientDrawable(
+                GradientDrawable.Orientation.LEFT_RIGHT, stops
+            )
+            // Live preview: the fractal updates as you drag, which is the only way to
+            // judge band width honestly.
+            view.renderer.palette = spec
+            view.requestRender()
+        }
+
+        presetSlider.addOnChangeListener { _, _, _ ->
+            custom.setText("")
+            refresh()
+        }
+        cycleSlider.addOnChangeListener { _, _, _ -> refresh() }
+        offsetSlider.addOnChangeListener { _, _, _ -> refresh() }
+        refresh()
+
+        AlertDialog.Builder(this)
+            .setTitle("Colours")
+            .setView(content)
+            .setNegativeButton("Cancel") { _, _ ->
+                view.renderer.palette = startingPalette
+                view.requestRender()
+            }
+            .setPositiveButton("Apply") { _, _ ->
+                view.renderer.palette = current()
+                view.requestRender()
                 wake()
             }
             .show()

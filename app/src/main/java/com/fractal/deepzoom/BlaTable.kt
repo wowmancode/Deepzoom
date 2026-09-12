@@ -65,7 +65,7 @@ class BlaTable(
 
         const val MAX_LEVELS = 24
 
-        fun build(orbit: ReferenceOrbit, maxC: Double): BlaTable? {
+        fun build(orbit: ReferenceOrbit, maxC: Double, scale: Double): BlaTable? {
             // Level 0 starts at iteration 1: iteration 0 sits on the critical point,
             // where the validity radius is always zero.
             val count0 = orbit.count - 1
@@ -140,7 +140,6 @@ class BlaTable(
                 }
             }
 
-            val scale = orbit.scale
             for (i in 0 until total) {
                 val a = hypot(ax[i], ay[i])
                 val b = hypot(bx[i], by[i])
@@ -175,11 +174,10 @@ class BlaTable(
         /** Largest |dc| any pixel can have, with margin for orbit reuse across zooms. */
         fun maxCFor(spanY: Double, aspect: Double): Double {
             val halfDiag = 0.5 * spanY * hypot(1.0, abs(aspect))
-            // An orbit is reused across a 4x zoom range and panning up to 0.7 of a half
-            // span, so the table must stay valid for a larger image than the one it was
-            // built for. Overstating maxC shrinks radii, which costs speed but never
-            // correctness.
-            return halfDiag * 8.0
+            // Tables are reused while the view grows, so this is deliberately
+            // overstated: a larger bound shrinks radii, which costs a little speed but
+            // never correctness, and it means zooming out 16x before a rebuild.
+            return halfDiag * 16.0
         }
     }
 }

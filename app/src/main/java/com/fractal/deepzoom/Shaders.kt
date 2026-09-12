@@ -20,18 +20,19 @@ object Shaders {
 
         uniform vec2  uResolution;
         uniform int   uMaxIter;
-        uniform float uColorCycle;
 
-        vec3 palette(float t) {
-            return 0.5 + 0.5 * cos(6.28318530718 * (vec3(0.95, 1.00, 1.05) * t
-                                                    + vec3(0.10, 0.42, 0.74)));
-        }
+        uniform sampler2D uPalette;
+        uniform float uCycle;      // iterations per full trip around the palette
+        uniform float uOffset;
+        uniform vec3  uInterior;
 
-        // Continuous escape count. Without it the bands are integer steps and no
-        // palette tuning hides the contouring.
+        // Colour depends only on the escape count, never on zoom. An escape count does
+        // not change as you descend, so a pixel keeps its colour at any depth. The
+        // palette texture is sampled with repeat wrapping, so no fract() is needed and
+        // the seam blends.
         vec3 shade(int n, vec2 z) {
             float sn = float(n) + 1.0 - log2(0.5 * log2(dot(z, z)));
-            return palette(sn * uColorCycle);
+            return texture(uPalette, vec2(sn / uCycle + uOffset, 0.5)).rgb;
         }
 
         vec2 cmul(vec2 a, vec2 b) {
@@ -66,7 +67,7 @@ object Shaders {
             vec2 c = uCenter + (gl_FragCoord.xy - 0.5 * uResolution) * pixelSpan;
 
             if (inMainBulbs(c)) {
-                fragColor = vec4(0.0, 0.0, 0.0, 1.0);
+                fragColor = vec4(uInterior, 1.0);
                 return;
             }
 
@@ -100,7 +101,7 @@ object Shaders {
             }
 
             if (i >= uMaxIter) {
-                fragColor = vec4(0.0, 0.0, 0.0, 1.0);
+                fragColor = vec4(uInterior, 1.0);
                 return;
             }
             fragColor = vec4(shade(i, z), 1.0);
@@ -229,7 +230,7 @@ object Shaders {
                 }
             }
 
-            fragColor = vec4(0.0, 0.0, 0.0, 1.0);
+            fragColor = vec4(uInterior, 1.0);
         }
     """.trimIndent()
 }

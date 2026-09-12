@@ -12,10 +12,20 @@ import javax.microedition.khronos.opengles.GL10
 import kotlin.math.ceil
 import kotlin.math.min
 
+/** An orbit together with the zoom-dependent data derived from it. */
+class OrbitBundle(val orbit: ReferenceOrbit, val gpu: OrbitGpuData)
+
 class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer {
 
     var onOrbitStateChanged: ((building: Boolean) -> Unit)? = null
     var requestRender: (() -> Unit)? = null
+
+    @Volatile var palette: PaletteSpec = Palettes.PRESETS[0]
+        set(value) {
+            field = value
+            paletteDirty = true
+        }
+    @Volatile private var paletteDirty = true
 
     private var directProgram = 0
     private var perturbProgram = 0
@@ -24,18 +34,23 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
     private var orbitTexture = 0
     private var blaAbTexture = 0
     private var blaRTexture = 0
+    private var paletteTexture = 0
 
     private var surfaceW = 1
     private var surfaceH = 1
 
-    private var orbit: ReferenceOrbit? = null
-    @Volatile private var pendingOrbit: ReferenceOrbit? = null
+    /** Owned by the builder thread. */
+    private var workingOrbit: ReferenceOrbit? = null
+
+    /** Owned by the GL thread. */
+    private var active: OrbitBundle? = null
+
+    @Volatile private var pending: OrbitBundle? = null
 
     private var uploadedLen = 0
-    private var uploadedScaleExp = 0
     private var uploadedBlaLevels = 0
-    private var uploadedBlaOffset = IntArray(BlaTable.MAX_LEVELS)
-    private var uploadedBlaCount = IntArray(BlaTable.MAX_LEVELS)
+    private val uploadedBlaOffset = IntArray(BlaTable.MAX_LEVELS)
+    private val uploadedBlaCount = IntArray(BlaTable.MAX_LEVELS)
 
     private val building = AtomicBoolean(false)
     private val executor = Executors.newSingleThreadExecutor { r ->
@@ -60,11 +75,13 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         perturbProgram = buildProgram(Shaders.VERTEX, Shaders.PERTURBATION)
 
         cacheUniforms(directProgram, direct,
-            "uResolution", "uMaxIter", "uColorCycle", "uCenter", "uSpanY")
+            "uResolution", "uMaxIter", "uPalette", "uCycle", "uOffset", "uInterior",
+            "uCenter", "uSpanY")
         cacheUniforms(perturbProgram, perturb,
-            "uResolution", "uMaxIter", "uColorCycle", "uOrbit", "uBlaAB", "uBlaR",
-            "uWidthMask", "uWidthShift", "uOrbitLen", "uBlaLevels", "uBlaOffset[0]",
-            "uBlaCount[0]", "uDeltaCenter", "uPixelSpan", "uInvScale", "uBailoutScaled")
+            "uResolution", "uMaxIter", "uPalette", "uCycle", "uOffset", "uInterior",
+            "uOrbit", "uBlaAB", "uBlaR", "uWidthMask", "uWidthShift", "uOrbitLen",
+            "uBlaLevels", "uBlaOffset[0]", "uBlaCount[0]", "uDeltaCenter", "uPixelSpan",
+            "uInvScale", "uBailoutScaled")
 
         val ids = IntArray(1)
         GLES31.glGenVertexArrays(1, ids, 0)
@@ -73,13 +90,15 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         orbitTexture = createDataTexture()
         blaAbTexture = createDataTexture()
         blaRTexture = createDataTexture()
+        paletteTexture = createRampTexture()
 
         val sizeQuery = IntArray(1)
         GLES31.glGetIntegerv(GLES31.GL_MAX_TEXTURE_SIZE, sizeQuery, 0)
         maxTextureSizeCached = sizeQuery[0]
 
         // Everything from the previous context died with it.
-        orbit = null
+        active = null
+        paletteDirty = true
         fbo = 0
         fboW = 0
     }
@@ -96,6 +115,18 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         return ids[0]
     }
 
+    /** Linear filtering and repeat wrapping give the palette its blending and seam. */
+    private fun createRampTexture(): Int {
+        val ids = IntArray(1)
+        GLES31.glGenTextures(1, ids, 0)
+        GLES31.glBindTexture(GLES31.GL_TEXTURE_2D, ids[0])
+        GLES31.glTexParameteri(GLES31.GL_TEXTURE_2D, GLES31.GL_TEXTURE_MIN_FILTER, GLES31.GL_LINEAR)
+        GLES31.glTexParameteri(GLES31.GL_TEXTURE_2D, GLES31.GL_TEXTURE_MAG_FILTER, GLES31.GL_LINEAR)
+        GLES31.glTexParameteri(GLES31.GL_TEXTURE_2D, GLES31.GL_TEXTURE_WRAP_S, GLES31.GL_REPEAT)
+        GLES31.glTexParameteri(GLES31.GL_TEXTURE_2D, GLES31.GL_TEXTURE_WRAP_T, GLES31.GL_CLAMP_TO_EDGE)
+        return ids[0]
+    }
+
     override fun onSurfaceChanged(unused: GL10?, width: Int, height: Int) {
         surfaceW = width
         surfaceH = height
@@ -104,21 +135,19 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
 
     override fun onDrawFrame(unused: GL10?) {
         GLES31.glClear(GLES31.GL_COLOR_BUFFER_BIT)
+        uploadPaletteIfDirty()
 
-        pendingOrbit?.let {
-            pendingOrbit = null
-            orbit = it
-            upload(it)
+        pending?.let {
+            pending = null
+            active = it
+            upload(it.gpu)
         }
 
         if (state.needsPerturbation()) {
-            ensureOrbitAsync()
-            val o = orbit
-            if (o != null && o.scaleExp == uploadedScaleExp) {
-                drawPerturbation(state, o, surfaceW, surfaceH)
-            } else {
-                drawDirect(state, surfaceW, surfaceH)
-            }
+            ensureBundleAsync()
+            val b = active
+            if (b != null) drawPerturbation(state, b, surfaceW, surfaceH)
+            else drawDirect(state, surfaceW, surfaceH)
         } else {
             drawDirect(state, surfaceW, surfaceH)
         }
@@ -126,13 +155,26 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
 
     // --- Draw paths -------------------------------------------------------------------
 
+    private fun applyColorUniforms(u: HashMap<String, Int>) {
+        val p = palette
+        GLES31.glUniform1f(u["uCycle"]!!, p.cycleLength.coerceAtLeast(2f))
+        GLES31.glUniform1f(u["uOffset"]!!, p.offset)
+        GLES31.glUniform3f(
+            u["uInterior"]!!,
+            ((p.interior shr 16) and 0xFF) / 255f,
+            ((p.interior shr 8) and 0xFF) / 255f,
+            (p.interior and 0xFF) / 255f
+        )
+        bindTexture(3, paletteTexture, u["uPalette"]!!)
+    }
+
     private fun drawDirect(s: ViewState, w: Int, h: Int) {
         GLES31.glUseProgram(directProgram)
         GLES31.glBindVertexArray(vao)
 
         GLES31.glUniform2f(direct["uResolution"]!!, w.toFloat(), h.toFloat())
         GLES31.glUniform1i(direct["uMaxIter"]!!, s.maxIter)
-        GLES31.glUniform1f(direct["uColorCycle"]!!, colorCycle(s))
+        applyColorUniforms(direct)
         GLES31.glUniform2f(direct["uCenter"]!!, s.centerX.toFloat(), s.centerY.toFloat())
         GLES31.glUniform1f(direct["uSpanY"]!!, s.spanY.toFloat())
 
@@ -140,17 +182,17 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         GLES31.glBindVertexArray(0)
     }
 
-    private fun drawPerturbation(s: ViewState, o: ReferenceOrbit, w: Int, h: Int) {
+    private fun drawPerturbation(s: ViewState, b: OrbitBundle, w: Int, h: Int) {
         GLES31.glUseProgram(perturbProgram)
         GLES31.glBindVertexArray(vao)
 
-        val scale = o.scale
-        val offset = s.offsetFrom(o)
+        val scale = b.gpu.scale
+        val offset = s.offsetFrom(b.orbit)
         val pixelSpan = s.spanY / h
 
         GLES31.glUniform2f(perturb["uResolution"]!!, w.toFloat(), h.toFloat())
-        GLES31.glUniform1i(perturb["uMaxIter"]!!, s.maxIter)
-        GLES31.glUniform1f(perturb["uColorCycle"]!!, colorCycle(s))
+        GLES31.glUniform1i(perturb["uMaxIter"]!!, min(s.maxIter, b.orbit.iterBuilt))
+        applyColorUniforms(perturb)
 
         // Pre-scaled on the way in, so the shader never has to represent 1e-50.
         GLES31.glUniform2f(
@@ -168,12 +210,8 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
 
         GLES31.glUniform1i(perturb["uBlaLevels"]!!, uploadedBlaLevels)
         if (uploadedBlaLevels > 0) {
-            GLES31.glUniform1iv(
-                perturb["uBlaOffset[0]"]!!, uploadedBlaLevels, uploadedBlaOffset, 0
-            )
-            GLES31.glUniform1iv(
-                perturb["uBlaCount[0]"]!!, uploadedBlaLevels, uploadedBlaCount, 0
-            )
+            GLES31.glUniform1iv(perturb["uBlaOffset[0]"]!!, uploadedBlaLevels, uploadedBlaOffset, 0)
+            GLES31.glUniform1iv(perturb["uBlaCount[0]"]!!, uploadedBlaLevels, uploadedBlaCount, 0)
         }
 
         bindTexture(0, orbitTexture, perturb["uOrbit"]!!)
@@ -190,17 +228,20 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         GLES31.glUniform1i(location, unit)
     }
 
-    /** Widen colour bands with depth so detail does not compress into noise. */
-    private fun colorCycle(s: ViewState): Float {
-        val depth = s.zoomDepth().coerceAtLeast(0.0)
-        return (0.035 / (1.0 + depth * 0.04)).toFloat()
+    // --- Orbit lifecycle --------------------------------------------------------------
+
+    private fun needsRebuild(b: OrbitBundle?, aspect: Double): Boolean {
+        if (b == null) return true
+        if (state.maxIter > b.orbit.iterBuilt) return true
+        if (!state.canReuse(b.orbit, aspect)) return true
+        if (b.gpu.scaleExp != state.deltaScaleExponent()) return true
+        // A table built for a larger bound stays valid; only growing past it forces work.
+        return BlaTable.maxCFor(state.spanY, aspect) > b.gpu.maxC
     }
 
-    // --- Reference orbit --------------------------------------------------------------
-
-    private fun ensureOrbitAsync() {
+    private fun ensureBundleAsync() {
         val aspect = surfaceW.toDouble() / surfaceH
-        if (state.canReuse(orbit, aspect)) return
+        if (!needsRebuild(active, aspect)) return
         if (!building.compareAndSet(false, true)) return
 
         // Snapshot: the UI thread keeps mutating state while this runs.
@@ -214,7 +255,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         onOrbitStateChanged?.invoke(true)
         executor.execute {
             try {
-                pendingOrbit = ReferenceOrbit.compute(cx, cy, iter, span, exp, maxC)
+                pending = buildBundle(cx, cy, span, iter, exp, maxC, aspect)
             } finally {
                 building.set(false)
                 onOrbitStateChanged?.invoke(false)
@@ -223,36 +264,70 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         }
     }
 
+    /**
+     * Produces a bundle, reusing the existing orbit wherever possible.
+     *
+     * The orbit is the expensive part and it does not depend on zoom, so zooming out,
+     * zooming in within the guard digits, and small pans all skip straight to the cheap
+     * repack. Raising the detail slider extends rather than restarts.
+     */
+    private fun buildBundle(
+        cx: java.math.BigDecimal,
+        cy: java.math.BigDecimal,
+        span: Double,
+        iter: Int,
+        exp: Int,
+        maxC: Double,
+        aspect: Double
+    ): OrbitBundle {
+        val probe = ViewState().also {
+            it.centerX = cx; it.centerY = cy; it.spanY = span; it.maxIter = iter
+        }
+
+        var orbit = workingOrbit
+        if (orbit == null || !probe.canReuse(orbit, aspect)) {
+            orbit = ReferenceOrbit.compute(cx, cy, iter, span)
+        } else if (iter > orbit.iterBuilt) {
+            orbit.extendTo(iter)
+        }
+        workingOrbit = orbit
+
+        val snap = orbit.snapshot()
+        return OrbitBundle(snap, OrbitGpuData.build(snap, exp, maxC))
+    }
+
     /** Synchronous variant for export, where frames must not be skipped. */
-    private fun orbitForExport(
-        s: ViewState,
-        aspect: Double,
-        cached: ReferenceOrbit?
-    ): ReferenceOrbit {
-        if (s.canReuse(cached, aspect)) return cached!!
-        val built = ReferenceOrbit.compute(
-            s.centerX, s.centerY, s.maxIter, s.spanY,
-            s.deltaScaleExponent(), BlaTable.maxCFor(s.spanY, aspect)
+    private fun bundleForExport(s: ViewState, aspect: Double, cached: OrbitBundle?): OrbitBundle {
+        if (cached != null &&
+            s.maxIter <= cached.orbit.iterBuilt &&
+            s.canReuse(cached.orbit, aspect) &&
+            cached.gpu.scaleExp == s.deltaScaleExponent() &&
+            BlaTable.maxCFor(s.spanY, aspect) <= cached.gpu.maxC
+        ) return cached
+
+        val built = buildBundle(
+            s.centerX, s.centerY, s.spanY, s.maxIter,
+            s.deltaScaleExponent(), BlaTable.maxCFor(s.spanY, aspect), aspect
         )
-        upload(built)
+        upload(built.gpu)
         return built
     }
 
-    private fun upload(o: ReferenceOrbit) {
-        uploadOrbit(o)
-        uploadBla(o.bla)
-        uploadedScaleExp = o.scaleExp
+    // --- Uploads ----------------------------------------------------------------------
+
+    private fun upload(gpu: OrbitGpuData) {
+        uploadOrbit(gpu)
+        uploadBla(gpu.bla)
     }
 
-    private fun uploadOrbit(o: ReferenceOrbit) {
-        val points = min(o.count + 1, MAX_POINTS)
-        val packed = o.packForGpu()
+    private fun uploadOrbit(gpu: OrbitGpuData) {
+        val points = min(gpu.points, MAX_POINTS)
         val rows = rowsFor(points)
         val buf = floatBuffer(rows * TEX_WIDTH * 4)
 
-        buf.put(packed, 0, points * 4)
-        // The shader never reads past uOrbitLen, but leaving the row tail
-        // uninitialised invites driver-dependent surprises.
+        buf.put(gpu.packed, 0, points * 4)
+        // The shader never reads past uOrbitLen, but leaving the row tail uninitialised
+        // invites driver-dependent surprises.
         while (buf.position() < rows * TEX_WIDTH * 4) buf.put(0f)
         buf.position(0)
 
@@ -306,6 +381,24 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         }
     }
 
+    private fun uploadPaletteIfDirty() {
+        if (!paletteDirty) return
+        paletteDirty = false
+
+        val ramp = Palettes.buildRamp(palette)
+        val buf = ByteBuffer.allocateDirect(ramp.size).order(ByteOrder.nativeOrder())
+        buf.put(ramp)
+        buf.position(0)
+
+        GLES31.glBindTexture(GLES31.GL_TEXTURE_2D, paletteTexture)
+        GLES31.glPixelStorei(GLES31.GL_UNPACK_ALIGNMENT, 1)
+        GLES31.glTexImage2D(
+            GLES31.GL_TEXTURE_2D, 0, GLES31.GL_RGBA,
+            Palettes.TEXTURE_WIDTH, 1, 0,
+            GLES31.GL_RGBA, GLES31.GL_UNSIGNED_BYTE, buf
+        )
+    }
+
     private fun rowsFor(entries: Int): Int =
         ceil(entries / TEX_WIDTH.toDouble()).toInt().coerceAtLeast(1)
 
@@ -313,7 +406,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         ByteBuffer.allocateDirect(floats * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
 
     fun invalidateOrbit() {
-        orbit = null
+        active = null
     }
 
     // --- Offscreen rendering ----------------------------------------------------------
@@ -380,16 +473,17 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         w: Int,
         h: Int,
         out: ByteBuffer,
-        cachedOrbit: ReferenceOrbit?
-    ): ReferenceOrbit? {
+        cached: OrbitBundle?
+    ): OrbitBundle? {
         ensureFbo(w, h)
+        uploadPaletteIfDirty()
         GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, fbo)
         GLES31.glViewport(0, 0, w, h)
         GLES31.glClear(GLES31.GL_COLOR_BUFFER_BIT)
 
-        var used: ReferenceOrbit? = null
+        var used: OrbitBundle? = null
         if (s.needsPerturbation()) {
-            used = orbitForExport(s, w.toDouble() / h, cachedOrbit)
+            used = bundleForExport(s, w.toDouble() / h, cached)
             drawPerturbation(s, used, w, h)
         } else {
             drawDirect(s, w, h)

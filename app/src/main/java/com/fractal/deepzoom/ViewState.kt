@@ -58,7 +58,12 @@ class ViewState {
      */
     fun deltaScaleExponent(): Int {
         val log2Span = ln(spanY) / LN2
-        return (-TARGET_EXPONENT - log2Span).roundToInt().coerceIn(0, MAX_SCALE_EXP)
+        val ideal = -TARGET_EXPONENT - log2Span
+        // Quantised so the exponent only changes every 256x of zoom. Each change forces
+        // the orbit to be repacked and the BLA table rebuilt, and there is ample range
+        // headroom to absorb being a few binary orders off the ideal.
+        val stepped = (ideal / SCALE_QUANTUM).roundToInt() * SCALE_QUANTUM
+        return stepped.coerceIn(0, MAX_SCALE_EXP)
     }
 
     /**
@@ -79,10 +84,11 @@ class ViewState {
 
         private const val LN2 = 0.6931471805599453
         private const val TARGET_EXPONENT = 80
+        private const val SCALE_QUANTUM = 8
 
         // 2^118 leaves headroom for the squared term at bailout magnitude without
         // overflowing float32.
-        private const val MAX_SCALE_EXP = 118
+        private const val MAX_SCALE_EXP = 120
     }
 }
 
@@ -101,10 +107,10 @@ fun ViewState.offsetFrom(orbit: ReferenceOrbit): DoubleArray {
  */
 fun ViewState.canReuse(orbit: ReferenceOrbit?, aspect: Double): Boolean {
     if (orbit == null) return false
-    if (orbit.iterAtBuild < maxIter) return false
 
-    val zoomRatio = orbit.spanAtBuild / spanY
-    if (zoomRatio > 4.0 || zoomRatio < 0.25) return false
+    // Zooming out never invalidates an orbit: it has more digits than it needs. Only
+    // zooming in past the guard digits does.
+    if (spanY < orbit.spanAtBuild * ReferenceOrbit.ZOOM_IN_MARGIN) return false
 
     val off = offsetFrom(orbit)
     val halfY = spanY * 0.5

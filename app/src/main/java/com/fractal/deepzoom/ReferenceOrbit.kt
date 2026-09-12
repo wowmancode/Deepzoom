@@ -6,105 +6,130 @@ import kotlin.math.ceil
 import kotlin.math.log10
 import kotlin.math.max
 import kotlin.math.min
-import kotlin.math.pow
 
 /**
  * A single point's orbit, iterated in arbitrary precision on the CPU.
  *
- * Precision beyond float32 lives only here. Every pixel renders as a small offset
- * from this orbit, so 90-digit arithmetic is paid for once per frame rather than two
- * million times.
+ * This is the most expensive thing the app does — roughly 300 ms for 65536 iterations
+ * on a desktop JVM, and noticeably worse on a phone — so the design here is mostly
+ * about *not* recomputing it.
  *
- * Orbit values are kept as doubles as well as GPU floats: the BLA table is built from
- * them on the CPU, and building it in float would compound rounding across thousands
- * of merge steps.
+ * Two properties make that possible. The orbit depends on the centre and the iteration
+ * count, but not on the zoom: zoom only sets how many digits are needed, and an orbit
+ * computed with spare guard digits stays valid as you zoom in, and stays valid forever
+ * as you zoom out. And the iteration is a plain forward recurrence, so raising the
+ * detail slider extends the existing orbit instead of restarting it.
+ *
+ * Everything that does depend on zoom — the delta scaling and the BLA radii — lives in
+ * OrbitGpuData, which is cheap to rebuild.
  */
 class ReferenceOrbit(
     val centerX: BigDecimal,
     val centerY: BigDecimal,
-    val zx: DoubleArray,
-    val zy: DoubleArray,
+    var zx: DoubleArray,
+    var zy: DoubleArray,
     /** Valid point indices are 0..count. */
-    val count: Int,
-    val scaleExp: Int,
+    var count: Int,
+    var iterBuilt: Int,
     val spanAtBuild: Double,
-    val iterAtBuild: Int,
-    val maxCAtBuild: Double
+    private val precision: Int,
+    private var lastX: BigDecimal,
+    private var lastY: BigDecimal,
+    private var escaped: Boolean
 ) {
-    val scale: Double get() = 2.0.pow(scaleExp)
+    /**
+     * Continues an existing orbit to a higher iteration count.
+     *
+     * The saved BigDecimal state is the whole reason this is possible; without it a
+     * nudge of the detail slider would mean paying the full cost again.
+     */
+    fun extendTo(newMaxIter: Int) {
+        if (newMaxIter <= iterBuilt) return
+        if (escaped) {
+            iterBuilt = newMaxIter
+            return
+        }
 
-    var bla: BlaTable? = null
-        internal set
+        val mc = MathContext(precision)
+        if (zx.size < newMaxIter + 2) {
+            zx = zx.copyOf(newMaxIter + 2)
+            zy = zy.copyOf(newMaxIter + 2)
+        }
+
+        var x = lastX
+        var y = lastY
+        var n = count
+
+        while (n <= newMaxIter) {
+            zx[n] = x.toDouble()
+            zy[n] = y.toDouble()
+
+            val x2 = x.multiply(x, mc)
+            val y2 = y.multiply(y, mc)
+            if (x2.add(y2, mc).toDouble() > ESCAPE_SQ) {
+                escaped = true
+                break
+            }
+
+            val nx = x2.subtract(y2, mc).add(centerX, mc)
+            val ny = x.multiply(y, mc).multiply(TWO, mc).add(centerY, mc)
+            x = nx.round(mc)
+            y = ny.round(mc)
+            n++
+        }
+
+        lastX = x
+        lastY = y
+        count = min(n, newMaxIter)
+        iterBuilt = newMaxIter
+    }
 
     /**
-     * Four floats per point: (2*Zx, 2*Zy, Zx*scale, Zy*scale).
+     * A stable view of the orbit as it stands now.
      *
-     * Both forms are needed every iteration — the doubled value for the 2*Z*d term,
-     * the scaled value to reconstruct the true position — so precomputing both removes
-     * two multiplies from the inner loop.
+     * extendTo mutates, and the render thread holds onto whatever it was last given,
+     * so the builder hands over an immutable snapshot instead. The arrays are shared
+     * rather than copied: extendTo only writes past the old count and reallocates
+     * rather than overwriting, so existing indices never change under a reader.
      */
-    fun packForGpu(): FloatArray {
-        val scale = this.scale
-        val out = FloatArray((count + 1) * 4)
-        for (n in 0..count) {
-            val i = n * 4
-            out[i] = (zx[n] * 2.0).toFloat()
-            out[i + 1] = (zy[n] * 2.0).toFloat()
-            out[i + 2] = (zx[n] * scale).toFloat()
-            out[i + 3] = (zy[n] * scale).toFloat()
-        }
-        return out
-    }
+    fun snapshot(): ReferenceOrbit = ReferenceOrbit(
+        centerX, centerY, zx, zy, count, iterBuilt, spanAtBuild, precision,
+        lastX, lastY, escaped
+    )
 
     companion object {
         private val TWO = BigDecimal(2)
         private const val ESCAPE_SQ = 4.0
 
+        /**
+         * Guard digits beyond what the current zoom strictly needs. Generous on
+         * purpose: each spare digit is a decade of zooming in that reuses the orbit
+         * rather than rebuilding it, and the benchmark says digit count barely affects
+         * build time anyway.
+         */
+        private const val GUARD_DIGITS = 30
+
         fun precisionFor(spanY: Double): Int {
             val decades = max(0.0, ceil(-log10(spanY)))
-            return 30 + decades.toInt()
+            return GUARD_DIGITS + decades.toInt()
         }
+
+        /** How far in this orbit can be zoomed before its digits run short. */
+        const val ZOOM_IN_MARGIN = 1e-6
 
         fun compute(
             cx: BigDecimal,
             cy: BigDecimal,
             maxIter: Int,
-            spanY: Double,
-            scaleExp: Int,
-            maxC: Double
+            spanY: Double
         ): ReferenceOrbit {
-            val mc = MathContext(precisionFor(spanY))
-
-            val zx = DoubleArray(maxIter + 2)
-            val zy = DoubleArray(maxIter + 2)
-            var x = BigDecimal.ZERO
-            var y = BigDecimal.ZERO
-            var n = 0
-
-            while (n <= maxIter) {
-                zx[n] = x.toDouble()
-                zy[n] = y.toDouble()
-
-                val x2 = x.multiply(x, mc)
-                val y2 = y.multiply(y, mc)
-
-                // The reference escaping is normal. It just bounds how far the shader
-                // can walk before it has to rebase.
-                if (x2.add(y2, mc).toDouble() > ESCAPE_SQ) break
-
-                val nx = x2.subtract(y2, mc).add(cx, mc)
-                val ny = x.multiply(y, mc).multiply(TWO, mc).add(cy, mc)
-                x = nx.round(mc)
-                y = ny.round(mc)
-                n++
-            }
-
-            // A normal exit leaves n one past the last written index; an escape break
-            // leaves it pointing at it.
             val orbit = ReferenceOrbit(
-                cx, cy, zx, zy, min(n, maxIter), scaleExp, spanY, maxIter, maxC
+                cx, cy,
+                DoubleArray(maxIter + 2), DoubleArray(maxIter + 2),
+                0, 0, spanY, precisionFor(spanY),
+                BigDecimal.ZERO, BigDecimal.ZERO, false
             )
-            orbit.bla = BlaTable.build(orbit, maxC)
+            orbit.extendTo(maxIter)
             return orbit
         }
     }

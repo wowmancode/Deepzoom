@@ -94,6 +94,15 @@
                     android:textSize="14sp" />
 
                 <Button
+                    android:id="@+id/colors"
+                    style="?android:attr/borderlessButtonStyle"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Colors"
+                    android:textColor="#7FA6D8"
+                    android:textSize="14sp" />
+
+                <Button
                     android:id="@+id/save_png"
                     style="?android:attr/borderlessButtonStyle"
                     android:layout_width="wrap_content"

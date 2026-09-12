@@ -89,7 +89,7 @@ class ExportManager(private val view: MandelbrotView) {
                 encoder.start()
                 val buf = allocate(settings.width, settings.height)
                 val frameState = snapshot.snapshot()
-                var orbit: ReferenceOrbit? = null
+                var bundle: OrbitBundle? = null
 
                 for (i in 0 until total) {
                     if (i < total - settings.holdFrames) {
@@ -102,8 +102,8 @@ class ExportManager(private val view: MandelbrotView) {
                         frameState.spanY = ViewState.DEFAULT_SPAN
                     }
 
-                    orbit = view.renderer.renderOffscreen(
-                        frameState, settings.width, settings.height, buf, orbit
+                    bundle = view.renderer.renderOffscreen(
+                        frameState, settings.width, settings.height, buf, bundle
                     )
                     encoder.encodeFrame(buf)
                     progress.onProgress(i + 1, total)

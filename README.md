@@ -38,7 +38,10 @@ supplies the Gradle CLI instead.
   ratio, resolution, frame rate, zoom-out per frame, and quality are all adjustable,
   and the dialog shows resulting frame count, duration, and bitrate before you commit.
   H.264 MP4 in Movies/DeepZoom.
-- **Copy position / Go to** — the current location as a text code, and back again.
+- **Colors** — nine presets, adjustable band width and rotation, custom palettes as a
+  list of hex values, and a custom interior colour. The fractal updates live as you
+  drag, which is the only honest way to judge band width.
+- **Copy position / Go to** — location and palette as a text code, and back again.
 
 Height sets the vertical span in every ratio, so a wider ratio reveals more of the
 plane to the sides rather than cropping the framing you set up.
@@ -129,6 +132,23 @@ Measured against high-precision ground truth, in loop iterations per pixel:
 
 The speedup grows with depth, which is the opposite of how the naive loop behaves.
 
+**Orbit reuse** is the one you feel while browsing. The reference orbit costs roughly
+300 ms per 65536 iterations on a desktop JVM and worse on a phone, and precision barely
+affects that — 40 digits and 150 digits are within 15% of each other, because the cost
+is allocation, not arithmetic. So the answer is not a faster orbit but fewer of them.
+The orbit is now decoupled from zoom entirely:
+
+- Zooming **out** never rebuilds. The orbit has more digits than it needs.
+- Zooming **in** reuses it for six decades, on the guard digits it was built with.
+- Raising the detail slider **extends** the orbit from its saved state instead of
+  restarting it.
+- The delta scale is quantised to powers of 256, so the cheap repack happens every 256x
+  of zoom rather than every 2x, and BLA tables are built with a bound generous enough
+  to survive 16x of zooming out.
+
+For a long zoom-out video this means one orbit for the entire render instead of one per
+couple of decades.
+
 Other optimisations:
 
 - **Periodicity detection** on the direct path. Interior points settle into a cycle,
@@ -140,6 +160,20 @@ Other optimisations:
 - **Mask-and-shift table indexing** instead of integer division and modulo, which are
   slow on mobile GPUs. Texture widths are powers of two specifically for this.
 - **Analytic interior tests** for the main cardioid and period-2 bulb.
+- **Parallel YUV conversion** during video export. It is the dominant CPU cost per
+  frame and every row is independent, so it is split across all cores.
+
+### Colour
+
+Colour is a pure function of the smooth escape count, with no zoom term anywhere. A
+point's escape count does not change when you zoom, so a pixel keeps its colour at any
+depth. An earlier version scaled the colour cycle with depth to keep band widths even;
+that made the whole image rotate through the palette as you zoomed. Band width is
+instead set directly, in iterations per trip around the palette.
+
+Palettes are rendered to a 1024-wide ramp texture and sampled with linear filtering and
+repeat wrapping, which is what gives the blending and a seamless wrap. Any number of
+colour stops works without touching the shader.
 
 ### Verification
 
