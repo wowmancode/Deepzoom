@@ -369,6 +369,7 @@ class MainActivity : AppCompatActivity() {
         val summary = content.findViewById<TextView>(R.id.v_summary)
         val warning = content.findViewById<TextView>(R.id.v_warning)
         val expMapCheck = content.findViewById<android.widget.CheckBox>(R.id.v_expmap)
+        val dumpCheck = content.findViewById<android.widget.CheckBox>(R.id.v_dumpstrip)
 
         fun settings(): ExportManager.VideoSettings {
             val h = videoHeights[resSlider.value.toInt()]
@@ -379,7 +380,8 @@ class MainActivity : AppCompatActivity() {
                 fps = fpsOptions[fpsSlider.value.toInt()],
                 zoomPerFrame = zoomSlider.value.toDouble(),
                 bitsPerPixel = qualityBpp[qualitySlider.value.toInt()],
-                exponentialMap = expMapCheck.isChecked
+                exponentialMap = expMapCheck.isChecked,
+                dumpStrip = dumpCheck.isChecked
             )
         }
 

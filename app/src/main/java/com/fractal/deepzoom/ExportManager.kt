@@ -28,6 +28,7 @@ class ExportManager(private val view: MandelbrotView) {
         val zoomPerFrame: Double,
         val bitsPerPixel: Double,
         val exponentialMap: Boolean = true,
+        val dumpStrip: Boolean = false,
         val holdFrames: Int = 12
     )
 
@@ -105,6 +106,24 @@ class ExportManager(private val view: MandelbrotView) {
                     view.renderer.onStripProgress = { done, target ->
                         progress.onStripBuild(done, target)
                     }
+                }
+
+                // Diagnostic: build the first frame's strip window, write it out as an
+                // image, and stop. Splits "strip is wrong" from "unwarp is wrong".
+                if (geom != null && settings.dumpStrip) {
+                    val window = StripGeometry.windowFor(
+                        geom, frameState.spanY, settings.height, settings.width
+                    )
+                    view.renderer.stripExtendTo(frameState, geom, window.last, null)
+                    val dims = intArrayOf(geom.width, geom.ringHeight)
+                    val dump = allocate(dims[0], dims[1])
+                    view.renderer.stripDump(dump)
+                    encoder.abort()
+                    val u = ImageExporter.savePng(
+                        context, dump, dims[0], dims[1], "deepzoom_strip_${timestamp()}.png"
+                    )
+                    onDone(u, if (u == null) "Could not write strip image" else null)
+                    return@queueEvent
                 }
 
                 for (i in 0 until total) {

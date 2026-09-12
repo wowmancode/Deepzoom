@@ -100,6 +100,14 @@
             android:text="Exponential map (much faster zoom-out)"
             android:textSize="13sp" />
 
+        <CheckBox
+            android:id="@+id/v_dumpstrip"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:checked="false"
+            android:text="Debug: save strip as image instead of video"
+            android:textSize="13sp" />
+
         <TextView
             android:id="@+id/v_summary"
             android:layout_width="match_parent"

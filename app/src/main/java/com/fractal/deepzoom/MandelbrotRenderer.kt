@@ -999,7 +999,9 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         GLES31.glUniform2f(unwarp["uResolution"]!!, w.toFloat(), h.toFloat())
         GLES31.glUniform1f(unwarp["uRingHeight"]!!, stripRing.toFloat())
         // Row for a one-pixel radius, so the shader only adds log(radius in pixels).
-        GLES31.glUniform1f(unwarp["uRowBase"]!!, geom.rowFor(ln(spanY / h)).toFloat())
+        // Row N occupies texel centre N+0.5, so the sample has to be nudged or every
+        // row is read half a texel low.
+        GLES31.glUniform1f(unwarp["uRowBase"]!!, (geom.rowFor(ln(spanY / h)) + 0.5).toFloat())
         GLES31.glUniform1f(unwarp["uStepInv"]!!, (1.0 / geom.step).toFloat())
         GLES31.glUniform1f(unwarp["uMinRadius"]!!, StripGeometry.MIN_RADIUS_PX.toFloat())
         bindTexture(6, stripTex, unwarp["uStrip"]!!)
@@ -1013,6 +1015,20 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
 
         GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, 0)
         GLES31.glViewport(0, 0, surfaceW, surfaceH)
+    }
+
+    /**
+     * Reads the strip texture back as RGBA, for diagnosing the strip separately from
+     * the unwarp. If the strip has content and frames are still blank, the fault is in
+     * the resampling; if the strip is blank too, it is in the strip render.
+     */
+    fun stripDump(out: ByteBuffer): IntArray {
+        GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, stripFbo)
+        out.position(0)
+        GLES31.glReadPixels(0, 0, stripW, stripRing, GLES31.GL_RGBA, GLES31.GL_UNSIGNED_BYTE, out)
+        out.position(0)
+        GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, 0)
+        return intArrayOf(stripW, stripRing)
     }
 
     fun stripEnd() {
