@@ -27,6 +27,7 @@ class ExportManager(private val view: MandelbrotView) {
         val fps: Int,
         val zoomPerFrame: Double,
         val bitsPerPixel: Double,
+        val exponentialMap: Boolean = true,
         val holdFrames: Int = 12
     )
 
@@ -91,6 +92,14 @@ class ExportManager(private val view: MandelbrotView) {
                 val frameState = snapshot.snapshot()
                 var bundle: OrbitBundle? = null
 
+                // Exponential map renders every scale in the zoom exactly once, so a
+                // frame costs only the few new strip rows it exposes rather than a
+                // full render. Falls back silently if the strip will not fit.
+                val geom = stripFor(
+                    settings, snapshot.spanY, view.renderer.maxTextureSizeCached
+                )
+                if (geom != null) view.renderer.stripBegin(geom)
+
                 for (i in 0 until total) {
                     if (i < total - settings.holdFrames) {
                         frameState.spanY = (snapshot.spanY *
@@ -102,9 +111,21 @@ class ExportManager(private val view: MandelbrotView) {
                         frameState.spanY = ViewState.DEFAULT_SPAN
                     }
 
-                    bundle = view.renderer.renderOffscreen(
-                        frameState, settings.width, settings.height, buf, bundle
-                    )
+                    if (geom != null) {
+                        val window = StripGeometry.windowFor(
+                            geom, frameState.spanY, settings.height, settings.width
+                        )
+                        bundle = view.renderer.stripExtendTo(
+                            frameState, geom, window.last, bundle
+                        )
+                        view.renderer.stripUnwarp(
+                            geom, frameState.spanY, settings.width, settings.height, buf
+                        )
+                    } else {
+                        bundle = view.renderer.renderOffscreen(
+                            frameState, settings.width, settings.height, buf, bundle
+                        )
+                    }
                     encoder.encodeFrame(buf)
                     progress.onProgress(i + 1, total)
                 }
@@ -114,6 +135,7 @@ class ExportManager(private val view: MandelbrotView) {
                 error = e.message ?: e.javaClass.simpleName
                 encoder.abort()
             } finally {
+                view.renderer.stripEnd()
                 view.renderer.releaseExportResources()
                 view.renderer.invalidateOrbit()
                 view.requestRender()
@@ -129,6 +151,16 @@ class ExportManager(private val view: MandelbrotView) {
         SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
 
     companion object {
+        /** Ceiling on the strip ring buffer. Beyond this, fall back to plain frames. */
+        const val STRIP_MEMORY_BUDGET = 160L * 1024 * 1024
+
+        fun stripFor(settings: VideoSettings, deepestSpan: Double, maxTex: Int): StripGeometry? =
+            if (!settings.exponentialMap) null
+            else StripGeometry.build(
+                settings.width, settings.height, deepestSpan,
+                maxTex.coerceAtLeast(2048), STRIP_MEMORY_BUDGET
+            )
+
         fun frameCount(startSpan: Double, settings: VideoSettings): Int {
             if (startSpan >= ViewState.DEFAULT_SPAN) return settings.holdFrames + 1
             val steps = ln(ViewState.DEFAULT_SPAN / startSpan) / ln(settings.zoomPerFrame)

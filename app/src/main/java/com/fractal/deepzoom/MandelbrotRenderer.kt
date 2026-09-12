@@ -11,6 +11,7 @@ import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 import kotlin.math.ceil
 import kotlin.math.max
+import kotlin.math.ln
 import kotlin.math.min
 
 /** An orbit together with the zoom-dependent data derived from it. */
@@ -33,6 +34,15 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
     private var directTileProgram = 0
     private var perturbTileProgram = 0
     private var blitProgram = 0
+    private var directStripProgram = 0
+    private var perturbStripProgram = 0
+    private var unwarpProgram = 0
+
+    // Exponential-map strip, held as a ring buffer of rows.
+    private var stripFbo = 0
+    private var stripTex = 0
+    private var stripW = 0
+    private var stripRing = 0
 
     // One texel per tile: 1 means the border pass proved the tile entirely interior.
     private var tileFbo = 0
@@ -104,6 +114,9 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
     private val blit = HashMap<String, Int>()
     private val directTile = HashMap<String, Int>()
     private val perturbTile = HashMap<String, Int>()
+    private val directStrip = HashMap<String, Int>()
+    private val perturbStrip = HashMap<String, Int>()
+    private val unwarp = HashMap<String, Int>()
 
     private var fbo = 0
     private var fboTex = 0
@@ -126,6 +139,15 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         perturbTileProgram = buildProgram(Shaders.VERTEX, Shaders.PERTURB_TILE)
         cacheUniforms(directTileProgram, directTile, *DIRECT_UNIFORMS)
         cacheUniforms(perturbTileProgram, perturbTile, *PERTURB_UNIFORMS)
+
+        directStripProgram = buildProgram(Shaders.VERTEX, Shaders.DIRECT_STRIP)
+        perturbStripProgram = buildProgram(Shaders.VERTEX, Shaders.PERTURB_STRIP)
+        cacheUniforms(directStripProgram, directStrip, *DIRECT_UNIFORMS)
+        cacheUniforms(perturbStripProgram, perturbStrip, *PERTURB_UNIFORMS)
+
+        unwarpProgram = buildProgram(Shaders.VERTEX, Shaders.UNWARP)
+        cacheUniforms(unwarpProgram, unwarp,
+            "uStrip", "uResolution", "uRingHeight", "uRowBase", "uStepInv", "uMinRadius")
 
         blitProgram = buildProgram(Shaders.VERTEX, Shaders.BLIT)
         cacheUniforms(blitProgram, blit,
@@ -153,6 +175,8 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         sceneW = 0
         tileFbo = 0
         tileTexW = 0
+        stripFbo = 0
+        stripW = 0
         snapValid = false
         markDirty()
     }
@@ -801,6 +825,174 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         return used
     }
 
+
+    // --- Exponential-map strip --------------------------------------------------------
+
+    /**
+     * Highest absolute row rendered so far, plus the state the strip belongs to.
+     * Rows are written once and never revisited, which is the entire point.
+     */
+    private var stripRowsDone = 0
+    private var stripStarted = false
+
+    fun stripBegin(geom: StripGeometry) {
+        ensureStrip(geom.width, geom.ringHeight)
+        stripRowsDone = 0
+        stripStarted = true
+    }
+
+    private fun ensureStrip(w: Int, ring: Int) {
+        if (stripW == w && stripRing == ring && stripFbo != 0) return
+
+        val ids = IntArray(1)
+        if (stripFbo != 0) { ids[0] = stripFbo; GLES31.glDeleteFramebuffers(1, ids, 0); stripFbo = 0 }
+        if (stripTex != 0) { ids[0] = stripTex; GLES31.glDeleteTextures(1, ids, 0); stripTex = 0 }
+
+        GLES31.glGenTextures(1, ids, 0)
+        stripTex = ids[0]
+        GLES31.glBindTexture(GLES31.GL_TEXTURE_2D, stripTex)
+        GLES31.glTexImage2D(
+            GLES31.GL_TEXTURE_2D, 0, GLES31.GL_RGBA8, w, ring, 0,
+            GLES31.GL_RGBA, GLES31.GL_UNSIGNED_BYTE, null
+        )
+        GLES31.glTexParameteri(GLES31.GL_TEXTURE_2D, GLES31.GL_TEXTURE_MIN_FILTER, GLES31.GL_LINEAR)
+        GLES31.glTexParameteri(GLES31.GL_TEXTURE_2D, GLES31.GL_TEXTURE_MAG_FILTER, GLES31.GL_LINEAR)
+        // Angle wraps at 2*pi, and the vertical axis is a ring buffer. Repeat on both
+        // makes the wrap free rather than something the shader has to handle.
+        GLES31.glTexParameteri(GLES31.GL_TEXTURE_2D, GLES31.GL_TEXTURE_WRAP_S, GLES31.GL_REPEAT)
+        GLES31.glTexParameteri(GLES31.GL_TEXTURE_2D, GLES31.GL_TEXTURE_WRAP_T, GLES31.GL_REPEAT)
+
+        GLES31.glGenFramebuffers(1, ids, 0)
+        stripFbo = ids[0]
+        GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, stripFbo)
+        GLES31.glFramebufferTexture2D(
+            GLES31.GL_FRAMEBUFFER, GLES31.GL_COLOR_ATTACHMENT0,
+            GLES31.GL_TEXTURE_2D, stripTex, 0
+        )
+        val status = GLES31.glCheckFramebufferStatus(GLES31.GL_FRAMEBUFFER)
+        GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, 0)
+        if (status != GLES31.GL_FRAMEBUFFER_COMPLETE) {
+            throw RuntimeException("Strip target unavailable at ${w}x$ring")
+        }
+
+        stripW = w
+        stripRing = ring
+    }
+
+    /** Extends the strip so every row up to and including lastRow exists. */
+    fun stripExtendTo(s: ViewState, geom: StripGeometry, lastRow: Int, cached: OrbitBundle?): OrbitBundle? {
+        if (!stripStarted) stripBegin(geom)
+        var bundle = cached
+        if (lastRow < stripRowsDone) return bundle
+
+        GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, stripFbo)
+        uploadPaletteIfDirty()
+
+        var row = stripRowsDone
+        while (row <= lastRow) {
+            // A chunk stops at the ring wrap, and at the boundary between radii that
+            // still need perturbation and radii where plain float32 is fine.
+            val dest = row % stripRing
+            val untilWrap = stripRing - dest
+            val radius = Math.exp(geom.logR0 + row * geom.step)
+            val deep = radius < ViewState.DIRECT_LIMIT
+
+            var count = min(untilWrap, lastRow - row + 1)
+            if (deep) {
+                val crossing = ((ln(ViewState.DIRECT_LIMIT) - geom.logR0) / geom.step).toInt() - row
+                if (crossing in 1 until count) count = crossing
+            }
+
+            val probe = s.snapshot()
+            probe.spanY = max(radius * 2.0, s.minSpan())
+            if (deep) bundle = bundleForExport(probe, 1.0, bundle)
+
+            val u = if (deep) perturbStrip else directStrip
+            val program = if (deep) perturbStripProgram else directStripProgram
+            val scale = if (deep) bundle!!.gpu.scale else 1.0
+
+            GLES31.glViewport(0, dest, stripW, count)
+            GLES31.glUseProgram(program)
+            GLES31.glBindVertexArray(vao)
+
+            GLES31.glUniform2f(u["uResolution"]!!, stripW.toFloat(), stripRing.toFloat())
+            GLES31.glUniform1i(u["uMaxIter"]!!, if (deep) min(s.maxIter, bundle!!.orbit.iterBuilt) else s.maxIter)
+            applyColorUniforms(u)
+            applyTileUniforms(u, false)
+
+            // Radius is built multiplicatively from a per-chunk base: at depth the
+            // absolute log radius is around -130, where a float cannot separate rows.
+            GLES31.glUniform1f(u["uStripRBase"]!!, Math.exp(geom.logR0 + row * geom.step + ln(scale)).toFloat())
+            GLES31.glUniform1f(u["uStripRowBase"]!!, dest + 0.5f)
+            GLES31.glUniform1f(u["uStripStep"]!!, geom.step.toFloat())
+            GLES31.glUniform1f(u["uStripWidth"]!!, stripW.toFloat())
+
+            if (deep) {
+                val b = bundle!!
+                val offset = probe.offsetFrom(b.orbit)
+                GLES31.glUniform2f(u["uDeltaCenter"]!!,
+                    (offset[0] * scale).toFloat(), (offset[1] * scale).toFloat())
+                GLES31.glUniform1f(u["uPixelSpan"]!!, 0f)
+                GLES31.glUniform1f(u["uInvScale"]!!, (1.0 / scale).toFloat())
+                GLES31.glUniform1f(u["uBailoutScaled"]!!, (BAILOUT * scale).toFloat())
+                GLES31.glUniform1i(u["uWidthMask"]!!, TEX_WIDTH - 1)
+                GLES31.glUniform1i(u["uWidthShift"]!!, TEX_SHIFT)
+                GLES31.glUniform1i(u["uOrbitLen"]!!, uploadedLen)
+                GLES31.glUniform1i(u["uBlaLevels"]!!, uploadedBlaLevels)
+                if (uploadedBlaLevels > 0) {
+                    GLES31.glUniform1iv(u["uBlaOffset[0]"]!!, uploadedBlaLevels, uploadedBlaOffset, 0)
+                    GLES31.glUniform1iv(u["uBlaCount[0]"]!!, uploadedBlaLevels, uploadedBlaCount, 0)
+                }
+                bindTexture(0, orbitTexture, u["uOrbit"]!!)
+                bindTexture(1, blaAbTexture, u["uBlaAB"]!!)
+                bindTexture(2, blaRTexture, u["uBlaR"]!!)
+            } else {
+                GLES31.glUniform2f(u["uCenter"]!!, s.centerX.toFloat(), s.centerY.toFloat())
+                GLES31.glUniform1f(u["uSpanY"]!!, 1f)
+            }
+
+            GLES31.glDrawArrays(GLES31.GL_TRIANGLES, 0, 3)
+            GLES31.glBindVertexArray(0)
+            row += count
+        }
+
+        GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, 0)
+        stripRowsDone = lastRow + 1
+        return bundle
+    }
+
+    /** Resamples the strip into a normal frame and reads it back. */
+    fun stripUnwarp(geom: StripGeometry, spanY: Double, w: Int, h: Int, out: ByteBuffer) {
+        ensureFbo(w, h)
+        GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, fbo)
+        GLES31.glViewport(0, 0, w, h)
+
+        GLES31.glUseProgram(unwarpProgram)
+        GLES31.glBindVertexArray(vao)
+        GLES31.glUniform2f(unwarp["uResolution"]!!, w.toFloat(), h.toFloat())
+        GLES31.glUniform1f(unwarp["uRingHeight"]!!, stripRing.toFloat())
+        // Row for a one-pixel radius, so the shader only adds log(radius in pixels).
+        GLES31.glUniform1f(unwarp["uRowBase"]!!, geom.rowFor(ln(spanY / h)).toFloat())
+        GLES31.glUniform1f(unwarp["uStepInv"]!!, (1.0 / geom.step).toFloat())
+        GLES31.glUniform1f(unwarp["uMinRadius"]!!, StripGeometry.MIN_RADIUS_PX.toFloat())
+        bindTexture(6, stripTex, unwarp["uStrip"]!!)
+
+        GLES31.glDrawArrays(GLES31.GL_TRIANGLES, 0, 3)
+        GLES31.glBindVertexArray(0)
+
+        out.position(0)
+        GLES31.glReadPixels(0, 0, w, h, GLES31.GL_RGBA, GLES31.GL_UNSIGNED_BYTE, out)
+        out.position(0)
+
+        GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, 0)
+        GLES31.glViewport(0, 0, surfaceW, surfaceH)
+    }
+
+    fun stripEnd() {
+        stripStarted = false
+        invalidateOrbit()
+    }
+
     fun releaseExportResources() {
         releaseFbo()
         // The tile target was resized for the export; put it back for the screen.
@@ -865,7 +1057,8 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
 
         private val SHARED_UNIFORMS = arrayOf(
             "uResolution", "uMaxIter", "uPalette", "uCycle", "uOffset", "uInterior",
-            "uTiles", "uTileSize", "uUseTiles"
+            "uTiles", "uTileSize", "uUseTiles",
+            "uStripRBase", "uStripRowBase", "uStripStep", "uStripWidth"
         )
         private val DIRECT_UNIFORMS = SHARED_UNIFORMS + arrayOf("uCenter", "uSpanY")
         private val PERTURB_UNIFORMS = SHARED_UNIFORMS + arrayOf(

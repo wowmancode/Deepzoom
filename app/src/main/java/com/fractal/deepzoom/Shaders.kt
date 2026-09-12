@@ -26,6 +26,11 @@ object Shaders {
         uniform float uOffset;
         uniform vec3  uInterior;
 
+        uniform float uStripRBase;
+        uniform float uStripRowBase;
+        uniform float uStripStep;
+        uniform float uStripWidth;
+
         uniform sampler2D uTiles;
         uniform int   uTileSize;
         uniform int   uUseTiles;
@@ -115,9 +120,8 @@ object Shaders {
             return dot(d, d) <= 0.0625;
         }
 
-        bool escapes(vec2 frag, out int outN, out vec2 outZ) {
-            float pixelSpan = uSpanY / uResolution.y;
-            vec2 c = uCenter + (frag - 0.5 * uResolution) * pixelSpan;
+        bool escapesOffset(vec2 off, out int outN, out vec2 outZ) {
+            vec2 c = uCenter + off;
             outN = uMaxIter;
             outZ = vec2(0.0);
 
@@ -147,6 +151,11 @@ object Shaders {
                 }
             }
             return false;
+        }
+
+        bool escapes(vec2 frag, out int outN, out vec2 outZ) {
+            float pixelSpan = uSpanY / uResolution.y;
+            return escapesOffset((frag - 0.5 * uResolution) * pixelSpan, outN, outZ);
         }
     """.trimIndent()
 
@@ -200,8 +209,8 @@ object Shaders {
             return texelFetch(uBlaR, ivec2(i & uWidthMask, i >> uWidthShift), 0).r;
         }
 
-        bool escapes(vec2 frag, out int outN, out vec2 outZ) {
-            vec2 dc = uDeltaCenter + (frag - 0.5 * uResolution) * uPixelSpan;
+        bool escapesOffset(vec2 off, out int outN, out vec2 outZ) {
+            vec2 dc = uDeltaCenter + off;
             outN = uMaxIter;
             outZ = vec2(0.0);
 
@@ -267,6 +276,10 @@ object Shaders {
             }
             return false;
         }
+
+        bool escapes(vec2 frag, out int outN, out vec2 outZ) {
+            return escapesOffset((frag - 0.5 * uResolution) * uPixelSpan, outN, outZ);
+        }
     """.trimIndent()
 
     private val MAIN_BODY = """
@@ -285,10 +298,78 @@ object Shaders {
         }
     """.trimIndent()
 
+
+    /**
+     * Renders rows of the exponential-map strip.
+     *
+     * The strip is the whole zoom in log-polar coordinates: horizontal is angle over
+     * 2*pi, vertical is log radius from the zoom centre. Every scale in the zoom
+     * appears exactly once, at exactly the resolution the animation needs, so no
+     * iteration is ever computed twice across the whole video. Advancing the zoom by
+     * one frame only extends the strip by a few rows, instead of recomputing a whole
+     * frame's worth of pixels.
+     *
+     * The radius is built up multiplicatively from a per-chunk base rather than from
+     * an absolute log, because at depth the absolute log radius is around -130 and a
+     * float there has nowhere near enough resolution to separate adjacent rows.
+     */
+    private val STRIP_BODY = """
+        void main() {
+            float angle = (gl_FragCoord.x / uStripWidth) * 6.28318530718;
+            float r = uStripRBase * exp((gl_FragCoord.y - uStripRowBase) * uStripStep);
+            vec2 off = r * vec2(cos(angle), sin(angle));
+
+            int n;
+            vec2 z;
+            if (!escapesOffset(off, n, z)) {
+                fragColor = vec4(uInterior, 1.0);
+                return;
+            }
+            fragColor = vec4(shade(n, z), 1.0);
+        }
+    """.trimIndent()
+
+    /**
+     * Turns strip rows back into a normal frame.
+     *
+     * Both texture axes wrap: angle wraps at 2*pi, and the vertical axis is a ring
+     * buffer holding only the rows the current frame needs. The seam between oldest
+     * and newest row always falls outside that window, so linear filtering across it
+     * never shows.
+     */
+    val UNWARP = """
+        #version 310 es
+        precision highp float;
+        precision highp sampler2D;
+
+        out vec4 fragColor;
+
+        uniform sampler2D uStrip;
+        uniform vec2  uResolution;
+        uniform float uRingHeight;
+        uniform float uRowBase;     // strip row for a one-pixel radius
+        uniform float uStepInv;     // rows per unit of log radius
+        uniform float uMinRadius;
+
+        void main() {
+            vec2 p = gl_FragCoord.xy - 0.5 * uResolution;
+            // The few pixels at the very centre would need rows from arbitrarily deep
+            // in the strip, so they are clamped to the innermost one available.
+            float rpx = max(length(p), uMinRadius);
+            float row = uRowBase + log(rpx) * uStepInv;
+            fragColor = vec4(
+                texture(uStrip, vec2(atan(p.y, p.x) / 6.28318530718, row / uRingHeight)).rgb,
+                1.0
+            );
+        }
+    """.trimIndent()
+
     val DIRECT = "#version 310 es\n$COMMON\n$DIRECT_CORE\n$MAIN_BODY"
     val DIRECT_TILE = "#version 310 es\n$COMMON\n$DIRECT_CORE\n$TILE_BODY"
     val PERTURBATION = "#version 310 es\n$COMMON\n$PERTURB_CORE\n$MAIN_BODY"
     val PERTURB_TILE = "#version 310 es\n$COMMON\n$PERTURB_CORE\n$TILE_BODY"
+    val DIRECT_STRIP = "#version 310 es\n$COMMON\n$DIRECT_CORE\n$STRIP_BODY"
+    val PERTURB_STRIP = "#version 310 es\n$COMMON\n$PERTURB_CORE\n$STRIP_BODY"
 
     /**
      * Presents an already-rendered frame, optionally reprojected.

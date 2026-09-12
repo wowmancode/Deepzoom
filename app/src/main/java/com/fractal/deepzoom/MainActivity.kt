@@ -368,6 +368,7 @@ class MainActivity : AppCompatActivity() {
         val qualityLabel = content.findViewById<TextView>(R.id.v_quality_label)
         val summary = content.findViewById<TextView>(R.id.v_summary)
         val warning = content.findViewById<TextView>(R.id.v_warning)
+        val expMapCheck = content.findViewById<android.widget.CheckBox>(R.id.v_expmap)
 
         fun settings(): ExportManager.VideoSettings {
             val h = videoHeights[resSlider.value.toInt()]
@@ -377,7 +378,8 @@ class MainActivity : AppCompatActivity() {
                 height = h,
                 fps = fpsOptions[fpsSlider.value.toInt()],
                 zoomPerFrame = zoomSlider.value.toDouble(),
-                bitsPerPixel = qualityBpp[qualitySlider.value.toInt()]
+                bitsPerPixel = qualityBpp[qualitySlider.value.toInt()],
+                exponentialMap = expMapCheck.isChecked
             )
         }
 
@@ -397,6 +399,22 @@ class MainActivity : AppCompatActivity() {
             summary.text = "$frames frames  ·  %d:%02d long".format(
                 (seconds / 60).toInt(), (seconds % 60).toInt()
             )
+            // Report the real figure from the geometry that will actually be used,
+            // rather than an idealised one: the strip gets narrowed to fit memory, and
+            // that changes both the speedup and the corner sharpness.
+            val geom = ExportManager.stripFor(
+                s, view.state.spanY, view.renderer.maxTextureSizeCached
+            )
+            if (geom != null) {
+                val ratio = StripGeometry.speedup(geom, s.width, s.height, s.zoomPerFrame)
+                val soft = StripGeometry.cornerSoftness(geom, s.width, s.height)
+                summary.append("  ·  ~%.0fx faster".format(ratio))
+                if (soft > 1.3) {
+                    summary.append("  ·  corners %.1fx softer".format(soft))
+                }
+            } else if (expMapCheck.isChecked) {
+                summary.append("  ·  strip will not fit, rendering frames directly")
+            }
             warning.text = if (frames > 400)
                 "Long export. Every frame is a full render, and the view is blocked until done."
             else
@@ -408,6 +426,7 @@ class MainActivity : AppCompatActivity() {
         fpsSlider.addOnChangeListener { _, _, _ -> refresh() }
         zoomSlider.addOnChangeListener { _, _, _ -> refresh() }
         qualitySlider.addOnChangeListener { _, _, _ -> refresh() }
+        expMapCheck.setOnCheckedChangeListener { _, _ -> refresh() }
         refresh()
 
         AlertDialog.Builder(this)
