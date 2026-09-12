@@ -31,25 +31,37 @@ supplies the Gradle CLI instead.
 
 ## Export
 
-- **Save PNG** — renders offscreen at screen size, 1080p, 4K, or 8K and writes to
-  Pictures/DeepZoom. Export resolution is independent of the render-resolution slider.
-- **Save video** — renders a zoom-out from wherever you are back to the whole set.
-  You choose resolution, frame rate, and how much to widen per frame; the dialog shows
-  the resulting frame count and duration before you commit. Output goes to
-  Movies/DeepZoom as H.264 MP4.
+- **Save PNG** — offscreen render at 720p through 8640p, in any of seven aspect
+  ratios, written to Pictures/DeepZoom. Independent of the render-resolution slider.
+  Sizes above the device's texture limit are allowed and flagged rather than blocked.
+- **Save video** — a zoom-out from wherever you are back to the whole set. Aspect
+  ratio, resolution, frame rate, zoom-out per frame, and quality are all adjustable,
+  and the dialog shows resulting frame count, duration, and bitrate before you commit.
+  H.264 MP4 in Movies/DeepZoom.
 - **Copy position / Go to** — the current location as a text code, and back again.
 
-Zoom-out steps are multiplicative, not additive: a constant percentage per frame reads
-as constant speed, whereas constant additive steps would crawl at depth and lurch at
-the end.
+Height sets the vertical span in every ratio, so a wider ratio reveals more of the
+plane to the sides rather than cropping the framing you set up.
+
+Zoom-out steps are multiplicative. A constant percentage per frame reads as constant
+speed; constant additive steps would crawl at depth and lurch at the end.
 
 Position codes write the centre as a plain decimal string rather than a double. At
 depth the coordinate needs more digits than a double holds, so round-tripping through
 one would silently land you somewhere else.
 
-Both exports run on the GL thread and block the interactive view while they work.
-Every video frame is a full deep-zoom render, so wall-clock cost scales with depth as
-much as with frame count.
+### Video quality
+
+Fractal frames are near the worst case for an inter-frame codec: every pixel is
+high-contrast detail that changes every frame, so motion estimation has almost nothing
+to reuse, and rates that look generous for ordinary video are visibly destructive.
+The quality setting is expressed in bits per pixel per frame — Standard 0.25, High
+0.5, Maximum 1.0 — which at 1080p30 works out to roughly 15, 31, and 62 Mbps. The
+encoder also requests High profile (CABAC, 8x8 transforms) where the device offers it,
+falling back rather than failing, and keyframes every second instead of every two.
+
+Chroma is still subsampled to 4:2:0, which is inherent to H.264 and does cost some
+colour detail on the finest filaments.
 
 ## How deep it goes
 
@@ -95,20 +107,38 @@ background thread; the old orbit keeps rendering meanwhile.
 
 There is no `-O3` for shaders. GLSL is compiled by the GPU driver at runtime and is
 always optimised at full strength; there is no flag to turn. The Kotlin side is a
-rounding error against per-pixel GPU work, so build-level optimisation would not move
-anything either. The wins available are algorithmic:
+rounding error against per-pixel GPU work. The wins here are algorithmic.
+
+**Bivariate linear approximation** is the large one, and it is what the deep-zoom
+numbers rest on. Where the delta is small and the reference is not near a critical
+point, the squared term in the perturbed iteration is negligible, leaving a map that
+is linear in both delta and c. Linear maps compose, so runs of consecutive iterations
+collapse into a single `d -> A*d + B*dc` valid inside a radius r. The table holds
+those composites at every power-of-two length, and a pixel takes the longest jump its
+delta fits inside. Radii are non-increasing as levels merge, so the lookup climbs from
+level 0 and stops at the first failure rather than searching.
+
+Measured against high-precision ground truth, in loop iterations per pixel:
+
+| span | without BLA | with BLA | speedup |
+|------|------------|----------|---------|
+| 1e-20 | 9069 | 4294 | 2.1x |
+| 1e-28 | 20000 | 3101 | 6.4x |
+| 1e-40 | 20000 | 37 | 540x |
+| 1e-55 | 20000 | 10 | 2000x |
+
+The speedup grows with depth, which is the opposite of how the naive loop behaves.
+
+Other optimisations:
 
 - **Periodicity detection** on the direct path. Interior points settle into a cycle,
-  and comparing against a lazily-updated earlier value detects that in O(1) space.
-  Catching an interior pixel at iteration 200 instead of 65536 is the single largest
-  saving on that path.
+  detected in O(1) space against a lazily-updated earlier value. Catching an interior
+  pixel at iteration 200 instead of 65536 is the largest saving on that path.
 - **Pre-scaled orbit data.** The orbit texture stores `2*Z` and `Z*scale` already
-  computed, removing two multiplies from every iteration of every pixel. The delta
-  scale is fixed when the orbit is built rather than per frame, which is what makes
-  this possible.
-- **Mask-and-shift orbit indexing** instead of integer division and modulo, which are
-  slow on mobile GPUs. The texture width is a power of two specifically for this.
-- **One texture fetch per iteration**, carried across the loop rather than re-fetched.
+  computed, removing two multiplies from every iteration. The delta scale is fixed
+  when the orbit is built rather than per frame, which is what makes this possible.
+- **Mask-and-shift table indexing** instead of integer division and modulo, which are
+  slow on mobile GPUs. Texture widths are powers of two specifically for this.
 - **Analytic interior tests** for the main cardioid and period-2 bulb.
 
 ### Going deeper than 1e60

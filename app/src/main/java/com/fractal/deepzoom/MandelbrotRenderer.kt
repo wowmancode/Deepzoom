@@ -20,15 +20,22 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
     private var directProgram = 0
     private var perturbProgram = 0
     private var vao = 0
+
     private var orbitTexture = 0
+    private var blaAbTexture = 0
+    private var blaRTexture = 0
 
     private var surfaceW = 1
     private var surfaceH = 1
 
     private var orbit: ReferenceOrbit? = null
     @Volatile private var pendingOrbit: ReferenceOrbit? = null
+
     private var uploadedLen = 0
     private var uploadedScaleExp = 0
+    private var uploadedBlaLevels = 0
+    private var uploadedBlaOffset = IntArray(BlaTable.MAX_LEVELS)
+    private var uploadedBlaCount = IntArray(BlaTable.MAX_LEVELS)
 
     private val building = AtomicBoolean(false)
     private val executor = Executors.newSingleThreadExecutor { r ->
@@ -38,11 +45,13 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
     private val direct = HashMap<String, Int>()
     private val perturb = HashMap<String, Int>()
 
-    // Offscreen target, reused across export frames.
     private var fbo = 0
     private var fboTex = 0
     private var fboW = 0
     private var fboH = 0
+
+    @Volatile var maxTextureSizeCached: Int = 0
+        private set
 
     override fun onSurfaceCreated(unused: GL10?, config: EGLConfig?) {
         GLES31.glClearColor(0f, 0f, 0f, 1f)
@@ -53,32 +62,38 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         cacheUniforms(directProgram, direct,
             "uResolution", "uMaxIter", "uColorCycle", "uCenter", "uSpanY")
         cacheUniforms(perturbProgram, perturb,
-            "uResolution", "uMaxIter", "uColorCycle", "uOrbit", "uWidthMask",
-            "uWidthShift", "uOrbitLen", "uDeltaCenter", "uPixelSpan", "uInvScale",
-            "uBailoutScaled")
+            "uResolution", "uMaxIter", "uColorCycle", "uOrbit", "uBlaAB", "uBlaR",
+            "uWidthMask", "uWidthShift", "uOrbitLen", "uBlaLevels", "uBlaOffset[0]",
+            "uBlaCount[0]", "uDeltaCenter", "uPixelSpan", "uInvScale", "uBailoutScaled")
 
         val ids = IntArray(1)
         GLES31.glGenVertexArrays(1, ids, 0)
         vao = ids[0]
 
-        GLES31.glGenTextures(1, ids, 0)
-        orbitTexture = ids[0]
-        GLES31.glBindTexture(GLES31.GL_TEXTURE_2D, orbitTexture)
-        // This texture is a data array addressed in 2D, not an image. Any filtering
-        // would be corruption.
-        GLES31.glTexParameteri(GLES31.GL_TEXTURE_2D, GLES31.GL_TEXTURE_MIN_FILTER, GLES31.GL_NEAREST)
-        GLES31.glTexParameteri(GLES31.GL_TEXTURE_2D, GLES31.GL_TEXTURE_MAG_FILTER, GLES31.GL_NEAREST)
-        GLES31.glTexParameteri(GLES31.GL_TEXTURE_2D, GLES31.GL_TEXTURE_WRAP_S, GLES31.GL_CLAMP_TO_EDGE)
-        GLES31.glTexParameteri(GLES31.GL_TEXTURE_2D, GLES31.GL_TEXTURE_WRAP_T, GLES31.GL_CLAMP_TO_EDGE)
+        orbitTexture = createDataTexture()
+        blaAbTexture = createDataTexture()
+        blaRTexture = createDataTexture()
 
         val sizeQuery = IntArray(1)
         GLES31.glGetIntegerv(GLES31.GL_MAX_TEXTURE_SIZE, sizeQuery, 0)
         maxTextureSizeCached = sizeQuery[0]
 
-        // The old context's texture died with it.
+        // Everything from the previous context died with it.
         orbit = null
         fbo = 0
         fboW = 0
+    }
+
+    /** Data arrays addressed in 2D. Any filtering would be corruption. */
+    private fun createDataTexture(): Int {
+        val ids = IntArray(1)
+        GLES31.glGenTextures(1, ids, 0)
+        GLES31.glBindTexture(GLES31.GL_TEXTURE_2D, ids[0])
+        GLES31.glTexParameteri(GLES31.GL_TEXTURE_2D, GLES31.GL_TEXTURE_MIN_FILTER, GLES31.GL_NEAREST)
+        GLES31.glTexParameteri(GLES31.GL_TEXTURE_2D, GLES31.GL_TEXTURE_MAG_FILTER, GLES31.GL_NEAREST)
+        GLES31.glTexParameteri(GLES31.GL_TEXTURE_2D, GLES31.GL_TEXTURE_WRAP_S, GLES31.GL_CLAMP_TO_EDGE)
+        GLES31.glTexParameteri(GLES31.GL_TEXTURE_2D, GLES31.GL_TEXTURE_WRAP_T, GLES31.GL_CLAMP_TO_EDGE)
+        return ids[0]
     }
 
     override fun onSurfaceChanged(unused: GL10?, width: Int, height: Int) {
@@ -93,7 +108,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         pendingOrbit?.let {
             pendingOrbit = null
             orbit = it
-            uploadOrbit(it)
+            upload(it)
         }
 
         if (state.needsPerturbation()) {
@@ -147,16 +162,32 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         GLES31.glUniform1f(perturb["uInvScale"]!!, (1.0 / scale).toFloat())
         GLES31.glUniform1f(perturb["uBailoutScaled"]!!, (BAILOUT * scale).toFloat())
 
-        GLES31.glUniform1i(perturb["uWidthMask"]!!, ORBIT_TEX_WIDTH - 1)
-        GLES31.glUniform1i(perturb["uWidthShift"]!!, ORBIT_TEX_SHIFT)
+        GLES31.glUniform1i(perturb["uWidthMask"]!!, TEX_WIDTH - 1)
+        GLES31.glUniform1i(perturb["uWidthShift"]!!, TEX_SHIFT)
         GLES31.glUniform1i(perturb["uOrbitLen"]!!, uploadedLen)
 
-        GLES31.glActiveTexture(GLES31.GL_TEXTURE0)
-        GLES31.glBindTexture(GLES31.GL_TEXTURE_2D, orbitTexture)
-        GLES31.glUniform1i(perturb["uOrbit"]!!, 0)
+        GLES31.glUniform1i(perturb["uBlaLevels"]!!, uploadedBlaLevels)
+        if (uploadedBlaLevels > 0) {
+            GLES31.glUniform1iv(
+                perturb["uBlaOffset[0]"]!!, uploadedBlaLevels, uploadedBlaOffset, 0
+            )
+            GLES31.glUniform1iv(
+                perturb["uBlaCount[0]"]!!, uploadedBlaLevels, uploadedBlaCount, 0
+            )
+        }
+
+        bindTexture(0, orbitTexture, perturb["uOrbit"]!!)
+        bindTexture(1, blaAbTexture, perturb["uBlaAB"]!!)
+        bindTexture(2, blaRTexture, perturb["uBlaR"]!!)
 
         GLES31.glDrawArrays(GLES31.GL_TRIANGLES, 0, 3)
         GLES31.glBindVertexArray(0)
+    }
+
+    private fun bindTexture(unit: Int, texture: Int, location: Int) {
+        GLES31.glActiveTexture(GLES31.GL_TEXTURE0 + unit)
+        GLES31.glBindTexture(GLES31.GL_TEXTURE_2D, texture)
+        GLES31.glUniform1i(location, unit)
     }
 
     /** Widen colour bands with depth so detail does not compress into noise. */
@@ -178,11 +209,12 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         val span = state.spanY
         val iter = state.maxIter
         val exp = state.deltaScaleExponent()
+        val maxC = BlaTable.maxCFor(span, aspect)
 
         onOrbitStateChanged?.invoke(true)
         executor.execute {
             try {
-                pendingOrbit = ReferenceOrbit.compute(cx, cy, iter, span, exp)
+                pendingOrbit = ReferenceOrbit.compute(cx, cy, iter, span, exp, maxC)
             } finally {
                 building.set(false)
                 onOrbitStateChanged?.invoke(false)
@@ -192,42 +224,93 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
     }
 
     /** Synchronous variant for export, where frames must not be skipped. */
-    private fun orbitForExport(s: ViewState, aspect: Double, cached: ReferenceOrbit?): ReferenceOrbit {
+    private fun orbitForExport(
+        s: ViewState,
+        aspect: Double,
+        cached: ReferenceOrbit?
+    ): ReferenceOrbit {
         if (s.canReuse(cached, aspect)) return cached!!
         val built = ReferenceOrbit.compute(
-            s.centerX, s.centerY, s.maxIter, s.spanY, s.deltaScaleExponent()
+            s.centerX, s.centerY, s.maxIter, s.spanY,
+            s.deltaScaleExponent(), BlaTable.maxCFor(s.spanY, aspect)
         )
-        uploadOrbit(built)
+        upload(built)
         return built
     }
 
+    private fun upload(o: ReferenceOrbit) {
+        uploadOrbit(o)
+        uploadBla(o.bla)
+        uploadedScaleExp = o.scaleExp
+    }
+
     private fun uploadOrbit(o: ReferenceOrbit) {
-        val points = min(o.count + 1, MAX_ORBIT_POINTS)
-        val rows = ceil(points / ORBIT_TEX_WIDTH.toDouble()).toInt().coerceAtLeast(1)
-        val texels = rows * ORBIT_TEX_WIDTH
+        val points = min(o.count + 1, MAX_POINTS)
+        val packed = o.packForGpu()
+        val rows = rowsFor(points)
+        val buf = floatBuffer(rows * TEX_WIDTH * 4)
 
-        val buf: FloatBuffer = ByteBuffer
-            .allocateDirect(texels * 4 * 4)
-            .order(ByteOrder.nativeOrder())
-            .asFloatBuffer()
-
-        buf.put(o.data, 0, points * 4)
+        buf.put(packed, 0, points * 4)
         // The shader never reads past uOrbitLen, but leaving the row tail
         // uninitialised invites driver-dependent surprises.
-        while (buf.position() < texels * 4) buf.put(0f)
+        while (buf.position() < rows * TEX_WIDTH * 4) buf.put(0f)
         buf.position(0)
 
         GLES31.glBindTexture(GLES31.GL_TEXTURE_2D, orbitTexture)
         GLES31.glPixelStorei(GLES31.GL_UNPACK_ALIGNMENT, 1)
         GLES31.glTexImage2D(
             GLES31.GL_TEXTURE_2D, 0, GLES31.GL_RGBA32F,
-            ORBIT_TEX_WIDTH, rows, 0,
-            GLES31.GL_RGBA, GLES31.GL_FLOAT, buf
+            TEX_WIDTH, rows, 0, GLES31.GL_RGBA, GLES31.GL_FLOAT, buf
+        )
+        uploadedLen = points - 1
+    }
+
+    private fun uploadBla(bla: BlaTable?) {
+        if (bla == null || bla.total == 0 || bla.total > MAX_BLA_ENTRIES) {
+            uploadedBlaLevels = 0
+            return
+        }
+
+        val rows = rowsFor(bla.total)
+
+        val abBuf = floatBuffer(rows * TEX_WIDTH * 4)
+        abBuf.put(bla.ab, 0, bla.total * 4)
+        while (abBuf.position() < rows * TEX_WIDTH * 4) abBuf.put(0f)
+        abBuf.position(0)
+
+        GLES31.glBindTexture(GLES31.GL_TEXTURE_2D, blaAbTexture)
+        GLES31.glPixelStorei(GLES31.GL_UNPACK_ALIGNMENT, 1)
+        GLES31.glTexImage2D(
+            GLES31.GL_TEXTURE_2D, 0, GLES31.GL_RGBA32F,
+            TEX_WIDTH, rows, 0, GLES31.GL_RGBA, GLES31.GL_FLOAT, abBuf
         )
 
-        uploadedLen = points - 1
-        uploadedScaleExp = o.scaleExp
+        val rBuf = floatBuffer(rows * TEX_WIDTH)
+        rBuf.put(bla.radius, 0, bla.total)
+        // Zero radius means "never valid", so padding is inert by construction.
+        while (rBuf.position() < rows * TEX_WIDTH) rBuf.put(0f)
+        rBuf.position(0)
+
+        GLES31.glBindTexture(GLES31.GL_TEXTURE_2D, blaRTexture)
+        GLES31.glTexImage2D(
+            GLES31.GL_TEXTURE_2D, 0, GLES31.GL_R32F,
+            TEX_WIDTH, rows, 0, GLES31.GL_RED, GLES31.GL_FLOAT, rBuf
+        )
+
+        uploadedBlaLevels = min(bla.levels, BlaTable.MAX_LEVELS)
+        java.util.Arrays.fill(uploadedBlaOffset, 0)
+        java.util.Arrays.fill(uploadedBlaCount, 0)
+        for (k in 0 until uploadedBlaLevels) {
+            uploadedBlaOffset[k] = bla.levelOffset[k]
+            uploadedBlaCount[k] = bla.levelCount[k]
+        }
     }
+
+    private fun rowsFor(entries: Int): Int =
+        ceil(entries / TEX_WIDTH.toDouble()).toInt().coerceAtLeast(1)
+
+    private fun floatBuffer(floats: Int): FloatBuffer =
+        ByteBuffer.allocateDirect(floats * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
 
     fun invalidateOrbit() {
         orbit = null
@@ -262,7 +345,10 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, 0)
         if (status != GLES31.GL_FRAMEBUFFER_COMPLETE) {
             releaseFbo()
-            throw RuntimeException("Offscreen target incomplete: 0x${status.toString(16)}")
+            throw RuntimeException(
+                "Cannot render at ${w}x${h} on this device (framebuffer status " +
+                    "0x${status.toString(16)}). Try a smaller size."
+            )
         }
 
         fboW = w
@@ -287,9 +373,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
 
     /**
      * Renders one view offscreen at an arbitrary size and reads it back as RGBA.
-     *
-     * Must be called on the GL thread. The returned buffer is bottom-up, matching
-     * glReadPixels; callers flip as needed.
+     * Must be called on the GL thread. The buffer is bottom-up, as glReadPixels gives it.
      */
     fun renderOffscreen(
         s: ViewState,
@@ -318,7 +402,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, 0)
         GLES31.glViewport(0, 0, surfaceW, surfaceH)
 
-        // The live view's orbit upload was clobbered by the export's.
+        // The live view's uploads were clobbered by the export's.
         invalidateOrbit()
         return used
     }
@@ -326,10 +410,6 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
     fun releaseExportResources() {
         releaseFbo()
     }
-
-    /** Queried once on the GL thread; readable from anywhere afterwards. */
-    @Volatile var maxTextureSizeCached: Int = 0
-        private set
 
     fun shutdown() {
         executor.shutdownNow()
@@ -378,9 +458,10 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
     }
 
     companion object {
-        const val ORBIT_TEX_WIDTH = 1024
-        const val ORBIT_TEX_SHIFT = 10
-        const val MAX_ORBIT_POINTS = 1024 * 128
+        const val TEX_WIDTH = 1024
+        const val TEX_SHIFT = 10
+        const val MAX_POINTS = 1024 * 128
+        const val MAX_BLA_ENTRIES = 1024 * 256
         const val BAILOUT = 8.0
     }
 }

@@ -40,8 +40,8 @@ object Shaders {
     """.trimIndent()
 
     /**
-     * Direct iteration. Used above ~1e-4 span, where float32 still resolves pixels
-     * and perturbation would be pure overhead.
+     * Direct iteration, used above ~1e-4 span where float32 still resolves pixels and
+     * perturbation would be pure overhead.
      */
     val DIRECT = """
         #version 310 es
@@ -51,8 +51,7 @@ object Shaders {
         uniform float uSpanY;
 
         // The main cardioid and period-2 bulb are the two largest solid regions.
-        // Testing them analytically avoids running their pixels to uMaxIter, which is
-        // where most of the frame time goes when zoomed out.
+        // Testing them analytically avoids running their pixels to uMaxIter.
         bool inMainBulbs(vec2 c) {
             float xm = c.x - 0.25;
             float y2 = c.y * c.y;
@@ -78,7 +77,7 @@ object Shaders {
             // Periodicity check: interior points settle into a cycle, and comparing
             // against a lazily-updated earlier value detects that in O(1) space.
             // Catching an interior pixel at iteration 200 instead of 65536 is the
-            // single largest saving available on this path.
+            // largest saving available on this path.
             vec2 hare = vec2(0.0);
             int period = 1;
             int periodLimit = 1;
@@ -109,35 +108,44 @@ object Shaders {
     """.trimIndent()
 
     /**
-     * Perturbation with rebasing.
+     * Perturbation, with rebasing and bivariate linear approximation.
      *
      * Each pixel tracks its offset d from a high-precision reference orbit Z:
      *
      *     d(n+1) = 2*Z(n)*d(n) + d(n)^2 + dc
      *
      * Z stays O(1) and d stays small, so both fit in float32 even where the true
-     * coordinates need 60 decimal digits. All deltas are carried pre-multiplied by
-     * uScale because the true deltas sit below float32's denormal floor at depth.
+     * coordinates need 60 decimal digits. Deltas are carried pre-multiplied by the
+     * orbit's scale, because the true values sit below float32's denormal floor.
      *
-     * Rebasing (Zhuoran's method): when a pixel's true value falls below its own
-     * delta in magnitude, the reference has stopped being informative, so the pixel
-     * restarts at orbit index 0 carrying its full value forward. This is exact,
-     * unlike detecting glitched pixels heuristically and re-rendering them against
-     * secondary references — no glitch blobs, one orbit.
+     * Two accelerations sit on top of that recurrence:
      *
-     * Inner-loop cost has been pared to one texture fetch and one complex multiply
-     * beyond the recurrence itself: the orbit texture stores 2*Z and Z*scale
-     * precomputed, and the index splits by mask and shift rather than integer
-     * division, which is slow on mobile GPUs.
+     * Rebasing (Zhuoran) — when a pixel's true value falls below its own delta in
+     * magnitude, the reference has stopped being informative, so the pixel restarts at
+     * orbit index 0 carrying its full value forward. Exact, rather than detecting
+     * glitched pixels heuristically and re-rendering them.
+     *
+     * BLA (Zhuoran) — where the squared term is negligible the recurrence is linear,
+     * and composed runs of it are precomputed at every power-of-two length. A pixel
+     * takes the longest jump whose validity radius still contains its delta. Because
+     * radii shrink monotonically as levels merge, the lookup climbs from level 0 and
+     * stops at the first failure instead of searching.
      */
     val PERTURBATION = """
         #version 310 es
         $COMMON
 
         uniform sampler2D uOrbit;
+        uniform sampler2D uBlaAB;
+        uniform sampler2D uBlaR;
+
         uniform int   uWidthMask;
         uniform int   uWidthShift;
         uniform int   uOrbitLen;
+
+        uniform int   uBlaLevels;
+        uniform int   uBlaOffset[24];
+        uniform int   uBlaCount[24];
 
         uniform vec2  uDeltaCenter;    // (view centre - reference), pre-scaled
         uniform float uPixelSpan;      // complex units per pixel, pre-scaled
@@ -148,24 +156,63 @@ object Shaders {
             return texelFetch(uOrbit, ivec2(i & uWidthMask, i >> uWidthShift), 0);
         }
 
+        vec4 fetchAB(int i) {
+            return texelFetch(uBlaAB, ivec2(i & uWidthMask, i >> uWidthShift), 0);
+        }
+
+        float fetchR(int i) {
+            return texelFetch(uBlaR, ivec2(i & uWidthMask, i >> uWidthShift), 0).r;
+        }
+
         void main() {
             vec2 dc = uDeltaCenter + (gl_FragCoord.xy - 0.5 * uResolution) * uPixelSpan;
 
             vec2 dz = vec2(0.0);
             int m = 0;
-            vec4 t = fetchZ(0);        // t.xy = 2*Z, t.zw = Z*scale
+            int n = 0;
+            vec4 t = fetchZ(0);
 
-            for (int n = 0; n < uMaxIter; n++) {
-                // d^2 in scaled units is d*(d/scale). Computing it this way keeps the
-                // intermediate in range; a plain d*d would overflow.
-                vec2 sq = cmul(dz, dz * uInvScale);
-                dz = cmul(t.xy, dz) + sq + dc;
+            while (n < uMaxIter) {
+                float dzMag = max(abs(dz.x), abs(dz.y));
 
-                m++;
+                // Longest valid jump from here. Radii are non-increasing with level,
+                // so the first failure ends the climb.
+                int skip = 0;
+                int chosen = -1;
+                if (m >= 1) {
+                    for (int k = 0; k < uBlaLevels; k++) {
+                        int step = 1 << k;
+                        if (((m - 1) & (step - 1)) != 0) break;
+                        if (n + step > uMaxIter) break;
+                        int j = (m - 1) >> k;
+                        if (j >= uBlaCount[k]) break;
+                        int idx = uBlaOffset[k] + j;
+                        // 0.7 compensates for using the max-norm rather than the true
+                        // length, which would risk overflowing at this magnitude.
+                        if (dzMag >= fetchR(idx) * 0.7) break;
+                        skip = step;
+                        chosen = idx;
+                    }
+                }
+
+                if (chosen >= 0) {
+                    vec4 ab = fetchAB(chosen);
+                    dz = cmul(ab.xy, dz) + cmul(ab.zw, dc);
+                    n += skip;
+                    m += skip;
+                } else {
+                    // d^2 in scaled units is d*(d/scale). Computed this way the
+                    // intermediate stays in range; a plain d*d would overflow.
+                    vec2 sq = cmul(dz, dz * uInvScale);
+                    dz = cmul(t.xy, dz) + sq + dc;
+                    n++;
+                    m++;
+                }
+
                 t = fetchZ(m);
 
                 // True value, still scaled. Tests use the max-norm because a squared
-                // length would overflow at this magnitude.
+                // length would overflow up here.
                 vec2 zs = t.zw + dz;
                 float zMag = max(abs(zs.x), abs(zs.y));
 

@@ -157,37 +157,59 @@ class MainActivity : AppCompatActivity() {
 
     // --- PNG --------------------------------------------------------------------------
 
-    private fun showPngDialog() {
-        val aspect = view.width.toDouble() / view.height
-        val heights = intArrayOf(view.height, 1080, 2160, 4320)
-        val labels = arrayOf(
-            "Screen (${view.width} x ${view.height})",
-            sizeLabel(1080, aspect),
-            sizeLabel(2160, aspect),
-            sizeLabel(4320, aspect)
-        )
+    private val imageHeights = intArrayOf(720, 1080, 1440, 2160, 4320, 8640)
 
-        val maxTex = view.renderer.maxTextureSizeCached
+    @SuppressLint("SetTextI18n")
+    private fun showPngDialog() {
+        val screenAspect = view.width.toDouble() / view.height
+        val content = LayoutInflater.from(this).inflate(R.layout.dialog_image, null)
+
+        val aspectSlider = content.findViewById<Slider>(R.id.i_aspect)
+        val sizeSlider = content.findViewById<Slider>(R.id.i_size)
+        val aspectLabel = content.findViewById<TextView>(R.id.i_aspect_label)
+        val sizeLabel = content.findViewById<TextView>(R.id.i_size_label)
+        val summary = content.findViewById<TextView>(R.id.i_summary)
+        val warning = content.findViewById<TextView>(R.id.i_warning)
+
+        fun dimensions(): Pair<Int, Int> {
+            val h = imageHeights[sizeSlider.value.toInt()]
+            val aspect = ExportManager.aspectValue(aspectSlider.value.toInt(), screenAspect)
+            return Pair(ExportManager.alignedWidth(h, aspect), h)
+        }
+
+        fun refresh() {
+            val (w, h) = dimensions()
+            val idx = aspectSlider.value.toInt()
+            aspectLabel.text = "Aspect ratio — ${ExportManager.ASPECT_LABELS[idx]}"
+            sizeLabel.text = "Height — ${imageHeights[sizeSlider.value.toInt()]} px"
+            summary.text = "$w x $h  ·  %.1f megapixels".format(w.toDouble() * h / 1e6)
+
+            val cap = view.renderer.maxTextureSizeCached
+            // Vertical span is what stays fixed, so a wider ratio shows more of the
+            // plane rather than cropping the current framing.
+            warning.text = if (cap > 0 && maxOf(w, h) > cap)
+                "Above this device's ${cap} px render limit. It may fail — smaller sizes are safe."
+            else
+                "Height sets the vertical span; wider ratios reveal more to the sides."
+        }
+
+        aspectSlider.addOnChangeListener { _, _, _ -> refresh() }
+        sizeSlider.addOnChangeListener { _, _, _ -> refresh() }
+        refresh()
+
         AlertDialog.Builder(this)
             .setTitle("Save PNG")
-            .setItems(labels) { _, which ->
-                val h = heights[which]
-                val w = if (which == 0) view.width else ExportManager.alignedWidth(h, aspect)
-                if (maxTex in 1 until maxOf(w, h)) {
-                    toast("This device caps render size at $maxTex px")
-                    return@setItems
-                }
+            .setView(content)
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton("Render") { _, _ ->
+                val (w, h) = dimensions()
                 runPngExport(w, h)
             }
-            .setNegativeButton("Cancel", null)
             .show()
     }
 
-    private fun sizeLabel(h: Int, aspect: Double) =
-        "${ExportManager.alignedWidth(h, aspect)} x $h"
-
     private fun runPngExport(w: Int, h: Int) {
-        val dialog = progressDialog("Rendering ${w} x ${h}…")
+        val dialog = progressDialog("Rendering $w x $h…")
         dialog.show()
         exporter.savePng(this, w, h) { uri, error ->
             runOnUiThread {
@@ -201,28 +223,37 @@ class MainActivity : AppCompatActivity() {
 
     private val fpsOptions = intArrayOf(24, 30, 60)
     private val videoHeights = intArrayOf(720, 1080, 1440, 2160)
+    private val qualityLabels = arrayOf("Standard", "High", "Maximum")
+    private val qualityBpp = doubleArrayOf(0.25, 0.5, 1.0)
 
     @SuppressLint("SetTextI18n")
     private fun showVideoDialog() {
-        val aspect = view.width.toDouble() / view.height
+        val screenAspect = view.width.toDouble() / view.height
         val content = LayoutInflater.from(this).inflate(R.layout.dialog_video, null)
 
+        val aspectSlider = content.findViewById<Slider>(R.id.v_aspect)
         val resSlider = content.findViewById<Slider>(R.id.v_res)
         val fpsSlider = content.findViewById<Slider>(R.id.v_fps)
         val zoomSlider = content.findViewById<Slider>(R.id.v_zoom)
+        val qualitySlider = content.findViewById<Slider>(R.id.v_quality)
+
+        val aspectLabel = content.findViewById<TextView>(R.id.v_aspect_label)
         val resLabel = content.findViewById<TextView>(R.id.v_res_label)
         val fpsLabel = content.findViewById<TextView>(R.id.v_fps_label)
         val zoomLabel = content.findViewById<TextView>(R.id.v_zoom_label)
+        val qualityLabel = content.findViewById<TextView>(R.id.v_quality_label)
         val summary = content.findViewById<TextView>(R.id.v_summary)
         val warning = content.findViewById<TextView>(R.id.v_warning)
 
         fun settings(): ExportManager.VideoSettings {
             val h = videoHeights[resSlider.value.toInt()]
+            val aspect = ExportManager.aspectValue(aspectSlider.value.toInt(), screenAspect)
             return ExportManager.VideoSettings(
                 width = ExportManager.alignedWidth(h, aspect),
                 height = h,
                 fps = fpsOptions[fpsSlider.value.toInt()],
-                zoomPerFrame = zoomSlider.value.toDouble()
+                zoomPerFrame = zoomSlider.value.toDouble(),
+                bitsPerPixel = qualityBpp[qualitySlider.value.toInt()]
             )
         }
 
@@ -230,24 +261,29 @@ class MainActivity : AppCompatActivity() {
             val s = settings()
             val frames = ExportManager.frameCount(view.state.spanY, s)
             val seconds = frames.toDouble() / s.fps
+            val mbps = s.width.toDouble() * s.height * s.fps * s.bitsPerPixel / 1e6
 
+            aspectLabel.text =
+                "Aspect ratio — ${ExportManager.ASPECT_LABELS[aspectSlider.value.toInt()]}"
             resLabel.text = "Resolution — ${s.width} x ${s.height}"
             fpsLabel.text = "Frame rate — ${s.fps} fps"
             zoomLabel.text = "Zoom out per frame — %.1f%%".format((s.zoomPerFrame - 1) * 100)
+            qualityLabel.text =
+                "Quality — ${qualityLabels[qualitySlider.value.toInt()]} (~%.0f Mbps)".format(mbps)
             summary.text = "$frames frames  ·  %d:%02d long".format(
                 (seconds / 60).toInt(), (seconds % 60).toInt()
             )
-            // Every frame is a full deep-zoom render, so the wall-clock cost is the
-            // number people misjudge. Worth stating before they start it.
             warning.text = if (frames > 400)
-                "Long export. Rendering runs on the GPU and blocks the view until done."
+                "Long export. Every frame is a full render, and the view is blocked until done."
             else
                 "Rendering blocks the view until done."
         }
 
+        aspectSlider.addOnChangeListener { _, _, _ -> refresh() }
         resSlider.addOnChangeListener { _, _, _ -> refresh() }
         fpsSlider.addOnChangeListener { _, _, _ -> refresh() }
         zoomSlider.addOnChangeListener { _, _, _ -> refresh() }
+        qualitySlider.addOnChangeListener { _, _, _ -> refresh() }
         refresh()
 
         AlertDialog.Builder(this)

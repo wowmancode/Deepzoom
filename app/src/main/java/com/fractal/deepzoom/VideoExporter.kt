@@ -25,7 +25,14 @@ class VideoExporter(
     private val width: Int,
     private val height: Int,
     private val fps: Int,
-    private val displayName: String
+    private val displayName: String,
+    /**
+     * Bits per pixel per frame. Fractal frames are close to the worst case for an
+     * inter-frame codec — every pixel is high-contrast detail that changes each frame,
+     * so motion estimation has almost nothing to reuse. Rates that look generous for
+     * ordinary video are visibly destructive here.
+     */
+    private val bitsPerPixel: Double
 ) {
 
     private var codec: MediaCodec? = null
@@ -40,22 +47,46 @@ class VideoExporter(
     private var rgbaRow: ByteArray = ByteArray(0)
 
     fun start() {
+        val encoder = MediaCodec.createEncoderByType(MIME)
+        val caps = encoder.codecInfo.getCapabilitiesForType(MIME)
+        val bitrate = clampBitrate(caps, targetBitrate())
+
         val format = MediaFormat.createVideoFormat(MIME, width, height).apply {
             setInteger(
                 MediaFormat.KEY_COLOR_FORMAT,
                 MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible
             )
-            // Detail-dense fractal frames compress poorly; a generous bitrate keeps
-            // the filaments from dissolving into mush.
-            setInteger(MediaFormat.KEY_BIT_RATE, estimateBitrate())
+            setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
             setInteger(MediaFormat.KEY_FRAME_RATE, fps)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
+            // Keyframes every second. Detail this dense benefits from frequent
+            // refreshes, since predicted frames drift badly against it.
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+            setInteger(
+                MediaFormat.KEY_BITRATE_MODE,
+                MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR
+            )
         }
 
-        codec = MediaCodec.createEncoderByType(MIME).apply {
-            configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-            start()
+        // High profile gives CABAC and 8x8 transforms, both of which matter a lot for
+        // fine detail. Not every encoder accepts being told, so fall back rather than
+        // fail the export.
+        val high = highProfileLevel(caps)
+        codec = try {
+            if (high != null) {
+                format.setInteger(MediaFormat.KEY_PROFILE, high.first)
+                format.setInteger(MediaFormat.KEY_LEVEL, high.second)
+            }
+            encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            encoder
+        } catch (e: Exception) {
+            try { encoder.release() } catch (_: Exception) {}
+            format.removeKey(MediaFormat.KEY_PROFILE)
+            format.removeKey(MediaFormat.KEY_LEVEL)
+            MediaCodec.createEncoderByType(MIME).also {
+                it.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            }
         }
+        codec!!.start()
 
         val values = ContentValues().apply {
             put(MediaStore.Video.Media.DISPLAY_NAME, displayName)
@@ -72,9 +103,26 @@ class VideoExporter(
         muxer = MediaMuxer(pfd!!.fileDescriptor, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
     }
 
-    private fun estimateBitrate(): Int {
-        val raw = width.toLong() * height * fps
-        return (raw * 0.18).toLong().coerceIn(2_000_000L, 60_000_000L).toInt()
+    private fun targetBitrate(): Int =
+        (width.toDouble() * height * fps * bitsPerPixel)
+            .toLong().coerceIn(1_000_000L, 240_000_000L).toInt()
+
+    private fun clampBitrate(caps: MediaCodecInfo.CodecCapabilities, wanted: Int): Int {
+        val range = caps.videoCapabilities?.bitrateRange ?: return wanted
+        return wanted.coerceIn(range.lower, range.upper)
+    }
+
+    /** Highest AVC profile/level the device advertises, or null if High is absent. */
+    private fun highProfileLevel(caps: MediaCodecInfo.CodecCapabilities): Pair<Int, Int>? {
+        var best: Pair<Int, Int>? = null
+        for (p in caps.profileLevels) {
+            if (p.profile == MediaCodecInfo.CodecProfileLevel.AVCProfileHigh) {
+                if (best == null || p.level > best!!.second) {
+                    best = Pair(p.profile, p.level)
+                }
+            }
+        }
+        return best
     }
 
     /** Feeds one bottom-up RGBA frame. Blocks until the encoder accepts it. */

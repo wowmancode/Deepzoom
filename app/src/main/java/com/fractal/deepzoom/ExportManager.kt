@@ -26,6 +26,7 @@ class ExportManager(private val view: MandelbrotView) {
         val height: Int,
         val fps: Int,
         val zoomPerFrame: Double,
+        val bitsPerPixel: Double,
         val holdFrames: Int = 12
     )
 
@@ -81,7 +82,7 @@ class ExportManager(private val view: MandelbrotView) {
             var error: String? = null
             val encoder = VideoExporter(
                 context, settings.width, settings.height, settings.fps,
-                "deepzoom_${timestamp()}.mp4"
+                "deepzoom_${timestamp()}.mp4", settings.bitsPerPixel
             )
 
             try {
@@ -139,5 +140,25 @@ class ExportManager(private val view: MandelbrotView) {
             val raw = (height * aspect).roundToInt()
             return max(16, (raw / 16.0).roundToInt() * 16)
         }
+
+        /**
+         * Aspect ratios offered for export. "Screen" resolves to the live view's own
+         * ratio; the rest let a shot be framed for wherever it is going, since the
+         * vertical span is fixed and the horizontal extent follows from the ratio.
+         */
+        val ASPECT_LABELS = arrayOf(
+            "Screen", "16:9", "9:16", "4:3", "3:2", "1:1", "21:9"
+        )
+
+        fun aspectValue(index: Int, screenAspect: Double): Double = when (index) {
+            1 -> 16.0 / 9.0
+            2 -> 9.0 / 16.0
+            3 -> 4.0 / 3.0
+            4 -> 3.0 / 2.0
+            5 -> 1.0
+            6 -> 21.0 / 9.0
+            else -> screenAspect
+        }
+    }
     }
 }
