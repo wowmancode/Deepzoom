@@ -2,56 +2,78 @@ package com.fractal.deepzoom
 
 import android.opengl.GLES31
 import android.opengl.GLSurfaceView
-import android.util.Log
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.nio.FloatBuffer
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
+import kotlin.math.ceil
+import kotlin.math.min
 
-/**
- * Renders the Mandelbrot set with a single fullscreen pass.
- *
- * View state is kept in Double on the CPU and narrowed to Float only at upload time.
- * That costs nothing now and is what makes the perturbation upgrade a drop-in later:
- * the reference orbit has to be computed in high precision from this same center.
- */
-class MandelbrotRenderer : GLSurfaceView.Renderer {
+class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer {
 
-    // --- View state (complex plane) -------------------------------------------------
-    // Stored as Double deliberately. Float32 loses the center long before the shader
-    // math does, so keeping these wide is free headroom.
-    @Volatile var centerX: Double = -0.5
-    @Volatile var centerY: Double = 0.0
+    var onOrbitStateChanged: ((building: Boolean) -> Unit)? = null
+    var requestRender: (() -> Unit)? = null
 
-    /** Vertical extent of the view in complex-plane units. Smaller = deeper zoom. */
-    @Volatile var spanY: Double = 3.0
-
-    @Volatile var maxIter: Int = 512
-
-    private var program = 0
+    private var directProgram = 0
+    private var perturbProgram = 0
     private var vao = 0
-
-    private var uResolution = -1
-    private var uCenter = -1
-    private var uSpanY = -1
-    private var uMaxIter = -1
+    private var orbitTexture = 0
 
     private var surfaceW = 1
     private var surfaceH = 1
 
+    private var orbit: ReferenceOrbit? = null
+
+    // Written on the orbit-builder thread, consumed on the GL thread.
+    @Volatile private var pendingOrbit: ReferenceOrbit? = null
+    private var uploadedOrbitLen = 0
+
+    private val building = AtomicBoolean(false)
+    private val executor = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "orbit-builder").apply { priority = Thread.NORM_PRIORITY - 1 }
+    }
+
+    private val direct = UniformSet()
+    private val perturb = UniformSet()
+
+    private class UniformSet {
+        val loc = HashMap<String, Int>()
+        fun get(name: String) = loc[name] ?: -1
+    }
+
     override fun onSurfaceCreated(unused: GL10?, config: EGLConfig?) {
         GLES31.glClearColor(0f, 0f, 0f, 1f)
 
-        program = buildProgram(VERTEX_SHADER, Shaders.MANDELBROT_SIMPLE)
+        directProgram = buildProgram(Shaders.VERTEX, Shaders.DIRECT)
+        perturbProgram = buildProgram(Shaders.VERTEX, Shaders.PERTURBATION)
 
-        uResolution = GLES31.glGetUniformLocation(program, "uResolution")
-        uCenter = GLES31.glGetUniformLocation(program, "uCenter")
-        uSpanY = GLES31.glGetUniformLocation(program, "uSpanY")
-        uMaxIter = GLES31.glGetUniformLocation(program, "uMaxIter")
+        cacheUniforms(directProgram, direct,
+            "uResolution", "uMaxIter", "uColorCycle", "uColorShift", "uCenter", "uSpanY")
+        cacheUniforms(perturbProgram, perturb,
+            "uResolution", "uMaxIter", "uColorCycle", "uColorShift", "uOrbit",
+            "uOrbitWidth", "uOrbitLen", "uDeltaCenter", "uPixelSpan", "uScale",
+            "uInvScale", "uBailoutScaled")
 
-        // Attribute-less rendering: the vertex shader synthesises a covering triangle
-        // from gl_VertexID, so there is no vertex buffer to manage at all.
         val ids = IntArray(1)
         GLES31.glGenVertexArrays(1, ids, 0)
         vao = ids[0]
+
+        GLES31.glGenTextures(1, ids, 0)
+        orbitTexture = ids[0]
+        GLES31.glBindTexture(GLES31.GL_TEXTURE_2D, orbitTexture)
+        // Nearest filtering and clamped wrap: this texture is a data array that
+        // happens to be addressed in 2D, not an image. Any interpolation would be
+        // corruption.
+        GLES31.glTexParameteri(GLES31.GL_TEXTURE_2D, GLES31.GL_TEXTURE_MIN_FILTER, GLES31.GL_NEAREST)
+        GLES31.glTexParameteri(GLES31.GL_TEXTURE_2D, GLES31.GL_TEXTURE_MAG_FILTER, GLES31.GL_NEAREST)
+        GLES31.glTexParameteri(GLES31.GL_TEXTURE_2D, GLES31.GL_TEXTURE_WRAP_S, GLES31.GL_CLAMP_TO_EDGE)
+        GLES31.glTexParameteri(GLES31.GL_TEXTURE_2D, GLES31.GL_TEXTURE_WRAP_T, GLES31.GL_CLAMP_TO_EDGE)
+
+        // Force a rebuild: the previous orbit's texture died with the old context.
+        orbit = null
     }
 
     override fun onSurfaceChanged(unused: GL10?, width: Int, height: Int) {
@@ -62,19 +84,151 @@ class MandelbrotRenderer : GLSurfaceView.Renderer {
 
     override fun onDrawFrame(unused: GL10?) {
         GLES31.glClear(GLES31.GL_COLOR_BUFFER_BIT)
-        GLES31.glUseProgram(program)
+
+        pendingOrbit?.let {
+            pendingOrbit = null
+            orbit = it
+            uploadOrbit(it)
+        }
+
+        if (state.needsPerturbation()) {
+            ensureOrbit()
+            val o = orbit
+            if (o != null) drawPerturbation(o) else drawDirect()
+        } else {
+            drawDirect()
+        }
+    }
+
+    // --- Draw paths -------------------------------------------------------------------
+
+    private fun drawDirect() {
+        GLES31.glUseProgram(directProgram)
         GLES31.glBindVertexArray(vao)
 
-        GLES31.glUniform2f(uResolution, surfaceW.toFloat(), surfaceH.toFloat())
-        GLES31.glUniform2f(uCenter, centerX.toFloat(), centerY.toFloat())
-        GLES31.glUniform1f(uSpanY, spanY.toFloat())
-        GLES31.glUniform1i(uMaxIter, maxIter)
+        GLES31.glUniform2f(direct.get("uResolution"), surfaceW.toFloat(), surfaceH.toFloat())
+        GLES31.glUniform1i(direct.get("uMaxIter"), state.maxIter)
+        GLES31.glUniform1f(direct.get("uColorCycle"), colorCycle())
+        GLES31.glUniform1f(direct.get("uColorShift"), 0f)
+        GLES31.glUniform2f(
+            direct.get("uCenter"),
+            state.centerX.toFloat(),
+            state.centerY.toFloat()
+        )
+        GLES31.glUniform1f(direct.get("uSpanY"), state.spanY.toFloat())
 
         GLES31.glDrawArrays(GLES31.GL_TRIANGLES, 0, 3)
         GLES31.glBindVertexArray(0)
     }
 
-    // --- Shader plumbing ------------------------------------------------------------
+    private fun drawPerturbation(o: ReferenceOrbit) {
+        GLES31.glUseProgram(perturbProgram)
+        GLES31.glBindVertexArray(vao)
+
+        val scale = state.deltaScale()
+        val offset = state.offsetFrom(o)
+        val pixelSpan = state.spanY / surfaceH
+
+        GLES31.glUniform2f(perturb.get("uResolution"), surfaceW.toFloat(), surfaceH.toFloat())
+        GLES31.glUniform1i(perturb.get("uMaxIter"), state.maxIter)
+        GLES31.glUniform1f(perturb.get("uColorCycle"), colorCycle())
+        GLES31.glUniform1f(perturb.get("uColorShift"), 0f)
+
+        // Everything below is handed over pre-scaled, so the shader never has to
+        // represent a value near 1e-50 itself.
+        GLES31.glUniform2f(
+            perturb.get("uDeltaCenter"),
+            (offset[0] * scale).toFloat(),
+            (offset[1] * scale).toFloat()
+        )
+        GLES31.glUniform1f(perturb.get("uPixelSpan"), (pixelSpan * scale).toFloat())
+        GLES31.glUniform1f(perturb.get("uScale"), scale.toFloat())
+        GLES31.glUniform1f(perturb.get("uInvScale"), (1.0 / scale).toFloat())
+        GLES31.glUniform1f(perturb.get("uBailoutScaled"), (4.0 * scale).toFloat())
+
+        GLES31.glUniform1i(perturb.get("uOrbitWidth"), ORBIT_TEX_WIDTH)
+        GLES31.glUniform1i(perturb.get("uOrbitLen"), uploadedOrbitLen)
+
+        GLES31.glActiveTexture(GLES31.GL_TEXTURE0)
+        GLES31.glBindTexture(GLES31.GL_TEXTURE_2D, orbitTexture)
+        GLES31.glUniform1i(perturb.get("uOrbit"), 0)
+
+        GLES31.glDrawArrays(GLES31.GL_TRIANGLES, 0, 3)
+        GLES31.glBindVertexArray(0)
+    }
+
+    /** Widen colour bands as depth increases so detail does not compress into noise. */
+    private fun colorCycle(): Float {
+        val depth = state.zoomDepth().coerceAtLeast(0.0)
+        return (0.035 / (1.0 + depth * 0.04)).toFloat()
+    }
+
+    // --- Reference orbit --------------------------------------------------------------
+
+    private fun ensureOrbit() {
+        val aspect = surfaceW.toDouble() / surfaceH
+        if (state.canReuse(orbit, aspect)) return
+        if (!building.compareAndSet(false, true)) return
+
+        // Snapshot before handing off: the UI thread will keep mutating state.
+        val cx = state.centerX
+        val cy = state.centerY
+        val span = state.spanY
+        val iter = state.maxIter
+
+        onOrbitStateChanged?.invoke(true)
+        executor.execute {
+            try {
+                val built = ReferenceOrbit.compute(cx, cy, iter, span)
+                pendingOrbit = built
+            } finally {
+                building.set(false)
+                onOrbitStateChanged?.invoke(false)
+                requestRender?.invoke()
+            }
+        }
+    }
+
+    private fun uploadOrbit(o: ReferenceOrbit) {
+        val points = min(o.count + 1, MAX_ORBIT_POINTS)
+        val rows = ceil(points / ORBIT_TEX_WIDTH.toDouble()).toInt().coerceAtLeast(1)
+        val texels = rows * ORBIT_TEX_WIDTH
+
+        val buf: FloatBuffer = ByteBuffer
+            .allocateDirect(texels * 2 * 4)
+            .order(ByteOrder.nativeOrder())
+            .asFloatBuffer()
+
+        buf.put(o.data, 0, points * 2)
+        // Pad the tail of the last row; the shader never reads past uOrbitLen, but
+        // leaving it uninitialised invites driver-dependent surprises.
+        while (buf.position() < texels * 2) buf.put(0f)
+        buf.position(0)
+
+        GLES31.glBindTexture(GLES31.GL_TEXTURE_2D, orbitTexture)
+        GLES31.glPixelStorei(GLES31.GL_UNPACK_ALIGNMENT, 1)
+        GLES31.glTexImage2D(
+            GLES31.GL_TEXTURE_2D, 0, GLES31.GL_RG32F,
+            ORBIT_TEX_WIDTH, rows, 0,
+            GLES31.GL_RG, GLES31.GL_FLOAT, buf
+        )
+
+        uploadedOrbitLen = points - 1
+    }
+
+    fun invalidateOrbit() {
+        orbit = null
+    }
+
+    fun shutdown() {
+        executor.shutdownNow()
+    }
+
+    // --- Shader plumbing --------------------------------------------------------------
+
+    private fun cacheUniforms(program: Int, set: UniformSet, vararg names: String) {
+        names.forEach { set.loc[it] = GLES31.glGetUniformLocation(program, it) }
+    }
 
     private fun buildProgram(vsSrc: String, fsSrc: String): Int {
         val vs = compile(GLES31.GL_VERTEX_SHADER, vsSrc)
@@ -106,7 +260,6 @@ class MandelbrotRenderer : GLSurfaceView.Renderer {
         GLES31.glGetShaderiv(s, GLES31.GL_COMPILE_STATUS, status, 0)
         if (status[0] == 0) {
             val log = GLES31.glGetShaderInfoLog(s)
-            Log.e(TAG, "Shader compile failed: $log")
             GLES31.glDeleteShader(s)
             throw RuntimeException("Shader compile failed: $log")
         }
@@ -114,15 +267,7 @@ class MandelbrotRenderer : GLSurfaceView.Renderer {
     }
 
     companion object {
-        private const val TAG = "MandelbrotRenderer"
-
-        private val VERTEX_SHADER = """
-            #version 310 es
-            void main() {
-                // One oversized triangle covering the whole clip volume.
-                vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
-                gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
-            }
-        """.trimIndent()
+        const val ORBIT_TEX_WIDTH = 1024
+        const val MAX_ORBIT_POINTS = 1024 * 128
     }
 }

@@ -6,7 +6,8 @@ fragment shader; the CPU only tracks view state and uploads four uniforms per fr
 ## Controls
 
 - Drag to pan, pinch to zoom (zoom is anchored to the midpoint between your fingers)
-- **Detail** — maximum iterations, 32 to 16384 on a log scale
+- **Detail** — maximum iterations, 32 to 65536 on a log scale. Deep zooms need far
+  more than shallow ones; if a deep view looks like a flat black field, raise this
 - **Render resolution** — 25% to 100% of native. The GL surface is allocated at this
   size and the display hardware upscales it, so lowering it is a real cost saving
 - Controls fade back after a couple of seconds so they stop competing with the image
@@ -28,33 +29,52 @@ The APK is signed with the standard debug key: fine for sideloading onto your ow
 device, not for distribution. No Gradle wrapper JAR is committed; the workflow
 supplies the Gradle CLI instead.
 
-## Current limits
+## How deep it goes
 
-`MIN_SPAN` in `MandelbrotView.kt` is clamped to `1e-6`. That is roughly where float32
-runs out of mantissa and the image degrades into blocky quantisation rather than
-detail.
+Roughly **1e60**, set by float32's exponent range rather than by precision.
 
-## Path to e-100 zoom
+Two rendering paths, switched automatically and shown in the readout:
 
-The structure here is built for perturbation theory to drop in, which is what lifts
-the depth limit by ~94 orders of magnitude:
+- **direct** — above 1e-4 span. Plain float32 iteration, with analytic cardioid and
+  period-2 bulb tests to skip the two largest interior regions.
+- **perturbed** — below 1e-4 span. Each pixel iterates its offset from a shared
+  reference orbit.
 
-1. **Reference orbit on the CPU.** Iterate a single point (the view centre) in high
-   precision — `BigDecimal`, or a hand-rolled double-double for speed — and store
-   `Z_0..Z_n` as float32 pairs. This is why `centerX`/`centerY` are already `Double`
-   rather than `Float`.
-2. **Upload as an SSBO.** GLES 3.1 gives you shader storage buffers, which is the
-   reason this project targets 3.1 rather than using AGSL.
-3. **Iterate the delta, not the point.** Each pixel tracks its offset from the
-   reference: `d(n+1) = 2*Z_n*d_n + d_n^2 + dc`. The deltas stay small enough that
-   float32 is sufficient no matter how deep the reference is — the precision lives
-   entirely in the CPU-side orbit.
-4. **Detect glitches.** Where `|Z_n + d_n|` is much smaller than `|Z_n|`, the pixel's
-   result is unreliable (Pauldelbrot's criterion). Flag those pixels, pick a new
-   reference inside the glitched region, and re-render it.
-5. **Series approximation (optional).** Skip the first several thousand iterations
-   for most pixels with a truncated power series. This is what makes deep zooms fast
-   rather than merely possible.
+### How perturbation works here
 
-Add the new shader as a second constant in `Shaders.kt` and select it at program-build
-time in `MandelbrotRenderer`; the renderer's structure does not need to change.
+The CPU iterates one point in `BigDecimal` at whatever precision the current depth
+needs (`30 + decades` digits). Those orbit values are O(1), so they ship to the GPU
+as plain floats in an `RG32F` texture. Each pixel then iterates its *offset* from
+that orbit:
+
+    d(n+1) = 2*Z(n)*d(n) + d(n)^2 + dc
+
+Precision is paid for once per frame on the CPU instead of once per pixel on the GPU.
+
+**Scaling.** At 1e-50 the deltas are far below float32's smallest normal value
+(~1e-38), so every delta is carried pre-multiplied by a power of two chosen to put
+pixel-scale deltas near 2^-80. That leaves 46 binary orders above the denormal floor
+and 8 below overflow. The `d^2` term is computed as `d * (d/scale)` rather than
+`d * d`, which would overflow the intermediate.
+
+**Rebasing instead of glitch correction.** When a pixel's true value falls below its
+own delta in magnitude, the reference has stopped being informative for that pixel,
+so it restarts at orbit index 0 carrying its full value as the new delta. This is
+Zhuoran's method, and it is exact — unlike the older approach of detecting glitched
+pixels with Pauldelbrot's criterion and re-rendering them against secondary
+references, there are no glitch blobs to patch and no second reference orbit.
+
+**Orbit reuse.** The reference does not need to sit at the view centre, so it is kept
+across pans and small zooms and only rebuilt when it leaves the visible region, the
+zoom moves by more than 4x, or the iteration count rises. Rebuilds happen on a
+background thread; the old orbit keeps rendering meanwhile.
+
+### Going deeper than 1e60
+
+The limit is float32 exponent range, not the algorithm. Past this point deltas need
+a **floatexp** representation — mantissa plus a separate integer exponent — which
+removes the range ceiling entirely at some cost in shader speed.
+
+The other worthwhile addition is **series approximation**: a truncated power series
+can skip the first several thousand iterations for most pixels, which is what makes
+very deep zooms fast rather than merely possible.

@@ -13,12 +13,13 @@ class MandelbrotView @JvmOverloads constructor(
     attrs: AttributeSet? = null
 ) : GLSurfaceView(context, attrs) {
 
-    val renderer = MandelbrotRenderer()
+    val state = ViewState()
+    val renderer = MandelbrotRenderer(state)
 
     /**
-     * Fraction of native resolution to render at when idle. The GL surface is
-     * allocated smaller than the view and the display hardware upscales it for free,
-     * so this is a true cost saving rather than a render-then-downsample trick.
+     * Fraction of native resolution rendered when idle. The GL surface is genuinely
+     * allocated at this size and the display hardware upscales it, so this is real
+     * work avoided rather than a render-then-downsample.
      */
     var renderScale: Float = 1.0f
         set(value) {
@@ -26,11 +27,7 @@ class MandelbrotView @JvmOverloads constructor(
             applySurfaceSize(field)
         }
 
-    /**
-     * Resolution multiplier applied on top of renderScale while a gesture is active.
-     * Dropping to a quarter of the pixels during a drag is the difference between
-     * pan feeling attached to your finger and feeling like it is catching up.
-     */
+    /** Extra reduction applied while a gesture is in flight. */
     var interactiveScale: Float = 0.5f
 
     var onViewChanged: (() -> Unit)? = null
@@ -52,6 +49,7 @@ class MandelbrotView @JvmOverloads constructor(
         setEGLContextClientVersion(3)
         setRenderer(renderer)
         renderMode = RENDERMODE_WHEN_DIRTY
+        renderer.requestRender = { requestRender() }
         isFocusable = true
     }
 
@@ -62,40 +60,34 @@ class MandelbrotView @JvmOverloads constructor(
 
     private fun applySurfaceSize(scale: Float) {
         if (width == 0 || height == 0) return
-        val sw = max(1, (width * scale).roundToInt())
-        val sh = max(1, (height * scale).roundToInt())
-        holder.setFixedSize(sw, sh)
+        holder.setFixedSize(
+            max(1, (width * scale).roundToInt()),
+            max(1, (height * scale).roundToInt())
+        )
         requestRender()
     }
 
-    // --- Coordinate mapping ---------------------------------------------------------
-    // All touch math is done in *view* pixels, never surface pixels, so changing the
-    // render resolution never shifts what is under your finger.
+    // --- Gestures ---------------------------------------------------------------------
+    // All touch maths happens in view pixels and plain doubles. Offsets within a frame
+    // are small even at extreme depth, so only the accumulated centre needs BigDecimal.
 
-    private fun pixelSpan(): Double = renderer.spanY / height.toDouble()
-
-    private fun screenToComplexX(sx: Float): Double =
-        renderer.centerX + (sx - width / 2.0) * pixelSpan()
-
-    private fun screenToComplexY(sy: Float): Double =
-        // Screen y grows downward, the complex plane's grows upward.
-        renderer.centerY - (sy - height / 2.0) * pixelSpan()
+    private fun pixelSpan(): Double = state.spanY / height.toDouble()
 
     private fun zoomAround(focusX: Float, focusY: Float, factor: Double) {
         if (factor <= 0.0) return
 
-        val cxBefore = screenToComplexX(focusX)
-        val cyBefore = screenToComplexY(focusY)
+        val spanBefore = state.spanY
+        state.zoomBy(factor)
+        val spanAfter = state.spanY
+        if (spanBefore == spanAfter) return
 
-        // Clamp the span so float32 pixel quantisation stays off-screen until the
-        // perturbation path exists to handle deeper zooms.
-        renderer.spanY = (renderer.spanY / factor).coerceIn(MIN_SPAN, MAX_SPAN)
+        // Keep the point under the fingers fixed: the centre shifts by the change in
+        // how far the focus sits from it.
+        val dxPix = focusX - width / 2.0
+        val dyPix = focusY - height / 2.0
+        val perPixel = (spanBefore - spanAfter) / height
 
-        val cxAfter = screenToComplexX(focusX)
-        val cyAfter = screenToComplexY(focusY)
-
-        renderer.centerX += cxBefore - cxAfter
-        renderer.centerY += cyBefore - cyAfter
+        state.panBy(dxPix * perPixel, -dyPix * perPixel)
 
         requestRender()
         onViewChanged?.invoke()
@@ -122,8 +114,7 @@ class MandelbrotView @JvmOverloads constructor(
                         lastY = event.getY(idx)
 
                         val span = pixelSpan()
-                        renderer.centerX -= dx * span
-                        renderer.centerY += dy * span
+                        state.panBy(-dx * span, dy * span)
                         requestRender()
                         onViewChanged?.invoke()
                     }
@@ -131,8 +122,8 @@ class MandelbrotView @JvmOverloads constructor(
             }
 
             MotionEvent.ACTION_POINTER_UP -> {
-                // Hand the drag anchor to a finger that is still down, otherwise the
-                // view jumps when you lift one finger out of a pinch.
+                // Hand the drag anchor to a finger still down, or the view jumps when
+                // you lift one finger out of a pinch.
                 val upIndex = event.actionIndex
                 if (event.getPointerId(upIndex) == activePointerId) {
                     val newIndex = if (upIndex == 0) 1 else 0
@@ -163,19 +154,15 @@ class MandelbrotView @JvmOverloads constructor(
     }
 
     fun resetView() {
-        renderer.centerX = -0.5
-        renderer.centerY = 0.0
-        renderer.spanY = 3.0
+        state.reset()
+        renderer.invalidateOrbit()
         requestRender()
         onViewChanged?.invoke()
     }
 
-    /** Zoom depth relative to the default view, as a power of ten. */
-    fun zoomDepth(): Double = kotlin.math.log10(3.0 / renderer.spanY)
-
-    companion object {
-        // float32 runs out of usable mantissa here. Raise once perturbation lands.
-        private const val MIN_SPAN = 1e-6
-        private const val MAX_SPAN = 8.0
+    fun setMaxIter(value: Int) {
+        state.maxIter = value
+        requestRender()
+        onViewChanged?.invoke()
     }
 }

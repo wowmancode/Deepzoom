@@ -24,6 +24,16 @@
         android:fitsSystemWindows="true">
 
         <TextView
+            android:id="@+id/status"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Computing reference orbit"
+            android:textColor="#7FA6D8"
+            android:textSize="13sp"
+            android:visibility="gone"
+            android:paddingBottom="2dp" />
+
+        <TextView
             android:id="@+id/readout"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
