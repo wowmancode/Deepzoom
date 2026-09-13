@@ -941,6 +941,15 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
             val maxRows = max(1, (MAX_CHUNK_LOG_RANGE / geom.step).toInt())
             if (count > maxRows) count = maxRows
 
+            // Bound the work in one draw call. Mobile GPU drivers kill draws that run
+            // too long, and the kill is silent: the target stays black and glGetError
+            // reports nothing. At shallow depths BLA cannot help (deltas are far above
+            // its radii), and the strip has no tile pass to skip interior, so a
+            // 900-row chunk of interior can run millions of pixels to the iteration
+            // cap in a single call. Keep each call to roughly a quarter of a frame.
+            val budgetRows = max(1, MAX_CHUNK_PIXELS / stripW)
+            if (count > budgetRows) count = budgetRows
+
             // A chunk must always advance, whatever the arithmetic above produced.
             if (count < 1) count = 1
 
@@ -952,6 +961,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
             val program = if (deep) perturbStripProgram else directStripProgram
             val scale = if (deep) bundle!!.gpu.scale else 1.0
 
+            val chunkStart = System.nanoTime()
             GLES31.glViewport(0, dest, stripW, count)
             GLES31.glUseProgram(program)
             GLES31.glBindVertexArray(vao)
@@ -1031,6 +1041,8 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
                 )
             }
             if (debugSampling) {
+                GLES31.glFinish()
+                lastDiag += " %dms".format((System.nanoTime() - chunkStart) / 1_000_000)
                 // Read one row back and count non-black pixels. Tells us directly
                 // whether this chunk rendered structure, interior, or nothing.
                 val mid = dest + count / 2
@@ -1205,6 +1217,9 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
          * more finely but spend a larger fraction of themselves on the perimeter.
          */
         const val TILE_SIZE = 32
+
+        /** Pixels per strip draw call, to stay under GPU watchdog limits. */
+        private const val MAX_CHUNK_PIXELS = 512 * 1024
 
         /** Largest log-radius range one strip chunk may span. ln(4). */
         private const val MAX_CHUNK_LOG_RANGE = 1.3862943611198906
