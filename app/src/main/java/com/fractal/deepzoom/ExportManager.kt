@@ -94,7 +94,17 @@ class ExportManager(private val view: MandelbrotView) {
 
             try {
                 encoder.start()
-                val buf = allocate(settings.width, settings.height)
+                // Two frame buffers, so conversion and encoding of one frame overlap
+                // with rendering the next. The YUV conversion alone is a couple of
+                // million pixels; running it serially left the GPU idle for most of
+                // every frame.
+                val buffers = arrayOf(
+                    allocate(settings.width, settings.height),
+                    allocate(settings.width, settings.height)
+                )
+                val pipeline = java.util.concurrent.Executors.newSingleThreadExecutor()
+                var inFlight: java.util.concurrent.Future<*>? = null
+                val buf = buffers[0]
                 val frameState = snapshot.snapshot()
                 var bundle: OrbitBundle? = null
 
@@ -165,17 +175,25 @@ class ExportManager(private val view: MandelbrotView) {
                             frameState, geom, window.first, window.last, bundle
                         )
                         view.renderer.stripUnwarp(
-                            geom, frameState.spanY, settings.width, settings.height, buf
+                            geom, frameState.spanY, settings.width, settings.height,
+                            buffers[i % 2]
                         )
                     } else {
                         bundle = view.renderer.renderOffscreen(
-                            frameState, settings.width, settings.height, buf, bundle
+                            frameState, settings.width, settings.height,
+                            buffers[i % 2], bundle
                         )
                     }
-                    encoder.encodeFrame(buf)
+                    // Wait for the frame before last, which is the one that used this
+                    // buffer, then hand this frame off and carry on rendering.
+                    inFlight?.get()
+                    val ready = buffers[i % 2]
+                    inFlight = pipeline.submit { encoder.encodeFrame(ready) }
                     progress.onProgress(i + 1, total)
                 }
 
+                inFlight?.get()
+                pipeline.shutdown()
                 uri = encoder.finish()
             } catch (e: Exception) {
                 error = e.message ?: e.javaClass.simpleName

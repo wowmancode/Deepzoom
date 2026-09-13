@@ -931,6 +931,8 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
 
     /** Rows per strip draw, adapted from measured chunk time. */
     private var stripRowBudget = 128
+    private var chunksSinceMeasure = 0
+    private var lastChunkMs = 0.0
 
     /**
      * Ensures every row in [lo, hi] is present, rendering only what is missing.
@@ -1112,13 +1114,21 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
                         "scale 2^${if (deep) bundle!!.gpu.scaleExp else 0}"
                 )
             }
-            // Always measured, not just in debug: the budget depends on it. glFinish
-            // is required or the timing reflects queue submission, not GPU work.
-            GLES31.glFinish()
-            val chunkMs = (System.nanoTime() - chunkStart) / 1e6
-            stripRowBudget = if (chunkMs > 1.0) {
-                (count * CHUNK_TARGET_MS / chunkMs).toInt().coerceIn(1, MAX_CHUNK_ROWS)
-            } else MAX_CHUNK_ROWS
+            // Timing needs glFinish, which drains the pipeline — too costly to do on
+            // every chunk when a video renders one per frame. Chunk cost changes
+            // slowly, so sampling occasionally keeps the budget honest for a fraction
+            // of the stalls. Debug mode measures every chunk.
+            chunksSinceMeasure++
+            if (debugSampling || chunksSinceMeasure >= MEASURE_EVERY) {
+                chunksSinceMeasure = 0
+                GLES31.glFinish()
+                val chunkMs = (System.nanoTime() - chunkStart) / 1e6
+                stripRowBudget = if (chunkMs > 1.0) {
+                    (count * CHUNK_TARGET_MS / chunkMs).toInt().coerceIn(1, MAX_CHUNK_ROWS)
+                } else MAX_CHUNK_ROWS
+                lastChunkMs = chunkMs
+            }
+            val chunkMs = lastChunkMs
 
             if (debugSampling) {
                 lastDiag += " %.0fms".format(chunkMs)
@@ -1301,6 +1311,9 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
 
         /** Target milliseconds per strip draw. Well under typical watchdog limits. */
         private const val CHUNK_TARGET_MS = 150.0
+
+        /** Chunks between timing samples outside debug mode. */
+        private const val MEASURE_EVERY = 16
 
         /** Largest log-radius range one strip chunk may span. ln(4). */
         private const val MAX_CHUNK_LOG_RANGE = 1.3862943611198906
