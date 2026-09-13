@@ -3,6 +3,7 @@ package com.fractal.deepzoom
 import java.math.BigDecimal
 import java.math.MathContext
 import kotlin.math.ceil
+import kotlin.math.hypot
 import kotlin.math.log10
 import kotlin.math.max
 import kotlin.math.min
@@ -116,6 +117,97 @@ class ReferenceOrbit(
 
         /** How far in this orbit can be zoomed before its digits run short. */
         const val ZOOM_IN_MARGIN = 1e-6
+
+        /** Periods beyond this are not worth the Newton cost. */
+        private const val MAX_NUCLEUS_PERIOD = 8192
+        private const val NEWTON_STEPS = 12
+
+        /**
+         * Finds the nearest minibrot nucleus, or null if there isn't a useful one.
+         *
+         * A periodic point makes a better reference than an arbitrary one: the orbit
+         * returns close to zero every period, which keeps BLA coefficients small and
+         * their validity radii large, so pixels take longer jumps.
+         *
+         * The period comes from the atom domain — the iteration whose |z| is smallest
+         * is the period of the nearest atom — and Newton's method on f^p(0,c) = 0 then
+         * lands on the nucleus itself.
+         *
+         * Returns null unless the nucleus lands inside the view. Measured against
+         * high-precision ground truth, a nucleus found this way can sit tens of
+         * thousands of view-widths away when the zoom is deeper than its period
+         * warrants, and a reference that distant would give every pixel a huge delta,
+         * costing far more than the better coefficients gain.
+         */
+        fun findNucleus(
+            cx: BigDecimal,
+            cy: BigDecimal,
+            maxIter: Int,
+            spanY: Double,
+            precision: Int
+        ): Array<BigDecimal>? {
+            val mc = MathContext(precision)
+
+            var x = BigDecimal.ZERO
+            var y = BigDecimal.ZERO
+            var best = Double.MAX_VALUE
+            var period = 0
+            val scan = min(maxIter, MAX_NUCLEUS_PERIOD)
+
+            for (n in 1..scan) {
+                val nx = x.multiply(x, mc).subtract(y.multiply(y, mc), mc).add(cx, mc)
+                val ny = x.multiply(y, mc).multiply(TWO, mc).add(cy, mc)
+                x = nx.round(mc)
+                y = ny.round(mc)
+
+                val xd = x.toDouble()
+                val yd = y.toDouble()
+                val m = xd * xd + yd * yd
+                if (m > ESCAPE_SQ) break
+                if (m < best) { best = m; period = n }
+            }
+            if (period < 1) return null
+
+            var ccx = cx
+            var ccy = cy
+            repeat(NEWTON_STEPS) {
+                var zx = BigDecimal.ZERO
+                var zy = BigDecimal.ZERO
+                var dx = BigDecimal.ZERO
+                var dy = BigDecimal.ZERO
+
+                for (i in 1..period) {
+                    // d = 2*z*d + 1, the derivative with respect to c
+                    val ndx = TWO.multiply(
+                        zx.multiply(dx, mc).subtract(zy.multiply(dy, mc), mc), mc
+                    ).add(BigDecimal.ONE, mc)
+                    val ndy = TWO.multiply(
+                        zx.multiply(dy, mc).add(zy.multiply(dx, mc), mc), mc
+                    )
+                    val nzx = zx.multiply(zx, mc).subtract(zy.multiply(zy, mc), mc).add(ccx, mc)
+                    val nzy = TWO.multiply(zx.multiply(zy, mc), mc).add(ccy, mc)
+
+                    dx = ndx.round(mc); dy = ndy.round(mc)
+                    zx = nzx.round(mc); zy = nzy.round(mc)
+                }
+
+                val den = dx.multiply(dx, mc).add(dy.multiply(dy, mc), mc)
+                if (den.signum() == 0) return null
+
+                val sx = zx.multiply(dx, mc).add(zy.multiply(dy, mc), mc).divide(den, mc)
+                val sy = zy.multiply(dx, mc).subtract(zx.multiply(dy, mc), mc).divide(den, mc)
+                ccx = ccx.subtract(sx, mc)
+                ccy = ccy.subtract(sy, mc)
+            }
+
+            // Only worth it if the nucleus is actually in view.
+            val offX = ccx.subtract(cx, mc).toDouble()
+            val offY = ccy.subtract(cy, mc).toDouble()
+            if (!offX.isFinite() || !offY.isFinite()) return null
+            if (hypot(offX, offY) > spanY) return null
+
+            return arrayOf(ccx, ccy)
+        }
 
         fun compute(
             cx: BigDecimal,

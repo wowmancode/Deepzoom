@@ -11,6 +11,7 @@ import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 import kotlin.math.ceil
 import kotlin.math.max
+import kotlin.math.hypot
 import kotlin.math.ln
 import kotlin.math.min
 
@@ -609,14 +610,29 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
 
         var orbit = if (buildingForExport) exportOrbit else workingOrbit
         if (orbit == null || !probe.canReuse(orbit, aspect)) {
-            orbit = ReferenceOrbit.compute(cx, cy, iter, span)
+            // Prefer a minibrot nucleus. Its orbit returns near zero every period,
+            // which keeps BLA coefficients small and their radii large, so pixels take
+            // longer jumps. findNucleus declines when the nucleus is out of view, in
+            // which case the view centre is used as before.
+            val nucleus = try {
+                ReferenceOrbit.findNucleus(
+                    cx, cy, iter, span, ReferenceOrbit.precisionFor(span)
+                )
+            } catch (e: Exception) {
+                null
+            }
+            val rx = nucleus?.get(0) ?: cx
+            val ry = nucleus?.get(1) ?: cy
+            orbit = ReferenceOrbit.compute(rx, ry, iter, span)
         } else if (iter > orbit.iterBuilt) {
             orbit.extendTo(iter)
         }
         if (buildingForExport) exportOrbit = orbit else workingOrbit = orbit
 
         val snap = orbit.snapshot()
-        return OrbitBundle(snap, OrbitGpuData.build(snap, exp, maxC))
+        val off = probe.offsetFrom(snap)
+        val effectiveMaxC = max(maxC, BlaTable.maxCFor(span, aspect, hypot(off[0], off[1])))
+        return OrbitBundle(snap, OrbitGpuData.build(snap, exp, effectiveMaxC))
     }
 
     /** Synchronous variant for export, where frames must not be skipped. */
@@ -857,6 +873,8 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         stripRowsDone = 0
         stripStarted = true
         exportOrbit = null
+        // Start conservative; the first measured chunk corrects it immediately.
+        stripRowBudget = 64
     }
 
     private fun ensureStrip(w: Int, ring: Int) {
@@ -907,6 +925,9 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
     /** When set, each strip chunk reads back one row and counts lit pixels. */
     @Volatile var debugSampling = false
 
+    /** Rows per strip draw, adapted from measured chunk time. */
+    private var stripRowBudget = 128
+
     fun stripExtendTo(s: ViewState, geom: StripGeometry, lastRow: Int, cached: OrbitBundle?): OrbitBundle? {
         if (!stripStarted) stripBegin(geom)
         var bundle = cached
@@ -941,13 +962,19 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
             val maxRows = max(1, (MAX_CHUNK_LOG_RANGE / geom.step).toInt())
             if (count > maxRows) count = maxRows
 
-            // Bound the work in one draw call. Mobile GPU drivers kill draws that run
-            // too long, and the kill is silent: the target stays black and glGetError
-            // reports nothing. At shallow depths BLA cannot help (deltas are far above
-            // its radii), and the strip has no tile pass to skip interior, so a
-            // 900-row chunk of interior can run millions of pixels to the iteration
-            // cap in a single call. Keep each call to roughly a quarter of a frame.
-            val budgetRows = max(1, MAX_CHUNK_PIXELS / stripW)
+            // Bound the work in one draw call.
+            //
+            // Mobile GPU drivers kill draws that run too long, and the kill is silent:
+            // the target stays black, glGetError reports nothing, and the call returns
+            // immediately. This was the cause of blank exponential-map exports, and it
+            // only showed at certain depths because that is where pixels get expensive
+            // enough for a chunk to cross the limit.
+            //
+            // Rows per chunk are adapted from how long the previous chunk actually
+            // took, aiming well under any plausible watchdog. A fixed cap cannot work:
+            // chunk cost varies by more than 7x across a single strip, so any constant
+            // is either unsafe deep or needlessly slow shallow.
+            val budgetRows = (stripRowBudget).coerceIn(1, MAX_CHUNK_ROWS)
             if (count > budgetRows) count = budgetRows
 
             // A chunk must always advance, whatever the arithmetic above produced.
@@ -1040,9 +1067,16 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
                         "scale 2^${if (deep) bundle!!.gpu.scaleExp else 0}"
                 )
             }
+            // Always measured, not just in debug: the budget depends on it. glFinish
+            // is required or the timing reflects queue submission, not GPU work.
+            GLES31.glFinish()
+            val chunkMs = (System.nanoTime() - chunkStart) / 1e6
+            stripRowBudget = if (chunkMs > 1.0) {
+                (count * CHUNK_TARGET_MS / chunkMs).toInt().coerceIn(1, MAX_CHUNK_ROWS)
+            } else MAX_CHUNK_ROWS
+
             if (debugSampling) {
-                GLES31.glFinish()
-                lastDiag += " %dms".format((System.nanoTime() - chunkStart) / 1_000_000)
+                lastDiag += " %.0fms".format(chunkMs)
                 // Read one row back and count non-black pixels. Tells us directly
                 // whether this chunk rendered structure, interior, or nothing.
                 val mid = dest + count / 2
@@ -1218,8 +1252,11 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
          */
         const val TILE_SIZE = 32
 
-        /** Pixels per strip draw call, to stay under GPU watchdog limits. */
-        private const val MAX_CHUNK_PIXELS = 512 * 1024
+        /** Ceiling on rows per strip draw, whatever the timing suggests. */
+        private const val MAX_CHUNK_ROWS = 512
+
+        /** Target milliseconds per strip draw. Well under typical watchdog limits. */
+        private const val CHUNK_TARGET_MS = 150.0
 
         /** Largest log-radius range one strip chunk may span. ln(4). */
         private const val MAX_CHUNK_LOG_RANGE = 1.3862943611198906

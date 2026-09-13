@@ -172,6 +172,14 @@ class BlaTable(
         }
 
         /** Largest |dc| any pixel can have, with margin for orbit reuse across zooms. */
+        /**
+         * Variant accounting for a reference that is not at the view centre. A nucleus
+         * reference sits off-centre by design, and every pixel's |dc| grows by that
+         * offset — leaving it out would make the radii optimistic and the image wrong.
+         */
+        fun maxCFor(spanY: Double, aspect: Double, offset: Double): Double =
+            maxCFor(spanY, aspect) + offset * 2.0
+
         fun maxCFor(spanY: Double, aspect: Double): Double {
             val halfDiag = 0.5 * spanY * hypot(1.0, abs(aspect))
             // Tables are reused while the view grows, so this is deliberately
