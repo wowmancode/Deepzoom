@@ -122,11 +122,27 @@ class ExportManager(private val view: MandelbrotView) {
                     val dh = min(2048, geom.ringHeight)
                     val dump = allocate(dw, dh)
                     view.renderer.stripDump(dump, dw, dh)
-                    encoder.abort()
-                    val u = ImageExporter.savePng(
-                        context, dump, dw, dh, "deepzoom_strip_${timestamp()}.png"
+                    val stamp = timestamp()
+                    ImageExporter.savePng(
+                        context, dump, dw, dh, "deepzoom_strip_$stamp.png"
                     )
-                    onDone(u, if (u == null) "Could not write strip image" else null)
+
+                    // Also write the first unwarped frame. If the strip is good and
+                    // this is blank, the fault is in the resampling; if this looks
+                    // right, the fault is downstream in the encoder.
+                    view.renderer.stripUnwarp(
+                        geom, frameState.spanY, settings.width, settings.height, buf
+                    )
+                    val frameUri = ImageExporter.savePng(
+                        context, buf, settings.width, settings.height,
+                        "deepzoom_frame_$stamp.png"
+                    )
+
+                    encoder.abort()
+                    onDone(
+                        frameUri,
+                        if (frameUri == null) "Could not write debug images" else null
+                    )
                     return@queueEvent
                 }
 
