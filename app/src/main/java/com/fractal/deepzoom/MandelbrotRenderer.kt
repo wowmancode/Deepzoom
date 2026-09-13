@@ -900,9 +900,12 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
     /** Extends the strip so every row up to and including lastRow exists. */
     var onStripProgress: ((rowsDone: Int, rowsTarget: Int) -> Unit)? = null
 
-    /** Numbers from the most recent strip chunk, surfaced by the debug dump. */
+    /** Per-chunk numbers from the most recent strip build, surfaced by the debug dump. */
     @Volatile var lastDiag: String = ""
         private set
+
+    /** When set, each strip chunk reads back one row and counts lit pixels. */
+    @Volatile var debugSampling = false
 
     fun stripExtendTo(s: ViewState, geom: StripGeometry, lastRow: Int, cached: OrbitBundle?): OrbitBundle? {
         if (!stripStarted) stripBegin(geom)
@@ -973,13 +976,14 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
                         "probeSpan=${probe.spanY}, radius=$radius)"
                 )
             }
-            if (row == stripRowsDone) {
-                lastDiag = String.format(
+            if (row == stripRowsDone) lastDiag = ""
+            run {
+                lastDiag += String.format(
                     java.util.Locale.US,
-                    "geom %dx%d logR0=%.3f step=%.6f | row %d: radius=%.3e " +
-                        "probeSpan=%.3e scaleExp=%d rBase=%.3e deep=%b",
-                    stripW, stripRing, geom.logR0, geom.step, row, radius, probe.spanY,
-                    if (deep) bundle!!.gpu.scaleExp else 0, rBaseD, deep
+                    "row %d (+%d): r=%.2e span=%.2e exp=%d len=%d bla=%d %s",
+                    row, count, radius, probe.spanY,
+                    if (deep) bundle!!.gpu.scaleExp else 0,
+                    uploadedLen, uploadedBlaLevels, if (deep) "P" else "D"
                 )
             }
             GLES31.glUniform1f(u["uStripRBase"]!!, rBase)
@@ -1023,6 +1027,23 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
                         "${if (deep) "perturbation" else "direct"} path, chunk $count rows, " +
                         "scale 2^${if (deep) bundle!!.gpu.scaleExp else 0}"
                 )
+            }
+            if (debugSampling) {
+                // Read one row back and count non-black pixels. Tells us directly
+                // whether this chunk rendered structure, interior, or nothing.
+                val mid = dest + count / 2
+                val rowBuf = ByteBuffer.allocateDirect(stripW * 4).order(ByteOrder.nativeOrder())
+                GLES31.glReadPixels(0, mid, stripW, 1, GLES31.GL_RGBA, GLES31.GL_UNSIGNED_BYTE, rowBuf)
+                var lit = 0
+                for (i in 0 until stripW) {
+                    val o = i * 4
+                    if ((rowBuf.get(o).toInt() and 0xFF) > 8 ||
+                        (rowBuf.get(o + 1).toInt() and 0xFF) > 8 ||
+                        (rowBuf.get(o + 2).toInt() and 0xFF) > 8) lit++
+                }
+                lastDiag += " lit=$lit/$stripW\n"
+            } else {
+                lastDiag += "\n"
             }
             row += count
             // The first frame builds the whole window at once — thousands of rows
