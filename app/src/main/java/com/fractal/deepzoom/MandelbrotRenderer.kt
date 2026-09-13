@@ -865,12 +865,16 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
      * Highest absolute row rendered so far, plus the state the strip belongs to.
      * Rows are written once and never revisited, which is the entire point.
      */
-    private var stripRowsDone = 0
+    // Inclusive range of strip rows currently valid in the ring buffer. Zoom-out
+    // extends upward, zoom-in extends downward, so both ends move.
+    private var stripBuiltLo = 0
+    private var stripBuiltHi = -1
     private var stripStarted = false
 
     fun stripBegin(geom: StripGeometry) {
         ensureStrip(geom.width, geom.ringHeight)
-        stripRowsDone = 0
+        stripBuiltLo = 0
+        stripBuiltHi = -1
         stripStarted = true
         exportOrbit = null
         // Start conservative; the first measured chunk corrects it immediately.
@@ -928,10 +932,51 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
     /** Rows per strip draw, adapted from measured chunk time. */
     private var stripRowBudget = 128
 
-    fun stripExtendTo(s: ViewState, geom: StripGeometry, lastRow: Int, cached: OrbitBundle?): OrbitBundle? {
+    /**
+     * Ensures every row in [lo, hi] is present, rendering only what is missing.
+     *
+     * Zoom-out asks for ranges that grow upward and zoom-in for ranges that grow
+     * downward, so this extends at either end. Rows outside the ring buffer's span are
+     * dropped from the valid range as they are overwritten.
+     */
+    fun stripEnsureRange(
+        s: ViewState,
+        geom: StripGeometry,
+        lo: Int,
+        hi: Int,
+        cached: OrbitBundle?
+    ): OrbitBundle? {
         if (!stripStarted) stripBegin(geom)
         var bundle = cached
-        if (lastRow < stripRowsDone) return bundle
+
+        if (stripBuiltHi < stripBuiltLo) {
+            bundle = renderRows(s, geom, lo, hi, bundle)
+            stripBuiltLo = lo
+            stripBuiltHi = hi
+            return bundle
+        }
+        if (hi > stripBuiltHi) {
+            bundle = renderRows(s, geom, stripBuiltHi + 1, hi, bundle)
+            stripBuiltHi = hi
+            stripBuiltLo = max(stripBuiltLo, hi - stripRing + 1)
+        }
+        if (lo < stripBuiltLo) {
+            bundle = renderRows(s, geom, lo, stripBuiltLo - 1, bundle)
+            stripBuiltLo = lo
+            stripBuiltHi = min(stripBuiltHi, lo + stripRing - 1)
+        }
+        return bundle
+    }
+
+    private fun renderRows(
+        s: ViewState,
+        geom: StripGeometry,
+        firstRow: Int,
+        lastRow: Int,
+        cached: OrbitBundle?
+    ): OrbitBundle? {
+        var bundle = cached
+        if (lastRow < firstRow) return bundle
 
         GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, stripFbo)
         uploadPaletteIfDirty()
@@ -940,7 +985,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         // Drain it so anything caught below is genuinely from this loop.
         while (GLES31.glGetError() != GLES31.GL_NO_ERROR) { /* discard */ }
 
-        var row = stripRowsDone
+        var row = firstRow
         while (row <= lastRow) {
             // A chunk stops at the ring wrap, and at the boundary between radii that
             // still need perturbation and radii where plain float32 is fine.
@@ -1013,7 +1058,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
                         "probeSpan=${probe.spanY}, radius=$radius)"
                 )
             }
-            if (row == stripRowsDone) lastDiag = ""
+            if (row == firstRow) lastDiag = ""
             run {
                 lastDiag += String.format(
                     java.util.Locale.US,
@@ -1097,11 +1142,10 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
             // The first frame builds the whole window at once — thousands of rows
             // against a handful for every frame after it — so it needs its own
             // progress or it reads as a freeze.
-            onStripProgress?.invoke(row, lastRow + 1)
+            onStripProgress?.invoke(row - firstRow, lastRow - firstRow + 1)
         }
 
         GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, 0)
-        stripRowsDone = lastRow + 1
         return bundle
     }
 

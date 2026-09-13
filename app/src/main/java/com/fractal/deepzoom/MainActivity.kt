@@ -370,6 +370,7 @@ class MainActivity : AppCompatActivity() {
         val warning = content.findViewById<TextView>(R.id.v_warning)
         val expMapCheck = content.findViewById<android.widget.CheckBox>(R.id.v_expmap)
         val dumpCheck = content.findViewById<android.widget.CheckBox>(R.id.v_dumpstrip)
+        val zoomInCheck = content.findViewById<android.widget.CheckBox>(R.id.v_zoomin)
 
         fun settings(): ExportManager.VideoSettings {
             val h = videoHeights[resSlider.value.toInt()]
@@ -381,6 +382,7 @@ class MainActivity : AppCompatActivity() {
                 zoomPerFrame = zoomSlider.value.toDouble(),
                 bitsPerPixel = qualityBpp[qualitySlider.value.toInt()],
                 exponentialMap = expMapCheck.isChecked,
+                zoomIn = zoomInCheck.isChecked,
                 dumpStrip = dumpCheck.isChecked
             )
         }
@@ -398,7 +400,8 @@ class MainActivity : AppCompatActivity() {
             zoomLabel.text = "Zoom out per frame — %.1f%%".format((s.zoomPerFrame - 1) * 100)
             qualityLabel.text =
                 "Quality — ${qualityLabels[qualitySlider.value.toInt()]} (~%.0f Mbps)".format(mbps)
-            summary.text = "$frames frames  ·  %d:%02d long".format(
+            summary.text = (if (zoomInCheck.isChecked) "Zoom in  ·  " else "Zoom out  ·  ") +
+                "$frames frames  ·  %d:%02d long".format(
                 (seconds / 60).toInt(), (seconds % 60).toInt()
             )
             // Report the real figure from the geometry that will actually be used,
@@ -429,6 +432,7 @@ class MainActivity : AppCompatActivity() {
         zoomSlider.addOnChangeListener { _, _, _ -> refresh() }
         qualitySlider.addOnChangeListener { _, _, _ -> refresh() }
         expMapCheck.setOnCheckedChangeListener { _, _ -> refresh() }
+        zoomInCheck.setOnCheckedChangeListener { _, _ -> refresh() }
         refresh()
 
         AlertDialog.Builder(this)

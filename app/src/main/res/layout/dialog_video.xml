@@ -93,6 +93,14 @@
             app:labelBehavior="gone" />
 
         <CheckBox
+            android:id="@+id/v_zoomin"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:checked="false"
+            android:text="Zoom in (ends at this view) instead of out"
+            android:textSize="13sp" />
+
+        <CheckBox
             android:id="@+id/v_expmap"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"

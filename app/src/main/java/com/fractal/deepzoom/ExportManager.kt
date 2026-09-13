@@ -29,6 +29,8 @@ class ExportManager(private val view: MandelbrotView) {
         val zoomPerFrame: Double,
         val bitsPerPixel: Double,
         val exponentialMap: Boolean = true,
+        /** True renders the zoom inward, ending at the current view. */
+        val zoomIn: Boolean = false,
         val dumpStrip: Boolean = false,
         val holdFrames: Int = 12
     )
@@ -117,7 +119,9 @@ class ExportManager(private val view: MandelbrotView) {
                     )
                     view.renderer.debugSampling = true
                     try {
-                        view.renderer.stripExtendTo(frameState, geom, window.last, null)
+                            view.renderer.stripEnsureRange(
+                            frameState, geom, window.first, window.last, null
+                        )
                     } finally {
                         view.renderer.debugSampling = false
                     }
@@ -151,22 +155,14 @@ class ExportManager(private val view: MandelbrotView) {
                 }
 
                 for (i in 0 until total) {
-                    if (i < total - settings.holdFrames) {
-                        frameState.spanY = (snapshot.spanY *
-                            Math.pow(settings.zoomPerFrame, i.toDouble()))
-                            .coerceAtMost(ViewState.DEFAULT_SPAN)
-                    } else {
-                        // Hold on the final framing so the video does not end the
-                        // instant the motion stops.
-                        frameState.spanY = ViewState.DEFAULT_SPAN
-                    }
+                    frameState.spanY = spanForFrame(snapshot.spanY, settings, i, total)
 
                     if (geom != null) {
                         val window = StripGeometry.windowFor(
                             geom, frameState.spanY, settings.height, settings.width
                         )
-                        bundle = view.renderer.stripExtendTo(
-                            frameState, geom, window.last, bundle
+                        bundle = view.renderer.stripEnsureRange(
+                            frameState, geom, window.first, window.last, bundle
                         )
                         view.renderer.stripUnwarp(
                             geom, frameState.spanY, settings.width, settings.height, buf
@@ -202,6 +198,34 @@ class ExportManager(private val view: MandelbrotView) {
         SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
 
     companion object {
+        /**
+         * Span for one frame.
+         *
+         * Zoom-out starts at the current view and widens to the whole set; zoom-in is
+         * the same sequence walked backwards, starting wide and ending on the current
+         * view. Rendering inward directly avoids reversing an encoded video, which
+         * means decoding and re-encoding every frame.
+         */
+        fun spanForFrame(
+            targetSpan: Double,
+            settings: VideoSettings,
+            index: Int,
+            total: Int
+        ): Double {
+            val moving = total - settings.holdFrames
+            return if (settings.zoomIn) {
+                // Hold on the destination at the end.
+                if (index >= moving) targetSpan
+                else (ViewState.DEFAULT_SPAN *
+                    Math.pow(settings.zoomPerFrame, -(index).toDouble()))
+                    .coerceAtLeast(targetSpan)
+            } else {
+                if (index >= moving) ViewState.DEFAULT_SPAN
+                else (targetSpan * Math.pow(settings.zoomPerFrame, index.toDouble()))
+                    .coerceAtMost(ViewState.DEFAULT_SPAN)
+            }
+        }
+
         /** Ceiling on the strip ring buffer. Beyond this, fall back to plain frames. */
         const val STRIP_MEMORY_BUDGET = 160L * 1024 * 1024
 
