@@ -980,10 +980,12 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
             run {
                 lastDiag += String.format(
                     java.util.Locale.US,
-                    "row %d (+%d): r=%.2e span=%.2e exp=%d len=%d bla=%d %s",
-                    row, count, radius, probe.spanY,
+                    "row %d (+%d): r=%.2e exp=%d len=%d iter=%d bla=%d %s",
+                    row, count, radius,
                     if (deep) bundle!!.gpu.scaleExp else 0,
-                    uploadedLen, uploadedBlaLevels, if (deep) "P" else "D"
+                    uploadedLen,
+                    if (deep) min(s.maxIter, bundle!!.orbit.iterBuilt) else s.maxIter,
+                    uploadedBlaLevels, if (deep) "P" else "D"
                 )
             }
             GLES31.glUniform1f(u["uStripRBase"]!!, rBase)

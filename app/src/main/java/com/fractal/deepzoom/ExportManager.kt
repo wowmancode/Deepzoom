@@ -115,7 +115,12 @@ class ExportManager(private val view: MandelbrotView) {
                     val window = StripGeometry.windowFor(
                         geom, frameState.spanY, settings.height, settings.width
                     )
-                    view.renderer.stripExtendTo(frameState, geom, window.last, null)
+                    view.renderer.debugSampling = true
+                    try {
+                        view.renderer.stripExtendTo(frameState, geom, window.last, null)
+                    } finally {
+                        view.renderer.debugSampling = false
+                    }
                     // Keep the dump small enough to survive the Bitmap round trip,
                     // while holding the strip's own aspect so it stays readable.
                     val dw = min(1024, geom.width)
