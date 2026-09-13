@@ -1022,13 +1022,31 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
      * the unwarp. If the strip has content and frames are still blank, the fault is in
      * the resampling; if the strip is blank too, it is in the strip render.
      */
-    fun stripDump(out: ByteBuffer): IntArray {
-        GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, stripFbo)
+    fun stripDump(out: ByteBuffer, dumpW: Int, dumpH: Int) {
+        // Downscale on the GPU before reading back. The strip is 4096x8192, so a
+        // full-size readback would need a 134 MB buffer plus an IntArray and a Bitmap
+        // of the same size again — enough to kill the process outright.
+        ensureFbo(dumpW, dumpH)
+        GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, fbo)
+        GLES31.glViewport(0, 0, dumpW, dumpH)
+
+        GLES31.glUseProgram(blitProgram)
+        GLES31.glBindVertexArray(vao)
+        GLES31.glUniform2f(blit["uResolution"]!!, dumpW.toFloat(), dumpH.toFloat())
+        GLES31.glUniform2f(blit["uValidFrac"]!!, 1f, 1f)
+        GLES31.glUniform2f(blit["uShift"]!!, 0f, 0f)
+        GLES31.glUniform1f(blit["uZoom"]!!, 1f)
+        GLES31.glUniform3f(blit["uBackground"]!!, 1f, 0f, 1f)  // magenta marks untouched area
+        bindTexture(4, stripTex, blit["uScene"]!!)
+        GLES31.glDrawArrays(GLES31.GL_TRIANGLES, 0, 3)
+        GLES31.glBindVertexArray(0)
+
         out.position(0)
-        GLES31.glReadPixels(0, 0, stripW, stripRing, GLES31.GL_RGBA, GLES31.GL_UNSIGNED_BYTE, out)
+        GLES31.glReadPixels(0, 0, dumpW, dumpH, GLES31.GL_RGBA, GLES31.GL_UNSIGNED_BYTE, out)
         out.position(0)
+
         GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, 0)
-        return intArrayOf(stripW, stripRing)
+        GLES31.glViewport(0, 0, surfaceW, surfaceH)
     }
 
     fun stripEnd() {

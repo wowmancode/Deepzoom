@@ -10,6 +10,7 @@ import java.util.Locale
 import kotlin.math.ceil
 import kotlin.math.ln
 import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.roundToInt
 
 /**
@@ -115,12 +116,15 @@ class ExportManager(private val view: MandelbrotView) {
                         geom, frameState.spanY, settings.height, settings.width
                     )
                     view.renderer.stripExtendTo(frameState, geom, window.last, null)
-                    val dims = intArrayOf(geom.width, geom.ringHeight)
-                    val dump = allocate(dims[0], dims[1])
-                    view.renderer.stripDump(dump)
+                    // Keep the dump small enough to survive the Bitmap round trip,
+                    // while holding the strip's own aspect so it stays readable.
+                    val dw = min(1024, geom.width)
+                    val dh = min(2048, geom.ringHeight)
+                    val dump = allocate(dw, dh)
+                    view.renderer.stripDump(dump, dw, dh)
                     encoder.abort()
                     val u = ImageExporter.savePng(
-                        context, dump, dims[0], dims[1], "deepzoom_strip_${timestamp()}.png"
+                        context, dump, dw, dh, "deepzoom_strip_${timestamp()}.png"
                     )
                     onDone(u, if (u == null) "Could not write strip image" else null)
                     return@queueEvent
