@@ -983,6 +983,17 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
 
             GLES31.glDrawArrays(GLES31.GL_TRIANGLES, 0, 3)
             GLES31.glBindVertexArray(0)
+
+            // A failed draw here is otherwise invisible: the rows just stay black and
+            // the export finishes early, which is exactly the reported symptom.
+            val err = GLES31.glGetError()
+            if (err != GLES31.GL_NO_ERROR) {
+                throw RuntimeException(
+                    "Strip draw failed (GL error 0x${err.toString(16)}) at row $row, " +
+                        "${if (deep) "perturbation" else "direct"} path, chunk $count rows, " +
+                        "scale 2^${if (deep) bundle!!.gpu.scaleExp else 0}"
+                )
+            }
             row += count
             // The first frame builds the whole window at once — thousands of rows
             // against a handful for every frame after it — so it needs its own
