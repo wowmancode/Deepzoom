@@ -973,12 +973,15 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
                         "probeSpan=${probe.spanY}, radius=$radius)"
                 )
             }
-            if (row == stripRowsDone) lastDiag =
-                "geom ${stripW}x$stripRing logR0=%.3f step=%.6f | row %d: radius=%.3e " +
-                "probeSpan=%.3e scaleExp=%d rBase=%.3e deep=%b".let {
-                    it.format(geom.logR0, geom.step, row, radius, probe.spanY,
-                        if (deep) bundle!!.gpu.scaleExp else 0, rBaseD, deep)
-                }
+            if (row == stripRowsDone) {
+                lastDiag = String.format(
+                    java.util.Locale.US,
+                    "geom %dx%d logR0=%.3f step=%.6f | row %d: radius=%.3e " +
+                        "probeSpan=%.3e scaleExp=%d rBase=%.3e deep=%b",
+                    stripW, stripRing, geom.logR0, geom.step, row, radius, probe.spanY,
+                    if (deep) bundle!!.gpu.scaleExp else 0, rBaseD, deep
+                )
+            }
             GLES31.glUniform1f(u["uStripRBase"]!!, rBase)
             GLES31.glUniform1f(u["uStripRowBase"]!!, dest + 0.5f)
             GLES31.glUniform1f(u["uStripStep"]!!, geom.step.toFloat())
