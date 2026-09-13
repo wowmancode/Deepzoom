@@ -900,6 +900,10 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
     /** Extends the strip so every row up to and including lastRow exists. */
     var onStripProgress: ((rowsDone: Int, rowsTarget: Int) -> Unit)? = null
 
+    /** Numbers from the most recent strip chunk, surfaced by the debug dump. */
+    @Volatile var lastDiag: String = ""
+        private set
+
     fun stripExtendTo(s: ViewState, geom: StripGeometry, lastRow: Int, cached: OrbitBundle?): OrbitBundle? {
         if (!stripStarted) stripBegin(geom)
         var bundle = cached
@@ -907,6 +911,10 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
 
         GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, stripFbo)
         uploadPaletteIfDirty()
+
+        // glGetError reports the oldest unread error, which may date from launch.
+        // Drain it so anything caught below is genuinely from this loop.
+        while (GLES31.glGetError() != GLES31.GL_NO_ERROR) { /* discard */ }
 
         var row = stripRowsDone
         while (row <= lastRow) {
@@ -952,7 +960,26 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
 
             // Radius is built multiplicatively from a per-chunk base: at depth the
             // absolute log radius is around -130, where a float cannot separate rows.
-            GLES31.glUniform1f(u["uStripRBase"]!!, Math.exp(geom.logR0 + row * geom.step + ln(scale)).toFloat())
+            val rBaseD = Math.exp(geom.logR0 + row * geom.step + ln(scale))
+            val rBase = rBaseD.toFloat()
+            if (!rBase.isFinite() || rBase == 0f || rBase < 1e-36f) {
+                // A zero or denormal base makes every strip pixel's offset zero, so
+                // every pixel becomes the reference point and renders as its colour —
+                // a solid strip with no failed draw to catch. Name it instead.
+                throw RuntimeException(
+                    "Strip radius out of float range at row $row: base=$rBaseD " +
+                        "(logR0=${geom.logR0}, step=${geom.step}, " +
+                        "scaleExp=${if (deep) bundle!!.gpu.scaleExp else 0}, " +
+                        "probeSpan=${probe.spanY}, radius=$radius)"
+                )
+            }
+            if (row == stripRowsDone) lastDiag =
+                "geom ${stripW}x$stripRing logR0=%.3f step=%.6f | row %d: radius=%.3e " +
+                "probeSpan=%.3e scaleExp=%d rBase=%.3e deep=%b".let {
+                    it.format(geom.logR0, geom.step, row, radius, probe.spanY,
+                        if (deep) bundle!!.gpu.scaleExp else 0, rBaseD, deep)
+                }
+            GLES31.glUniform1f(u["uStripRBase"]!!, rBase)
             GLES31.glUniform1f(u["uStripRowBase"]!!, dest + 0.5f)
             GLES31.glUniform1f(u["uStripStep"]!!, geom.step.toFloat())
             GLES31.glUniform1f(u["uStripWidth"]!!, stripW.toFloat())

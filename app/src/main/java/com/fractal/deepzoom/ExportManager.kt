@@ -139,10 +139,9 @@ class ExportManager(private val view: MandelbrotView) {
                     )
 
                     encoder.abort()
-                    onDone(
-                        frameUri,
-                        if (frameUri == null) "Could not write debug images" else null
-                    )
+                    // Surface the strip's own numbers as the "error" so they show in a
+                    // dialog that can be screenshotted, rather than only in logcat.
+                    onDone(frameUri, "Debug images saved.\n\n" + view.renderer.lastDiag)
                     return@queueEvent
                 }
 
