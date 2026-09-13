@@ -922,8 +922,15 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
                 val crossing = ((ln(ViewState.DIRECT_LIMIT) - geom.logR0) / geom.step).toInt() - row
                 if (crossing in 1 until count) count = crossing
             }
-            // A chunk must always advance. If any of the arithmetic above ever yields
-            // zero or less, the loop would spin forever rather than fail.
+            // Cap the radius range a single chunk may cover. The delta scale, the BLA
+            // radii and maxC are all derived from the radius at the chunk's start, and
+            // an unbounded chunk applies them to radii hundreds of thousands of times
+            // larger, where they are meaningless. Four-to-one matches the tolerance
+            // used for reusing a bundle anywhere else.
+            val maxRows = max(1, (MAX_CHUNK_LOG_RANGE / geom.step).toInt())
+            if (count > maxRows) count = maxRows
+
+            // A chunk must always advance, whatever the arithmetic above produced.
             if (count < 1) count = 1
 
             val probe = s.snapshot()
@@ -1134,6 +1141,9 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
          * more finely but spend a larger fraction of themselves on the perimeter.
          */
         const val TILE_SIZE = 32
+
+        /** Largest log-radius range one strip chunk may span. ln(4). */
+        private const val MAX_CHUNK_LOG_RANGE = 1.3862943611198906
 
         /** Below this width the tile pass costs more than it saves. */
         const val TILE_MIN_WIDTH = 512
