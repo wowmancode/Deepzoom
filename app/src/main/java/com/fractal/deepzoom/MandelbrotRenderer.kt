@@ -1211,11 +1211,18 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
     fun stripRowLit(absoluteRow: Int): Int {
         if (stripFbo == 0 || stripW == 0) return -1
         val texel = ((absoluteRow % stripRing) + stripRing) % stripRing
-        var buf = rowProbeBuf
-        if (buf == null || buf.capacity() < stripW * 4) {
-            buf = ByteBuffer.allocateDirect(stripW * 4).order(ByteOrder.nativeOrder())
-            rowProbeBuf = buf
-        }
+        // Written so the non-null result is produced by the expression itself. Relying
+        // on a smart cast after reassigning a nullable var compiles under K2 but not
+        // under the K1 compiler this project builds with.
+        val cached = rowProbeBuf
+        val buf: ByteBuffer =
+            if (cached != null && cached.capacity() >= stripW * 4) {
+                cached
+            } else {
+                ByteBuffer.allocateDirect(stripW * 4)
+                    .order(ByteOrder.nativeOrder())
+                    .also { rowProbeBuf = it }
+            }
         buf.position(0)
         GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, stripFbo)
         GLES31.glReadPixels(0, texel, stripW, 1, GLES31.GL_RGBA, GLES31.GL_UNSIGNED_BYTE, buf)

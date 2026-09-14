@@ -5,8 +5,13 @@ bugs that reached the device would have been caught here.
 
 ## Setup (once)
 
+The compiler version must match `org.jetbrains.kotlin.android` in `build.gradle.kts`
+(currently 1.9.24). `verify.sh` refuses to run on a mismatch, because 1.9.x is the K1
+compiler and 2.0+ is K2, and K2 accepts code K1 rejects — a clean local check against
+the wrong compiler is worse than no check.
+
     curl -L -o /tmp/kotlin.zip \
-      https://github.com/JetBrains/kotlin/releases/download/v2.0.21/kotlin-compiler-2.0.21.zip
+      https://github.com/JetBrains/kotlin/releases/download/v1.9.24/kotlin-compiler-1.9.24.zip
     unzip -q /tmp/kotlin.zip -d "$HOME"        # -> $HOME/kotlinc
 
     curl -L -o "$HOME/android.jar" \
