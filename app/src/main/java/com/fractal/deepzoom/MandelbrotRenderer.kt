@@ -880,6 +880,9 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         // Start conservative; the first measured chunk corrects it immediately.
         stripRowBudget = 64
         stripSegments = 1
+        rowsSinceFinish = 0
+        finishStart = System.nanoTime()
+        msPerRow = 0.0
     }
 
     private fun ensureStrip(w: Int, ring: Int) {
@@ -935,6 +938,11 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
     /** Angular pieces each chunk row is drawn in; raised when one row is still too slow. */
     private var stripSegments = 1
     private var lastPerDrawMs = 0.0
+    /** Rows drawn since the pipeline was last drained, and when that was. */
+    private var rowsSinceFinish = 0
+    private var finishStart = System.nanoTime()
+    /** Running estimate of GPU cost per strip row; drives every budget below. */
+    private var msPerRow = 0.0
     private var chunksSinceMeasure = 0
     private var lastChunkMs = 0.0
 
@@ -1127,6 +1135,10 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
             if (segs == 1) {
                 GLES31.glDrawArrays(GLES31.GL_TRIANGLES, 0, 3)
             } else {
+                // When a single row costs more than a whole submission may, the row is
+                // the submission and splitting it alone does not help — the pipeline
+                // has to be drained between segments as well.
+                val drainPerSegment = msPerRow > SUBMIT_TARGET_MS
                 var x = 0
                 for (seg in 0 until segs) {
                     // Last segment takes the remainder, so widths always sum to stripW
@@ -1135,6 +1147,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
                     if (segW <= 0) break
                     GLES31.glViewport(x, dest, segW, count)
                     GLES31.glDrawArrays(GLES31.GL_TRIANGLES, 0, 3)
+                    if (drainPerSegment) GLES31.glFinish()
                     x += segW
                 }
             }
@@ -1154,35 +1167,38 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
             // every chunk when a video renders one per frame. Chunk cost changes
             // slowly, so sampling occasionally keeps the budget honest for a fraction
             // of the stalls. Debug mode measures every chunk.
-            chunksSinceMeasure++
-            if (debugSampling || chunksSinceMeasure >= MEASURE_EVERY) {
-                chunksSinceMeasure = 0
+            // What the driver kills is a submission that runs too long, not a single
+            // draw. Work queues up until something drains it, so measuring "per chunk"
+            // while draining only every sixteenth chunk attributed sixteen chunks of
+            // queued work to one chunk — inflating the number about 16x and, worse,
+            // letting roughly 2s of work accumulate into one submission, which is
+            // exactly the limit being hit.
+            //
+            // So the unit tracked is cost per row, and the pipeline is drained whenever
+            // the estimated work queued behind it approaches the budget for one
+            // submission.
+            rowsSinceFinish += count
+            val pendingMs = rowsSinceFinish * msPerRow
+            if (debugSampling || pendingMs >= SUBMIT_TARGET_MS || msPerRow <= 0.0) {
                 GLES31.glFinish()
-                val chunkMs = (System.nanoTime() - chunkStart) / 1e6
+                val elapsed = (System.nanoTime() - finishStart) / 1e6
+                val measured = elapsed / rowsSinceFinish.coerceAtLeast(1)
+                // Smoothed: cost per row varies between neighbouring rows, and reacting
+                // to a single sample makes the budget oscillate.
+                msPerRow = if (msPerRow <= 0.0) measured else msPerRow * 0.5 + measured * 0.5
+                lastChunkMs = elapsed
+                lastPerDrawMs = msPerRow
+                rowsSinceFinish = 0
+                finishStart = System.nanoTime()
 
-                // What the watchdog sees is one draw, not the whole chunk.
-                val perDrawMs = chunkMs / segs
-                if (perDrawMs > CHUNK_TARGET_MS) {
-                    if (stripRowBudget > 1) {
-                        stripRowBudget = if (chunkMs > 1.0) {
-                            (count * CHUNK_TARGET_MS / chunkMs).toInt()
-                                .coerceIn(1, MAX_CHUNK_ROWS)
-                        } else MAX_CHUNK_ROWS
-                    } else {
-                        // Out of rows to give up: narrow the draw instead.
-                        stripSegments = (segs * 2).coerceAtMost(MAX_SEGMENTS)
-                    }
-                } else if (perDrawMs * 4 < CHUNK_TARGET_MS) {
-                    // Comfortably under: widen again before growing rows, so the cheap
-                    // shallow rows do not stay needlessly split.
-                    if (segs > 1) stripSegments = segs / 2
-                    else if (chunkMs > 1.0) {
-                        stripRowBudget = (count * CHUNK_TARGET_MS / chunkMs).toInt()
-                            .coerceIn(1, MAX_CHUNK_ROWS)
-                    } else stripRowBudget = MAX_CHUNK_ROWS
-                }
-                lastChunkMs = chunkMs
-                lastPerDrawMs = perDrawMs
+                // Rows per chunk, then angular splitting only if one row alone is over
+                // budget — which is the case this whole path exists for.
+                stripRowBudget = if (msPerRow > 0.0) {
+                    (CHUNK_TARGET_MS / msPerRow).toInt().coerceIn(1, MAX_CHUNK_ROWS)
+                } else MAX_CHUNK_ROWS
+                stripSegments = if (msPerRow > CHUNK_TARGET_MS) {
+                    ceil(msPerRow / CHUNK_TARGET_MS).toInt().coerceIn(1, MAX_SEGMENTS)
+                } else 1
             }
             val chunkMs = lastChunkMs
 
@@ -1416,7 +1432,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
             "\n  1x1 readback worked: $tinyWorked" +
             "\n  read error 0x${err.toString(16)}" +
             "\n  row budget $stripRowBudget, segments $stripSegments" +
-            "\n  last chunk %.0fms, per draw %.0fms\n".format(lastChunkMs, lastPerDrawMs)
+            "\n  last drain %.0fms, cost per row %.1fms\n".format(lastChunkMs, msPerRow)
     }
 
     /** Draws the unwarped frame and leaves it bound, for an asynchronous read. */
@@ -1653,6 +1669,15 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
 
         /** Target milliseconds per strip draw. Well under typical watchdog limits. */
         private const val CHUNK_TARGET_MS = 150.0
+
+        /**
+         * Most GPU work allowed to queue behind one drain, in milliseconds.
+         *
+         * The driver kills a submission that runs beyond roughly two seconds, and it
+         * counts everything queued, not one draw. Well under that leaves room for the
+         * estimate to be wrong by several times without tripping it.
+         */
+        private const val SUBMIT_TARGET_MS = 400.0
 
         /** Chunks between timing samples outside debug mode. */
         private const val MEASURE_EVERY = 16
