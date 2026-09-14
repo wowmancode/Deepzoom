@@ -322,7 +322,17 @@ class ExportManager(private val view: MandelbrotView) {
                         // alternating pattern, which is lag 2.
                         for (k in 1 until min(HISTORY, i)) {
                             if (sum == history[k]) {
-                                if (lagHit < 0) { lagHit = k + 1; lagHitAt = i }
+                                if (lagHit < 0) {
+                                    lagHit = k + 1
+                                    lagHitAt = i
+                                    // A repeat at a lag is as much a failure as a
+                                    // repeat outright, so it gets a strip snapshot too.
+                                    if (geom != null && freezeReport.isEmpty()) {
+                                        freezeReport = stripSnapshot(
+                                            view, geom, frameState, settings, i, changed
+                                        )
+                                    }
+                                }
                                 break
                             }
                         }

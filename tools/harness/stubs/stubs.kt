@@ -19,6 +19,9 @@ open class AlertDialog : android.app.Dialog(null as Context) {
         fun setCancelable(flag: Boolean): Builder = this
         fun setPositiveButton(text: CharSequence?, l: DialogInterface.OnClickListener?): Builder = this
         fun setNegativeButton(text: CharSequence?, l: DialogInterface.OnClickListener?): Builder = this
+        fun setNeutralButton(text: CharSequence?, l: DialogInterface.OnClickListener?): Builder = this
+        fun setOnDismissListener(l: DialogInterface.OnDismissListener?): Builder = this
+        fun setItems(items: Array<CharSequence>?, l: DialogInterface.OnClickListener?): Builder = this
         fun create(): AlertDialog = AlertDialog()
         fun show(): AlertDialog = AlertDialog()
     }
