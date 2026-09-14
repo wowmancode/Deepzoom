@@ -1159,8 +1159,12 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
             } else {
                 lastDiag += "\n"
             }
-            row += count
+            // Recorded before row advances, so the range refers to the rows this chunk
+            // actually covered.
             stripRowsDrawn += count
+            if (stripDrawnLo < 0 || row < stripDrawnLo) stripDrawnLo = row
+            if (row + count - 1 > stripDrawnHi) stripDrawnHi = row + count - 1
+            row += count
             // The first frame builds the whole window at once — thousands of rows
             // against a handful for every frame after it — so it needs its own
             // progress or it reads as a freeze.
@@ -1172,38 +1176,56 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
     }
 
     /**
-     * Rows actually drawn into the strip since the counter was last reset.
+     * Rows drawn into the strip since the counter was reset, and the span of absolute
+     * rows they covered.
      *
-     * Separates "the rows were never requested" from "the rows were drawn and came out
-     * empty". Those two have the same symptom — a strip that stops gaining content —
-     * and completely different causes.
+     * The range matters as much as the count. Zoom-out extends the window upward and
+     * zoom-in extends it downward, so "the new rows" are not at a fixed end of the
+     * window — sampling the range that was actually drawn works in either direction.
      */
     @Volatile var stripRowsDrawn = 0
         private set
+    @Volatile var stripDrawnLo = -1
+        private set
+    @Volatile var stripDrawnHi = -1
+        private set
 
-    fun stripResetRowsDrawn() { stripRowsDrawn = 0 }
+    fun stripResetRowsDrawn() {
+        stripRowsDrawn = 0
+        stripDrawnLo = -1
+        stripDrawnHi = -1
+    }
+
+    // Reused so a per-frame probe does not allocate a direct buffer per call. Direct
+    // buffers are not reclaimed by an ordinary GC cycle, and a few hundred of them over
+    // the course of a dump is enough to bring the process down.
+    private var rowProbeBuf: ByteBuffer? = null
 
     /**
      * Counts non-black pixels in one absolute strip row.
      *
-     * Answers the question a dump of the whole strip only answers by eye: does this row
-     * actually contain a rendered image? 0 means the row was never drawn or the draw
-     * produced nothing. A count equal to the strip width means it is uniformly lit,
-     * which is what an all-interior row looks like.
+     * Answers what a dump of the whole strip only answers by eye: does this row hold a
+     * rendered image? 0 means nothing was drawn, or every pixel in it is the interior
+     * colour. A count equal to the strip width means every pixel is lit.
      */
     fun stripRowLit(absoluteRow: Int): Int {
         if (stripFbo == 0 || stripW == 0) return -1
         val texel = ((absoluteRow % stripRing) + stripRing) % stripRing
+        var buf = rowProbeBuf
+        if (buf == null || buf.capacity() < stripW * 4) {
+            buf = ByteBuffer.allocateDirect(stripW * 4).order(ByteOrder.nativeOrder())
+            rowProbeBuf = buf
+        }
+        buf.position(0)
         GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, stripFbo)
-        val rowBuf = ByteBuffer.allocateDirect(stripW * 4).order(ByteOrder.nativeOrder())
-        GLES31.glReadPixels(0, texel, stripW, 1, GLES31.GL_RGBA, GLES31.GL_UNSIGNED_BYTE, rowBuf)
+        GLES31.glReadPixels(0, texel, stripW, 1, GLES31.GL_RGBA, GLES31.GL_UNSIGNED_BYTE, buf)
         GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, 0)
         var lit = 0
         for (i in 0 until stripW) {
             val o = i * 4
-            if ((rowBuf.get(o).toInt() and 0xFF) > 8 ||
-                (rowBuf.get(o + 1).toInt() and 0xFF) > 8 ||
-                (rowBuf.get(o + 2).toInt() and 0xFF) > 8
+            if ((buf.get(o).toInt() and 0xFF) > 8 ||
+                (buf.get(o + 1).toInt() and 0xFF) > 8 ||
+                (buf.get(o + 2).toInt() and 0xFF) > 8
             ) lit++
         }
         return lit

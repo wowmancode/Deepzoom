@@ -178,20 +178,23 @@ class ExportManager(private val view: MandelbrotView) {
                             frameState, geom, w.first, w.last, bundle
                         )
                         val drawn = view.renderer.stripRowsDrawn
-                        // The newest row this frame needed, and the oldest, so a strip
-                        // that stops extending shows up as the top going dark while the
-                        // bottom still has content.
-                        val top = view.renderer.stripRowLit(w.last)
-                        val bottom = view.renderer.stripRowLit(w.first)
+                        val dLo = view.renderer.stripDrawnLo
+                        val dHi = view.renderer.stripDrawnHi
+                        // Sample the rows this frame actually drew, whichever end of the
+                        // window they were added to, plus both ends of the window so a
+                        // stale end still shows up.
+                        val fresh = if (drawn > 0) view.renderer.stripRowLit((dLo + dHi) / 2) else -1
+                        val lo = view.renderer.stripRowLit(w.first)
+                        val hi = view.renderer.stripRowLit(w.last)
                         if (i > 0 && drawn == 0 && firstNoDraw < 0) firstNoDraw = i
-                        if (top == 0 && firstBlank < 0) firstBlank = i
-                        if (top == geom.width && firstUniform < 0) firstUniform = i
+                        if (i > 0 && fresh == 0 && firstBlank < 0) firstBlank = i
+                        if (i > 0 && fresh == geom.width && firstUniform < 0) firstUniform = i
                         if (i % 10 == 0 || i == probeFrames - 1 ||
                             i == firstBlank || i == firstNoDraw
                         ) {
                             log.append(
-                                "f%d rows[%d..%d] drew=%d top=%d bottom=%d\n".format(
-                                    i, w.first, w.last, drawn, top, bottom
+                                "f%d win[%d..%d] drew=%d@[%d..%d] fresh=%d lo=%d hi=%d\n".format(
+                                    i, w.first, w.last, drawn, dLo, dHi, fresh, lo, hi
                                 )
                             )
                         }
@@ -221,26 +224,28 @@ class ExportManager(private val view: MandelbrotView) {
                     )
 
                     encoder.abort()
+                    val direction = if (settings.zoomIn) "zoom-in (window descends)"
+                                    else "zoom-out (window ascends)"
                     val verdict = when {
-                        firstNoDraw >= 0 && firstBlank >= 0 ->
-                            "Frame $firstNoDraw drew no rows at all, and the newest row " +
-                                "was blank from frame $firstBlank. The range handed to " +
+                        firstNoDraw >= 0 ->
+                            "Frame $firstNoDraw drew no rows at all. The range handed to " +
                                 "renderRows is wrong, not the draw."
                         firstBlank >= 0 ->
-                            "Rows were drawn every frame, but the newest row was blank " +
-                                "from frame $firstBlank. The draw produces nothing."
+                            "Rows were drawn every frame, but the rows drawn at frame " +
+                                "$firstBlank came out blank. The draw produces nothing."
                         firstUniform >= 0 ->
-                            "Newest row went uniform at frame $firstUniform: rows are " +
-                                "drawn but every pixel resolves the same."
+                            "Rows drawn at frame $firstUniform are uniformly lit: drawn, " +
+                                "but every pixel resolves the same."
                         else ->
-                            "Newest row had content on every probed frame: the strip " +
-                                "extends correctly, so the fault is in the unwarp."
+                            "Every frame drew rows and they had content. The strip " +
+                                "extends correctly in this direction."
                     }
                     // Surface the numbers as the "error" so they show in a dialog that
                     // can be screenshotted, rather than only in logcat.
                     onDone(
                         frameUri,
-                        "Probed $probeFrames frames, strip ${geom.width}x${geom.ringHeight}.\n\n" +
+                        "Probed $probeFrames frames, $direction,\n" +
+                            "strip ${geom.width}x${geom.ringHeight}.\n\n" +
                             verdict + "\n\n" + log + "\nLast chunk:\n" + view.renderer.lastDiag
                     )
                     return@queueEvent
