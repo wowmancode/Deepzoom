@@ -1238,6 +1238,27 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         return lit
     }
 
+    /** The row range stripEnsureRange believes is built, for diagnostics. */
+    val stripValidLo: Int get() = stripBuiltLo
+    val stripValidHi: Int get() = stripBuiltHi
+
+    /**
+     * Samples lit counts at evenly spaced rows across [lo, hi].
+     *
+     * Run after a freeze is detected rather than every frame: the rows are still in the
+     * ring, so where content stops can be found retrospectively for the cost of one
+     * burst of readbacks instead of one per frame for the whole export.
+     */
+    fun stripProfile(lo: Int, hi: Int, samples: Int = 12): String {
+        if (hi < lo) return "(empty range)"
+        val sb = StringBuilder()
+        for (k in 0 until samples) {
+            val row = lo + (hi - lo) * k / (samples - 1).coerceAtLeast(1)
+            sb.append("  row $row lit=${stripRowLit(row)}\n")
+        }
+        return sb.toString()
+    }
+
     /** Resamples the strip into a normal frame and reads it back. */
     fun stripUnwarp(geom: StripGeometry, spanY: Double, w: Int, h: Int, out: ByteBuffer) {
         stripUnwarpDraw(geom, spanY, w, h)

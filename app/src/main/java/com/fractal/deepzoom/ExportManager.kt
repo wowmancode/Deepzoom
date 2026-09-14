@@ -127,6 +127,9 @@ class ExportManager(private val view: MandelbrotView) {
                 var longestAt = -1
                 var firstDup = -1
                 var dupTotal = 0
+                // Filled in the moment a freeze is first seen, while the strip still
+                // holds the rows that produced it.
+                var freezeReport = ""
 
                 val frameState = snapshot.snapshot()
                 var bundle: OrbitBundle? = null
@@ -258,6 +261,7 @@ class ExportManager(private val view: MandelbrotView) {
                         val window = StripGeometry.windowFor(
                             geom, frameState.spanY, settings.height, settings.width
                         )
+                        view.renderer.stripResetRowsDrawn()
                         bundle = view.renderer.stripEnsureRange(
                             frameState, geom, window.first, window.last, bundle
                         )
@@ -283,7 +287,24 @@ class ExportManager(private val view: MandelbrotView) {
                     if (i > 0 && sum == prevSum) {
                         if (run == 0) { run = 2; runAt = i - 1 } else run++
                         dupTotal++
-                        if (firstDup < 0) firstDup = i
+                        if (firstDup < 0) {
+                            firstDup = i
+                            if (geom != null) {
+                                val w = StripGeometry.windowFor(
+                                    geom, frameState.spanY, settings.height, settings.width
+                                )
+                                freezeReport =
+                                    "At the first frozen frame:\n" +
+                                        "  window [${w.first}..${w.last}]\n" +
+                                        "  valid  [${view.renderer.stripValidLo}.." +
+                                        "${view.renderer.stripValidHi}]\n" +
+                                        "  drew ${view.renderer.stripRowsDrawn} rows at [" +
+                                        "${view.renderer.stripDrawnLo}.." +
+                                        "${view.renderer.stripDrawnHi}]\n\n" +
+                                        "Content across the window:\n" +
+                                        view.renderer.stripProfile(w.first, w.last)
+                            }
+                        }
                         if (run > longestRun) { longestRun = run; longestAt = runAt }
                     } else {
                         run = 0
@@ -306,6 +327,9 @@ class ExportManager(private val view: MandelbrotView) {
                 lastVideoDiag = describeDuplicates(
                     settings, total, firstDup, dupTotal, longestRun, longestAt
                 )
+                if (lastVideoDiag.isNotEmpty() && freezeReport.isNotEmpty()) {
+                    lastVideoDiag += "\n\n" + freezeReport
+                }
 
                 if (encoded != total) {
                     throw IllegalStateException(
