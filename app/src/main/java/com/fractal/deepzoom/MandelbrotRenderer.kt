@@ -1161,6 +1161,16 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
 
     /** Resamples the strip into a normal frame and reads it back. */
     fun stripUnwarp(geom: StripGeometry, spanY: Double, w: Int, h: Int, out: ByteBuffer) {
+        stripUnwarpDraw(geom, spanY, w, h)
+        out.position(0)
+        GLES31.glReadPixels(0, 0, w, h, GLES31.GL_RGBA, GLES31.GL_UNSIGNED_BYTE, out)
+        out.position(0)
+        GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, 0)
+        GLES31.glViewport(0, 0, surfaceW, surfaceH)
+    }
+
+    /** Draws the unwarped frame and leaves it bound, for an asynchronous read. */
+    fun stripUnwarpDraw(geom: StripGeometry, spanY: Double, w: Int, h: Int) {
         ensureFbo(w, h)
         GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, fbo)
         GLES31.glViewport(0, 0, w, h)
@@ -1179,13 +1189,79 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
 
         GLES31.glDrawArrays(GLES31.GL_TRIANGLES, 0, 3)
         GLES31.glBindVertexArray(0)
+    }
 
-        out.position(0)
-        GLES31.glReadPixels(0, 0, w, h, GLES31.GL_RGBA, GLES31.GL_UNSIGNED_BYTE, out)
-        out.position(0)
+    // --- Asynchronous readback -------------------------------------------------------
 
+    private var pbos = IntArray(0)
+    private var pboBytes = 0
+    private var pboIndex = 0
+    private var pboPrimed = false
+
+    /**
+     * Two pixel buffer objects, alternating.
+     *
+     * A plain glReadPixels blocks until the GPU has finished and 8 MB has crossed to
+     * the CPU. Reading into a PBO returns immediately and the transfer proceeds in the
+     * background, so the next frame renders while the previous one is still arriving.
+     * Mapping the other buffer then costs almost nothing, because its transfer had a
+     * whole frame to finish.
+     */
+    fun readbackEnsure(w: Int, h: Int): Boolean {
+        val bytes = w * h * 4
+        if (pboBytes == bytes && pbos.size == 2) return true
+
+        if (pbos.isNotEmpty()) GLES31.glDeleteBuffers(pbos.size, pbos, 0)
+        pbos = IntArray(2)
+        GLES31.glGenBuffers(2, pbos, 0)
+        for (id in pbos) {
+            GLES31.glBindBuffer(GLES31.GL_PIXEL_PACK_BUFFER, id)
+            GLES31.glBufferData(GLES31.GL_PIXEL_PACK_BUFFER, bytes, null, GLES31.GL_STREAM_READ)
+        }
+        GLES31.glBindBuffer(GLES31.GL_PIXEL_PACK_BUFFER, 0)
+
+        // Buffer mapping is driver-dependent; if setup fails, the caller falls back to
+        // the synchronous path rather than the export dying.
+        if (GLES31.glGetError() != GLES31.GL_NO_ERROR) {
+            pbos = IntArray(0)
+            pboBytes = 0
+            return false
+        }
+        pboBytes = bytes
+        pboIndex = 0
+        pboPrimed = false
+        return true
+    }
+
+    fun readbackIssue(w: Int, h: Int) {
+        GLES31.glBindBuffer(GLES31.GL_PIXEL_PACK_BUFFER, pbos[pboIndex])
+        GLES31.glReadPixels(0, 0, w, h, GLES31.GL_RGBA, GLES31.GL_UNSIGNED_BYTE, 0)
+        GLES31.glBindBuffer(GLES31.GL_PIXEL_PACK_BUFFER, 0)
         GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, 0)
         GLES31.glViewport(0, 0, surfaceW, surfaceH)
+        pboIndex = 1 - pboIndex
+        pboPrimed = true
+    }
+
+    /** Maps the frame issued before the current one, or null if none is pending. */
+    fun readbackMap(): ByteBuffer? {
+        if (!pboPrimed || pbos.isEmpty()) return null
+        GLES31.glBindBuffer(GLES31.GL_PIXEL_PACK_BUFFER, pbos[pboIndex])
+        return GLES31.glMapBufferRange(
+            GLES31.GL_PIXEL_PACK_BUFFER, 0, pboBytes, GLES31.GL_MAP_READ_BIT
+        ) as? ByteBuffer
+    }
+
+    fun readbackUnmap() {
+        GLES31.glUnmapBuffer(GLES31.GL_PIXEL_PACK_BUFFER)
+        GLES31.glBindBuffer(GLES31.GL_PIXEL_PACK_BUFFER, 0)
+    }
+
+    fun readbackRelease() {
+        if (pbos.isNotEmpty()) GLES31.glDeleteBuffers(pbos.size, pbos, 0)
+        pbos = IntArray(0)
+        pboBytes = 0
+        pboPrimed = false
     }
 
     /**
@@ -1226,6 +1302,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
     }
 
     fun releaseExportResources() {
+        readbackRelease()
         releaseFbo()
         // The tile target was resized for the export; put it back for the screen.
         ensureTileTarget()

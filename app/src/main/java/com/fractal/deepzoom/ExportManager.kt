@@ -105,6 +105,7 @@ class ExportManager(private val view: MandelbrotView) {
                 val pipeline = java.util.concurrent.Executors.newSingleThreadExecutor()
                 var inFlight: java.util.concurrent.Future<*>? = null
                 val buf = buffers[0]
+
                 val frameState = snapshot.snapshot()
                 var bundle: OrbitBundle? = null
 
@@ -114,6 +115,12 @@ class ExportManager(private val view: MandelbrotView) {
                 val geom = stripFor(
                     settings, snapshot.spanY, view.renderer.maxTextureSizeCached
                 )
+                // Asynchronous readback where the driver supports it. Falls back to
+                // the blocking path otherwise.
+                val async = geom != null &&
+                    view.renderer.readbackEnsure(settings.width, settings.height)
+                var asyncPending = false
+
                 if (geom != null) {
                     view.renderer.stripBegin(geom)
                     view.renderer.onStripProgress = { done, target ->
@@ -174,10 +181,32 @@ class ExportManager(private val view: MandelbrotView) {
                         bundle = view.renderer.stripEnsureRange(
                             frameState, geom, window.first, window.last, bundle
                         )
-                        view.renderer.stripUnwarp(
-                            geom, frameState.spanY, settings.width, settings.height,
-                            buffers[i % 2]
-                        )
+                        if (async) {
+                            view.renderer.stripUnwarpDraw(
+                                geom, frameState.spanY, settings.width, settings.height
+                            )
+                            view.renderer.readbackIssue(settings.width, settings.height)
+                            // Copy out the frame issued last time; its transfer has had
+                            // a full frame to complete, so this does not stall.
+                            val mapped = view.renderer.readbackMap()
+                            if (mapped != null && asyncPending) {
+                                val dst = buffers[i % 2]
+                                dst.position(0); mapped.position(0)
+                                dst.put(mapped)
+                                dst.position(0)
+                                view.renderer.readbackUnmap()
+                            } else {
+                                if (mapped != null) view.renderer.readbackUnmap()
+                                asyncPending = true
+                                progress.onProgress(i + 1, total)
+                                continue
+                            }
+                        } else {
+                            view.renderer.stripUnwarp(
+                                geom, frameState.spanY, settings.width, settings.height,
+                                buffers[i % 2]
+                            )
+                        }
                     } else {
                         bundle = view.renderer.renderOffscreen(
                             frameState, settings.width, settings.height,
@@ -190,6 +219,20 @@ class ExportManager(private val view: MandelbrotView) {
                     val ready = buffers[i % 2]
                     inFlight = pipeline.submit { encoder.encodeFrame(ready) }
                     progress.onProgress(i + 1, total)
+                }
+
+                // One frame is still on the GPU when the loop ends.
+                if (async && asyncPending) {
+                    val mapped = view.renderer.readbackMap()
+                    if (mapped != null) {
+                        val dst = buffers[0]
+                        dst.position(0); mapped.position(0)
+                        dst.put(mapped)
+                        dst.position(0)
+                        view.renderer.readbackUnmap()
+                        inFlight?.get()
+                        inFlight = pipeline.submit { encoder.encodeFrame(dst) }
+                    }
                 }
 
                 inFlight?.get()
