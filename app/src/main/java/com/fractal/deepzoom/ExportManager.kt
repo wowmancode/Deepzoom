@@ -144,20 +144,54 @@ class ExportManager(private val view: MandelbrotView) {
                     }
                 }
 
-                // Diagnostic: build the first frame's strip window, write it out as an
-                // image, and stop. Splits "strip is wrong" from "unwarp is wrong".
+                // Diagnostic: advance the strip frame by frame the way a real export
+                // does, sampling what actually landed in the newest rows, then write the
+                // strip and the last unwarped frame out as images.
+                //
+                // Building only frame 0 cannot see this class of fault: the first frame
+                // builds the whole window in one call and looks fine, and the question
+                // is whether the *extensions* after it carry any content.
                 if (geom != null && settings.dumpStrip) {
-                    val window = StripGeometry.windowFor(
+                    // Probe far enough that the window has moved entirely off the rows
+                    // the first frame built, with margin. A fixed count cannot do this:
+                    // rows gained per frame vary more than tenfold across the zoom-rate
+                    // slider, so any constant is either short at slow rates or wasteful
+                    // at fast ones.
+                    val firstWindow = StripGeometry.windowFor(
                         geom, frameState.spanY, settings.height, settings.width
                     )
-                    view.renderer.debugSampling = true
-                    try {
-                            view.renderer.stripEnsureRange(
-                            frameState, geom, window.first, window.last, null
+                    val rowsPerFrame = ln(settings.zoomPerFrame) / geom.step
+                    val toClear = (firstWindow.last - firstWindow.first) / max(rowsPerFrame, 1e-6)
+                    val probeFrames = min(total, (toClear * 1.5 + 20).toInt().coerceIn(20, DUMP_FRAMES_MAX))
+                    val log = StringBuilder()
+                    var firstBlank = -1
+                    var firstUniform = -1
+
+                    for (i in 0 until probeFrames) {
+                        frameState.spanY = spanForFrame(snapshot.spanY, settings, i, total)
+                        val w = StripGeometry.windowFor(
+                            geom, frameState.spanY, settings.height, settings.width
                         )
-                    } finally {
-                        view.renderer.debugSampling = false
+                        bundle = view.renderer.stripEnsureRange(
+                            frameState, geom, w.first, w.last, bundle
+                        )
+                        // The newest row this frame needed, and the oldest, so a strip
+                        // that stops extending shows up as the top going dark while the
+                        // bottom still has content.
+                        val top = view.renderer.stripRowLit(w.last)
+                        val bottom = view.renderer.stripRowLit(w.first)
+                        if (top == 0 && firstBlank < 0) firstBlank = i
+                        if (top == geom.width && firstUniform < 0) firstUniform = i
+                        if (i % 10 == 0 || i == probeFrames - 1 || i == firstBlank) {
+                            log.append(
+                                "f%d rows[%d..%d] top=%d bottom=%d\n".format(
+                                    i, w.first, w.last, top, bottom
+                                )
+                            )
+                        }
+                        progress.onProgress(i + 1, probeFrames)
                     }
+
                     // Keep the dump small enough to survive the Bitmap round trip,
                     // while holding the strip's own aspect so it stays readable.
                     val dw = min(1024, geom.width)
@@ -169,9 +203,9 @@ class ExportManager(private val view: MandelbrotView) {
                         context, dump, dw, dh, "deepzoom_strip_$stamp.png"
                     )
 
-                    // Also write the first unwarped frame. If the strip is good and
-                    // this is blank, the fault is in the resampling; if this looks
-                    // right, the fault is downstream in the encoder.
+                    // Also write the last unwarped frame. If the strip is good and this
+                    // is blank, the fault is in the resampling; if this looks right, the
+                    // fault is downstream in the encoder.
                     view.renderer.stripUnwarp(
                         geom, frameState.spanY, settings.width, settings.height, buf
                     )
@@ -181,9 +215,24 @@ class ExportManager(private val view: MandelbrotView) {
                     )
 
                     encoder.abort()
-                    // Surface the strip's own numbers as the "error" so they show in a
-                    // dialog that can be screenshotted, rather than only in logcat.
-                    onDone(frameUri, "Debug images saved.\n\n" + view.renderer.lastDiag)
+                    val verdict = when {
+                        firstBlank >= 0 ->
+                            "Newest row went blank at frame $firstBlank: the strip " +
+                                "stops being extended with content."
+                        firstUniform >= 0 ->
+                            "Newest row went uniform at frame $firstUniform: rows are " +
+                                "drawn but every pixel resolves the same."
+                        else ->
+                            "Newest row had content on every probed frame: the strip " +
+                                "extends correctly, so the fault is in the unwarp."
+                    }
+                    // Surface the numbers as the "error" so they show in a dialog that
+                    // can be screenshotted, rather than only in logcat.
+                    onDone(
+                        frameUri,
+                        "Probed $probeFrames frames, strip ${geom.width}x${geom.ringHeight}.\n\n" +
+                            verdict + "\n\n" + log + "\nLast chunk:\n" + view.renderer.lastDiag
+                    )
                     return@queueEvent
                 }
 
@@ -357,6 +406,9 @@ class ExportManager(private val view: MandelbrotView) {
 
         /** Ceiling on the strip ring buffer. Beyond this, fall back to plain frames. */
         const val STRIP_MEMORY_BUDGET = 160L * 1024 * 1024
+
+        /** Upper bound on the strip dump's probe, so a slow zoom rate cannot run away. */
+        const val DUMP_FRAMES_MAX = 2000
 
         fun stripFor(settings: VideoSettings, deepestSpan: Double, maxTex: Int): StripGeometry? =
             if (!settings.exponentialMap) null

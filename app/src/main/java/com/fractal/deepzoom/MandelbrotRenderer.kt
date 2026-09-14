@@ -1170,6 +1170,32 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         return bundle
     }
 
+    /**
+     * Counts non-black pixels in one absolute strip row.
+     *
+     * Answers the question a dump of the whole strip only answers by eye: does this row
+     * actually contain a rendered image? 0 means the row was never drawn or the draw
+     * produced nothing. A count equal to the strip width means it is uniformly lit,
+     * which is what an all-interior row looks like.
+     */
+    fun stripRowLit(absoluteRow: Int): Int {
+        if (stripFbo == 0 || stripW == 0) return -1
+        val texel = ((absoluteRow % stripRing) + stripRing) % stripRing
+        GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, stripFbo)
+        val rowBuf = ByteBuffer.allocateDirect(stripW * 4).order(ByteOrder.nativeOrder())
+        GLES31.glReadPixels(0, texel, stripW, 1, GLES31.GL_RGBA, GLES31.GL_UNSIGNED_BYTE, rowBuf)
+        GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, 0)
+        var lit = 0
+        for (i in 0 until stripW) {
+            val o = i * 4
+            if ((rowBuf.get(o).toInt() and 0xFF) > 8 ||
+                (rowBuf.get(o + 1).toInt() and 0xFF) > 8 ||
+                (rowBuf.get(o + 2).toInt() and 0xFF) > 8
+            ) lit++
+        }
+        return lit
+    }
+
     /** Resamples the strip into a normal frame and reads it back. */
     fun stripUnwarp(geom: StripGeometry, spanY: Double, w: Int, h: Int, out: ByteBuffer) {
         stripUnwarpDraw(geom, spanY, w, h)
