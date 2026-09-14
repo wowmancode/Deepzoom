@@ -1331,10 +1331,46 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         ) {
             readbackFailures++
             lastReadbackError = err
+            if (readbackHealth.isEmpty()) readbackHealth = probeGlHealth(err)
         }
 
         GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, 0)
         GLES31.glViewport(0, 0, surfaceW, surfaceH)
+    }
+
+    /** GL state at the first failed readback, to tell a dead context from a dead read. */
+    @Volatile var readbackHealth: String = ""
+        private set
+
+    /**
+     * Asks GL some questions that do not involve reading pixels.
+     *
+     * If queries still answer and the framebuffer is still complete, the context is
+     * alive and only the read is failing. If they do not, the context itself is gone —
+     * which on GLES 3.1 without the robustness extension is not required to be reported
+     * as an error, so it can only be found by asking.
+     */
+    private fun probeGlHealth(err: Int): String {
+        val status = GLES31.glCheckFramebufferStatus(GLES31.GL_FRAMEBUFFER)
+        val v = IntArray(1)
+        GLES31.glGetIntegerv(GLES31.GL_MAX_TEXTURE_SIZE, v, 0)
+        val queryWorks = v[0] > 0
+        val afterQuery = GLES31.glGetError()
+
+        // A one-pixel read. If the big read failed but this succeeds, the problem scales
+        // with the amount read rather than being a broken context.
+        val tiny = ByteBuffer.allocateDirect(4).order(ByteOrder.nativeOrder())
+        tiny.putInt(0, SENTINEL)
+        GLES31.glReadPixels(0, 0, 1, 1, GLES31.GL_RGBA, GLES31.GL_UNSIGNED_BYTE, tiny)
+        val tinyWorked = tiny.getInt(0) != SENTINEL
+
+        return "GL health at first failed readback:\n" +
+            "  framebuffer status 0x${status.toString(16)}" +
+            (if (status == GLES31.GL_FRAMEBUFFER_COMPLETE) " (complete)" else " (NOT complete)") +
+            "\n  queries responding: $queryWorks (maxTex=${v[0]}, err 0x${afterQuery.toString(16)})" +
+            "\n  1x1 readback worked: $tinyWorked" +
+            "\n  read error 0x${err.toString(16)}" +
+            "\n  row budget $stripRowBudget, last chunk %.0fms\n".format(lastChunkMs)
     }
 
     /** Draws the unwarped frame and leaves it bound, for an asynchronous read. */

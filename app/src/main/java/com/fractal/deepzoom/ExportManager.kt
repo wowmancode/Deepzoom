@@ -399,6 +399,7 @@ class ExportManager(private val view: MandelbrotView) {
                     firstStall, stallTotal,
                     view.renderer.readbackFailures, view.renderer.lastReadbackError,
                     firstFailAt, lastFailAt, failRunLongest,
+                    view.renderer.readbackHealth,
                     minChanged, minChangedAt, lagHit, lagHitAt
                 )
                 if (lastVideoDiag.isNotEmpty() && freezeReport.isNotEmpty()) {
@@ -492,6 +493,7 @@ class ExportManager(private val view: MandelbrotView) {
         firstFailAt: Int,
         lastFailAt: Int,
         failRunLongest: Int,
+        readbackHealth: String,
         minChanged: Double,
         minChangedAt: Int,
         lagHit: Int,
@@ -515,6 +517,7 @@ class ExportManager(private val view: MandelbrotView) {
                 append("two alternating buffers is the frame from two back.\n")
                 append("  frames $firstFailAt..$lastFailAt, ")
                 append("longest unbroken run $failRunLongest\n\n")
+                if (readbackHealth.isNotEmpty()) append(readbackHealth + "\n")
             }
             if (realDup) {
                 append("Identical frames:\n")
