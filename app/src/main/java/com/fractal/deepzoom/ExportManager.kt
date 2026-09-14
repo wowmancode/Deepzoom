@@ -193,8 +193,11 @@ class ExportManager(private val view: MandelbrotView) {
                 }
 
                 inFlight?.get()
+                // finish() queues end-of-stream and drains the encoder. MediaCodec is
+                // not safe to drive from two threads, so it runs where every
+                // encodeFrame ran rather than on the GL thread.
+                uri = pipeline.submit<Uri?> { encoder.finish() }.get()
                 pipeline.shutdown()
-                uri = encoder.finish()
             } catch (e: Exception) {
                 error = e.message ?: e.javaClass.simpleName
                 encoder.abort()
@@ -230,18 +233,21 @@ class ExportManager(private val view: MandelbrotView) {
             index: Int,
             total: Int
         ): Double {
-            val moving = total - settings.holdFrames
-            return if (settings.zoomIn) {
-                // Hold on the destination at the end.
-                if (index >= moving) targetSpan
-                else (ViewState.DEFAULT_SPAN *
-                    Math.pow(settings.zoomPerFrame, -(index).toDouble()))
-                    .coerceAtLeast(targetSpan)
-            } else {
-                if (index >= moving) ViewState.DEFAULT_SPAN
-                else (targetSpan * Math.pow(settings.zoomPerFrame, index.toDouble()))
-                    .coerceAtMost(ViewState.DEFAULT_SPAN)
+            val moving = (total - settings.holdFrames).coerceAtLeast(1)
+
+            // Hold on the destination at the end, whichever way we are going.
+            if (index >= moving) {
+                return if (settings.zoomIn) targetSpan else ViewState.DEFAULT_SPAN
             }
+
+            // Zoom-in is the zoom-out sequence walked backwards, rather than built
+            // forwards from the wide end. Built forwards, rounding in the frame count
+            // leaves the last moving frame short of the target — the zoom stops just
+            // before the place you started from. Mirroring makes the final frame land
+            // exactly on it by construction.
+            val step = if (settings.zoomIn) moving - 1 - index else index
+            return (targetSpan * Math.pow(settings.zoomPerFrame, step.toDouble()))
+                .coerceIn(targetSpan, ViewState.DEFAULT_SPAN)
         }
 
         /** Ceiling on the strip ring buffer. Beyond this, fall back to plain frames. */
