@@ -127,6 +127,19 @@ class ExportManager(private val view: MandelbrotView) {
                 var longestAt = -1
                 var firstDup = -1
                 var dupTotal = 0
+
+                // Exact equality is too narrow a test. A frame differing in a handful
+                // of pixels looks frozen but checksums differently, and an alternating
+                // good/bad sequence never repeats two frames in a row at all. So also
+                // measure how much of each frame actually changed, and keep a short
+                // checksum history to catch repeats at a lag.
+                val history = LongArray(HISTORY)
+                var minChanged = 1.0
+                var minChangedAt = -1
+                var firstStall = -1
+                var stallTotal = 0
+                var lagHit = -1
+                var lagHitAt = -1
                 // Filled in the moment a freeze is first seen, while the strip still
                 // holds the rows that produced it.
                 var freezeReport = ""
@@ -284,32 +297,47 @@ class ExportManager(private val view: MandelbrotView) {
                     // last used this buffer was awaited on the previous iteration, so
                     // nothing else is reading it now.
                     val sum = checksum(frameInts[i % 2])
+
+                    // Fraction of pixels differing from the previous frame. Both frames
+                    // are still live in the two ping-pong buffers, so this costs a pass
+                    // and no extra memory.
+                    var changed = 1.0
+                    if (i > 0) {
+                        val cur = frameInts[i % 2]
+                        val prv = frameInts[(i - 1) % 2]
+                        var diff = 0
+                        for (k in 0 until cur.capacity()) {
+                            if (cur.get(k) != prv.get(k)) diff++
+                        }
+                        changed = diff.toDouble() / cur.capacity()
+                        if (changed < minChanged) { minChanged = changed; minChangedAt = i }
+                        if (changed < STALL_FRACTION) {
+                            stallTotal++
+                            if (firstStall < 0) firstStall = i
+                        }
+                        // Repeat at a lag: an alternating pattern shows up as a match
+                        // two or more frames back while consecutive frames all differ.
+                        // history[k] holds frame i-1-k, so a match there is a repeat at
+                        // a lag of k+1. Starting at k=1 is what catches a plain
+                        // alternating pattern, which is lag 2.
+                        for (k in 1 until min(HISTORY, i)) {
+                            if (sum == history[k]) {
+                                if (lagHit < 0) { lagHit = k + 1; lagHitAt = i }
+                                break
+                            }
+                        }
+                    }
+                    for (k in HISTORY - 1 downTo 1) history[k] = history[k - 1]
+                    history[0] = sum
+
                     if (i > 0 && sum == prevSum) {
                         if (run == 0) { run = 2; runAt = i - 1 } else run++
                         dupTotal++
                         if (firstDup < 0) {
                             firstDup = i
-                            if (geom != null) {
-                                val w = StripGeometry.windowFor(
-                                    geom, frameState.spanY, settings.height, settings.width
-                                )
+                            if (geom != null && freezeReport.isEmpty()) {
                                 freezeReport =
-                                    "At the first frozen frame:\n" +
-                                        "  window [${w.first}..${w.last}]\n" +
-                                        "  valid  [${view.renderer.stripValidLo}.." +
-                                        "${view.renderer.stripValidHi}]\n" +
-                                        "  drew ${view.renderer.stripRowsDrawn} rows at [" +
-                                        "${view.renderer.stripDrawnLo}.." +
-                                        "${view.renderer.stripDrawnHi}]\n" +
-                                        "  that chunk measured lit=" +
-                                        "${view.renderer.lastChunkLit}/${geom.width} " +
-                                        "from inside renderRows\n\n" +
-                                        "Content across ALL valid rows:\n" +
-                                        view.renderer.stripProfile(
-                                            view.renderer.stripValidLo,
-                                            view.renderer.stripValidHi,
-                                            16
-                                        )
+                                    stripSnapshot(view, geom, frameState, settings, i, 0.0)
                             }
                         }
                         if (run > longestRun) { longestRun = run; longestAt = runAt }
@@ -317,6 +345,13 @@ class ExportManager(private val view: MandelbrotView) {
                         run = 0
                     }
                     prevSum = sum
+
+                    // A stall counts as a freeze for reporting purposes, so capture the
+                    // strip state the first time one happens even if no two frames were
+                    // ever byte-identical.
+                    if (i > 0 && changed < STALL_FRACTION && freezeReport.isEmpty() && geom != null) {
+                        freezeReport = stripSnapshot(view, geom, frameState, settings, i, changed)
+                    }
 
                     // Wait for the frame before last, which is the one that used this
                     // buffer, then hand this frame off and carry on rendering.
@@ -332,7 +367,8 @@ class ExportManager(private val view: MandelbrotView) {
                 // The last holdFrames frames sit on the destination on purpose, so
                 // duplicates there are expected and not worth reporting.
                 lastVideoDiag = describeDuplicates(
-                    settings, total, firstDup, dupTotal, longestRun, longestAt
+                    settings, total, firstDup, dupTotal, longestRun, longestAt,
+                    firstStall, stallTotal, minChanged, minChangedAt, lagHit, lagHitAt
                 )
                 if (lastVideoDiag.isNotEmpty() && freezeReport.isNotEmpty()) {
                     lastVideoDiag += "\n\n" + freezeReport
@@ -386,28 +422,83 @@ class ExportManager(private val view: MandelbrotView) {
         return h
     }
 
+    /**
+     * Captures what the strip looked like at the moment a freeze was first seen, while
+     * the rows that produced it are still in the ring.
+     */
+    private fun stripSnapshot(
+        view: MandelbrotView,
+        geom: StripGeometry,
+        frameState: ViewState,
+        settings: VideoSettings,
+        frame: Int,
+        changed: Double
+    ): String {
+        val w = StripGeometry.windowFor(
+            geom, frameState.spanY, settings.height, settings.width
+        )
+        val r = view.renderer
+        return "At frame $frame (%.4f%% of pixels changed):\n".format(changed * 100) +
+            "  window [${w.first}..${w.last}]\n" +
+            "  valid  [${r.stripValidLo}..${r.stripValidHi}]\n" +
+            "  drew ${r.stripRowsDrawn} rows at [${r.stripDrawnLo}..${r.stripDrawnHi}]\n" +
+            "  that chunk measured lit=${r.lastChunkLit}/${geom.width} inside renderRows\n\n" +
+            "Content across ALL valid rows:\n" +
+            r.stripProfile(r.stripValidLo, r.stripValidHi, 16)
+    }
+
     private fun describeDuplicates(
         settings: VideoSettings,
         total: Int,
         firstDup: Int,
         dupTotal: Int,
         longestRun: Int,
-        longestAt: Int
+        longestAt: Int,
+        firstStall: Int,
+        stallTotal: Int,
+        minChanged: Double,
+        minChangedAt: Int,
+        lagHit: Int,
+        lagHitAt: Int
     ): String {
         val moving = (total - settings.holdFrames).coerceAtLeast(1)
-        // Duplicates that fall entirely inside the intentional hold are expected.
-        if (firstDup < 0 || firstDup >= moving) return ""
+        // Duplicates inside the intentional hold at the end are expected.
+        val realDup = firstDup in 0 until moving
+        val realStall = firstStall in 0 until moving
+        val realLag = lagHitAt in 0 until moving
+        if (!realDup && !realStall && !realLag) return ""
 
         fun at(frame: Int) = "frame $frame (%.1fs)".format(frame.toDouble() / settings.fps)
 
         return buildString {
-            append("Identical frames detected.\n\n")
-            append("First repeat: ${at(firstDup)}\n")
-            append("Longest run: $longestRun frames from ${at(longestAt)}\n")
-            append("Repeated frames: $dupTotal of $total\n\n")
+            append("Frozen or near-frozen frames detected.\n\n")
+            if (realDup) {
+                append("Identical frames:\n")
+                append("  first repeat ${at(firstDup)}\n")
+                append("  longest run $longestRun frames from ${at(longestAt)}\n")
+                append("  $dupTotal of $total repeated\n\n")
+            }
+            if (realStall) {
+                append("Barely-changing frames (under %.1f%% of pixels):\n"
+                    .format(STALL_FRACTION * 100))
+                append("  first ${at(firstStall)}\n")
+                append("  $stallTotal of $total\n\n")
+            }
+            if (minChangedAt >= 0) {
+                append("Least motion: %.4f%% of pixels at %s\n\n"
+                    .format(minChanged * 100, at(minChangedAt)))
+            }
+            if (realLag) {
+                append("Frame repeats one seen $lagHit frames earlier, at ")
+                append("${at(lagHitAt)} — the output is cycling, not advancing.\n\n")
+            }
             append(
-                "The renderer produced the same image twice, so the freeze is at or " +
-                    "above the unwarp — not in the encoder."
+                if (realDup || realStall)
+                    "The renderer produced the same image twice, so the freeze is at " +
+                        "or above the unwarp — not in the encoder."
+                else
+                    "Every frame differed from the one before it, but the output " +
+                        "repeats at a lag."
             )
         }
     }
@@ -455,6 +546,19 @@ class ExportManager(private val view: MandelbrotView) {
 
         /** Upper bound on the strip dump's probe, so a slow zoom rate cannot run away. */
         const val DUMP_FRAMES_MAX = 2000
+
+        /** Checksums retained, so a repeat at a lag shows up as well as a repeat. */
+        const val HISTORY = 8
+
+        /**
+         * Below this fraction of pixels changed, a frame is treated as frozen.
+         *
+         * Byte equality is too strict: a frame differing in a few pixels still reads as
+         * stuck, and an alternating good/bad sequence never repeats two frames running.
+         * A real zoom step at these rates moves a large share of the frame, so anything
+         * under a fraction of a percent is not motion.
+         */
+        const val STALL_FRACTION = 0.002
 
         fun stripFor(settings: VideoSettings, deepestSpan: Double, maxTex: Int): StripGeometry? =
             if (!settings.exponentialMap) null
