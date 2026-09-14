@@ -967,6 +967,17 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
             stripBuiltLo = lo
             stripBuiltHi = min(stripBuiltHi, lo + stripRing - 1)
         }
+
+        // The unwarp samples [lo, hi] unconditionally. If those rows are not all valid
+        // it silently resamples stale data, and every later frame looks identical —
+        // the picture freezes while frames keep being written. Fail loudly instead.
+        if (lo < stripBuiltLo || hi > stripBuiltHi) {
+            throw IllegalStateException(
+                "Strip window [$lo, $hi] outside valid rows " +
+                    "[$stripBuiltLo, $stripBuiltHi] (ring $stripRing, " +
+                    "needs ${hi - lo + 1} rows)"
+            )
+        }
         return bundle
     }
 
