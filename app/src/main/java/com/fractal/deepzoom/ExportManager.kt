@@ -84,6 +84,7 @@ class ExportManager(private val view: MandelbrotView) {
     ) {
         val snapshot = view.state.snapshot()
         val total = frameCount(snapshot.spanY, settings)
+        lastVideoDiag = ""
 
         view.queueEvent {
             var uri: Uri? = null
@@ -109,6 +110,23 @@ class ExportManager(private val view: MandelbrotView) {
                 // file again.
                 var encoded = 0
                 val buf = buffers[0]
+
+                // Frame-identity check.
+                //
+                // A frozen image with frames still being written is invisible to every
+                // counter we have: the loop runs, the encoder accepts every frame, the
+                // file is the right length. Checksumming what the renderer actually
+                // produced is the one measurement that separates "the renderer emitted
+                // the same picture twice" from "the renderer was fine and the freeze is
+                // downstream of it". Views are made once; asIntBuffer allocates.
+                val frameInts = arrayOf(buffers[0].asIntBuffer(), buffers[1].asIntBuffer())
+                var prevSum = 0L
+                var run = 0          // length of the current identical-frame run
+                var runAt = -1       // frame the current run started on
+                var longestRun = 0
+                var longestAt = -1
+                var firstDup = -1
+                var dupTotal = 0
 
                 val frameState = snapshot.snapshot()
                 var bundle: OrbitBundle? = null
@@ -194,6 +212,20 @@ class ExportManager(private val view: MandelbrotView) {
                             buffers[i % 2], bundle
                         )
                     }
+                    // Checksum before handing the buffer to the encoder. The frame that
+                    // last used this buffer was awaited on the previous iteration, so
+                    // nothing else is reading it now.
+                    val sum = checksum(frameInts[i % 2])
+                    if (i > 0 && sum == prevSum) {
+                        if (run == 0) { run = 2; runAt = i - 1 } else run++
+                        dupTotal++
+                        if (firstDup < 0) firstDup = i
+                        if (run > longestRun) { longestRun = run; longestAt = runAt }
+                    } else {
+                        run = 0
+                    }
+                    prevSum = sum
+
                     // Wait for the frame before last, which is the one that used this
                     // buffer, then hand this frame off and carry on rendering.
                     inFlight?.get()
@@ -204,6 +236,13 @@ class ExportManager(private val view: MandelbrotView) {
                 }
 
                 inFlight?.get()
+
+                // The last holdFrames frames sit on the destination on purpose, so
+                // duplicates there are expected and not worth reporting.
+                lastVideoDiag = describeDuplicates(
+                    settings, total, firstDup, dupTotal, longestRun, longestAt
+                )
+
                 if (encoded != total) {
                     throw IllegalStateException(
                         "Encoded $encoded of $total frames — refusing to write a " +
@@ -226,6 +265,55 @@ class ExportManager(private val view: MandelbrotView) {
                 view.requestRender()
             }
             onDone(uri, error)
+        }
+    }
+
+    /**
+     * What the frame-identity check found on the most recent video export. Empty when
+     * every frame differed from the one before it, which is the healthy case.
+     */
+    @Volatile
+    var lastVideoDiag: String = ""
+        private set
+
+    /**
+     * Order-sensitive checksum of one rendered frame.
+     *
+     * Reads every pixel rather than sampling: the whole point is to be able to say two
+     * frames were identical without hedging, and a strided hash cannot. Absolute gets,
+     * so the buffer's own position is left alone for the encoder.
+     */
+    private fun checksum(pixels: java.nio.IntBuffer): Long {
+        var h = -3750763034362895579L          // FNV-1a 64-bit offset basis
+        for (i in 0 until pixels.capacity()) {
+            h = (h xor pixels.get(i).toLong()) * 1099511628211L
+        }
+        return h
+    }
+
+    private fun describeDuplicates(
+        settings: VideoSettings,
+        total: Int,
+        firstDup: Int,
+        dupTotal: Int,
+        longestRun: Int,
+        longestAt: Int
+    ): String {
+        val moving = (total - settings.holdFrames).coerceAtLeast(1)
+        // Duplicates that fall entirely inside the intentional hold are expected.
+        if (firstDup < 0 || firstDup >= moving) return ""
+
+        fun at(frame: Int) = "frame $frame (%.1fs)".format(frame.toDouble() / settings.fps)
+
+        return buildString {
+            append("Identical frames detected.\n\n")
+            append("First repeat: ${at(firstDup)}\n")
+            append("Longest run: $longestRun frames from ${at(longestAt)}\n")
+            append("Repeated frames: $dupTotal of $total\n\n")
+            append(
+                "The renderer produced the same image twice, so the freeze is at or " +
+                    "above the unwarp — not in the encoder."
+            )
         }
     }
 

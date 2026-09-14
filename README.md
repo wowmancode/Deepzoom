@@ -223,6 +223,25 @@ It is what the epsilon choice above is based on, and it is worth re-running if t
 table construction or the shader loop is ever changed — a wrong merge formula produces
 images that look plausible rather than obviously broken.
 
+`tools/harness/verify.sh` type-checks the whole Kotlin source set against a real
+`android.jar` plus signature-only stubs for AppCompat, Material and the generated `R`.
+No Android SDK or Gradle needed. See `tools/harness/README.md`.
+
+`tools/model_strip_freeze.py` and `tools/model_ring_contents.py` model the zoom-video
+strip pipeline — geometry, the per-frame row window, the ring-buffer bookkeeping, and
+what the unwarp shader samples in float32. The second one tracks which absolute row
+occupies each texel, so it checks contents rather than just the bookkeeping the
+in-app guard checks. Both were used to rule the strip out as the cause of a reported
+mid-video freeze.
+
+**Frame-identity check.** Every exported video frame is checksummed before it reaches
+the encoder, and runs of identical consecutive frames are counted. A frozen image with
+frames still being written is otherwise invisible to every counter there is: the loop
+runs, the encoder accepts each frame, the file comes out the right length. Duplicates
+inside the deliberate hold at the end are ignored; anything else is reported in a
+dialog on save. It costs one pass over the frame buffer, and it splits a freeze in the
+renderer from one downstream of it without needing logcat.
+
 ### Going deeper than 1e60
 
 The limit is float32 exponent range, not the algorithm. Past this point deltas need

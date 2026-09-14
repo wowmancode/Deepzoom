@@ -475,7 +475,19 @@ class MainActivity : AppCompatActivity() {
         exporter.saveVideo(this, settings, progress) { uri, error ->
             runOnUiThread {
                 dialog.dismiss()
-                reportResult(uri, error, "Saved to Movies/DeepZoom")
+                val diag = exporter.lastVideoDiag
+                // A video that saved but repeated frames is not a failure, so it does
+                // not get the failure dialog — but it must not pass as a silent success
+                // either, which is the whole reason the check exists.
+                if (error == null && uri != null && diag.isNotEmpty()) {
+                    AlertDialog.Builder(this)
+                        .setTitle("Saved to Movies/DeepZoom")
+                        .setMessage(diag)
+                        .setPositiveButton("OK", null)
+                        .show()
+                } else {
+                    reportResult(uri, error, "Saved to Movies/DeepZoom")
+                }
             }
         }
     }
