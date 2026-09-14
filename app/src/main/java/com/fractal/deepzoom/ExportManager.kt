@@ -140,6 +140,14 @@ class ExportManager(private val view: MandelbrotView) {
                 var stallTotal = 0
                 var lagHit = -1
                 var lagHitAt = -1
+                // Where the failed readbacks fall matters: a contiguous tail means the
+                // context died and never came back, scattered means an intermittent
+                // fault that recovers.
+                var firstFailAt = -1
+                var lastFailAt = -1
+                var failRunLongest = 0
+                var failRunCur = 0
+                var prevFailCount = 0
                 // Filled in the moment a freeze is first seen, while the strip still
                 // holds the rows that produced it.
                 var freezeReport = ""
@@ -287,6 +295,16 @@ class ExportManager(private val view: MandelbrotView) {
                             geom, frameState.spanY, settings.width, settings.height,
                             buffers[i % 2]
                         )
+                        val failNow = view.renderer.readbackFailures
+                        if (failNow > prevFailCount) {
+                            if (firstFailAt < 0) firstFailAt = i
+                            lastFailAt = i
+                            failRunCur++
+                            if (failRunCur > failRunLongest) failRunLongest = failRunCur
+                        } else {
+                            failRunCur = 0
+                        }
+                        prevFailCount = failNow
                     } else {
                         bundle = view.renderer.renderOffscreen(
                             frameState, settings.width, settings.height,
@@ -380,6 +398,7 @@ class ExportManager(private val view: MandelbrotView) {
                     settings, total, firstDup, dupTotal, longestRun, longestAt,
                     firstStall, stallTotal,
                     view.renderer.readbackFailures, view.renderer.lastReadbackError,
+                    firstFailAt, lastFailAt, failRunLongest,
                     minChanged, minChangedAt, lagHit, lagHitAt
                 )
                 if (lastVideoDiag.isNotEmpty() && freezeReport.isNotEmpty()) {
@@ -470,6 +489,9 @@ class ExportManager(private val view: MandelbrotView) {
         stallTotal: Int,
         readbackFailures: Int,
         lastReadbackError: Int,
+        firstFailAt: Int,
+        lastFailAt: Int,
+        failRunLongest: Int,
         minChanged: Double,
         minChangedAt: Int,
         lagHit: Int,
@@ -490,7 +512,9 @@ class ExportManager(private val view: MandelbrotView) {
                 append("READBACK FAILED on $readbackFailures frames ")
                 append("(last GL error 0x${lastReadbackError.toString(16)}).\n")
                 append("Those frames kept whatever the buffer already held, which with ")
-                append("two alternating buffers is the frame from two back.\n\n")
+                append("two alternating buffers is the frame from two back.\n")
+                append("  frames $firstFailAt..$lastFailAt, ")
+                append("longest unbroken run $failRunLongest\n\n")
             }
             if (realDup) {
                 append("Identical frames:\n")

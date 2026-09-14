@@ -1179,7 +1179,15 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         if (lastRow >= firstRow && stripW > 0) {
             val mid = ((stripDrawnHi + stripDrawnLo) / 2) % stripRing
             val probe = ByteBuffer.allocateDirect(stripW * 4).order(ByteOrder.nativeOrder())
+            val pend = (stripW - 1) * 4
+            probe.putInt(0, SENTINEL)
+            probe.putInt(pend, SENTINEL)
             GLES31.glReadPixels(0, mid, stripW, 1, GLES31.GL_RGBA, GLES31.GL_UNSIGNED_BYTE, probe)
+            if (probe.getInt(0) == SENTINEL && probe.getInt(pend) == SENTINEL) {
+                lastChunkLit = READ_FAILED
+                GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, 0)
+                return bundle
+            }
             var lit = 0
             for (i in 0 until stripW) {
                 val o = i * 4
@@ -1247,10 +1255,18 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
                     .order(ByteOrder.nativeOrder())
                     .also { rowProbeBuf = it }
             }
+        // Same sentinel treatment as the frame readback. Without it a read that does
+        // nothing leaves the reused buffer as it was and reports lit=0, which is
+        // indistinguishable from a genuinely black row — and would be read as evidence
+        // about the fractal when it is really evidence about the readback.
+        val end = (stripW - 1) * 4
+        buf.putInt(0, SENTINEL)
+        buf.putInt(end, SENTINEL)
         buf.position(0)
         GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, stripFbo)
         GLES31.glReadPixels(0, texel, stripW, 1, GLES31.GL_RGBA, GLES31.GL_UNSIGNED_BYTE, buf)
         GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, 0)
+        if (buf.getInt(0) == SENTINEL && buf.getInt(end) == SENTINEL) return READ_FAILED
         var lit = 0
         for (i in 0 until stripW) {
             val o = i * 4
@@ -1278,7 +1294,11 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         val sb = StringBuilder()
         for (k in 0 until samples) {
             val row = lo + (hi - lo) * k / (samples - 1).coerceAtLeast(1)
-            sb.append("  row $row lit=${stripRowLit(row)}\n")
+            val v = stripRowLit(row)
+            sb.append(
+                if (v == READ_FAILED) "  row $row READBACK DID NOTHING\n"
+                else "  row $row lit=$v\n"
+            )
         }
         return sb.toString()
     }
@@ -1508,6 +1528,9 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
          * from "the read wrote this". Fully opaque would be 0xFF alpha; this is not.
          */
         private const val SENTINEL = 0x5A3C7E01
+
+        /** Returned by the row probes when the read left the buffer untouched. */
+        const val READ_FAILED = -2
 
         const val TEX_WIDTH = 1024
         const val TEX_SHIFT = 10
