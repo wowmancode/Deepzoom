@@ -166,26 +166,32 @@ class ExportManager(private val view: MandelbrotView) {
                     val log = StringBuilder()
                     var firstBlank = -1
                     var firstUniform = -1
+                    var firstNoDraw = -1
 
                     for (i in 0 until probeFrames) {
                         frameState.spanY = spanForFrame(snapshot.spanY, settings, i, total)
                         val w = StripGeometry.windowFor(
                             geom, frameState.spanY, settings.height, settings.width
                         )
+                        view.renderer.stripResetRowsDrawn()
                         bundle = view.renderer.stripEnsureRange(
                             frameState, geom, w.first, w.last, bundle
                         )
+                        val drawn = view.renderer.stripRowsDrawn
                         // The newest row this frame needed, and the oldest, so a strip
                         // that stops extending shows up as the top going dark while the
                         // bottom still has content.
                         val top = view.renderer.stripRowLit(w.last)
                         val bottom = view.renderer.stripRowLit(w.first)
+                        if (i > 0 && drawn == 0 && firstNoDraw < 0) firstNoDraw = i
                         if (top == 0 && firstBlank < 0) firstBlank = i
                         if (top == geom.width && firstUniform < 0) firstUniform = i
-                        if (i % 10 == 0 || i == probeFrames - 1 || i == firstBlank) {
+                        if (i % 10 == 0 || i == probeFrames - 1 ||
+                            i == firstBlank || i == firstNoDraw
+                        ) {
                             log.append(
-                                "f%d rows[%d..%d] top=%d bottom=%d\n".format(
-                                    i, w.first, w.last, top, bottom
+                                "f%d rows[%d..%d] drew=%d top=%d bottom=%d\n".format(
+                                    i, w.first, w.last, drawn, top, bottom
                                 )
                             )
                         }
@@ -216,9 +222,13 @@ class ExportManager(private val view: MandelbrotView) {
 
                     encoder.abort()
                     val verdict = when {
+                        firstNoDraw >= 0 && firstBlank >= 0 ->
+                            "Frame $firstNoDraw drew no rows at all, and the newest row " +
+                                "was blank from frame $firstBlank. The range handed to " +
+                                "renderRows is wrong, not the draw."
                         firstBlank >= 0 ->
-                            "Newest row went blank at frame $firstBlank: the strip " +
-                                "stops being extended with content."
+                            "Rows were drawn every frame, but the newest row was blank " +
+                                "from frame $firstBlank. The draw produces nothing."
                         firstUniform >= 0 ->
                             "Newest row went uniform at frame $firstUniform: rows are " +
                                 "drawn but every pixel resolves the same."

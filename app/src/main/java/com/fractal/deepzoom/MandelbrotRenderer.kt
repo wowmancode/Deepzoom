@@ -1160,6 +1160,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
                 lastDiag += "\n"
             }
             row += count
+            stripRowsDrawn += count
             // The first frame builds the whole window at once — thousands of rows
             // against a handful for every frame after it — so it needs its own
             // progress or it reads as a freeze.
@@ -1169,6 +1170,18 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, 0)
         return bundle
     }
+
+    /**
+     * Rows actually drawn into the strip since the counter was last reset.
+     *
+     * Separates "the rows were never requested" from "the rows were drawn and came out
+     * empty". Those two have the same symptom — a strip that stops gaining content —
+     * and completely different causes.
+     */
+    @Volatile var stripRowsDrawn = 0
+        private set
+
+    fun stripResetRowsDrawn() { stripRowsDrawn = 0 }
 
     /**
      * Counts non-black pixels in one absolute strip row.
