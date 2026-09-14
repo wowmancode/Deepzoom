@@ -300,9 +300,16 @@ class ExportManager(private val view: MandelbrotView) {
                                         "${view.renderer.stripValidHi}]\n" +
                                         "  drew ${view.renderer.stripRowsDrawn} rows at [" +
                                         "${view.renderer.stripDrawnLo}.." +
-                                        "${view.renderer.stripDrawnHi}]\n\n" +
-                                        "Content across the window:\n" +
-                                        view.renderer.stripProfile(w.first, w.last)
+                                        "${view.renderer.stripDrawnHi}]\n" +
+                                        "  that chunk measured lit=" +
+                                        "${view.renderer.lastChunkLit}/${geom.width} " +
+                                        "from inside renderRows\n\n" +
+                                        "Content across ALL valid rows:\n" +
+                                        view.renderer.stripProfile(
+                                            view.renderer.stripValidLo,
+                                            view.renderer.stripValidHi,
+                                            16
+                                        )
                             }
                         }
                         if (run > longestRun) { longestRun = run; longestAt = runAt }

@@ -1171,9 +1171,33 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
             onStripProgress?.invoke(row - firstRow, lastRow - firstRow + 1)
         }
 
+        // One sample of what the final chunk actually wrote, taken here while stripFbo
+        // is still bound and in the same GL state the draw ran in. Deliberately not
+        // routed through debugSampling: that forces a glFinish on every chunk and so
+        // changes how the row budget adapts, which is exactly the behaviour under
+        // suspicion. No glFinish, no effect on the budget.
+        if (lastRow >= firstRow && stripW > 0) {
+            val mid = ((stripDrawnHi + stripDrawnLo) / 2) % stripRing
+            val probe = ByteBuffer.allocateDirect(stripW * 4).order(ByteOrder.nativeOrder())
+            GLES31.glReadPixels(0, mid, stripW, 1, GLES31.GL_RGBA, GLES31.GL_UNSIGNED_BYTE, probe)
+            var lit = 0
+            for (i in 0 until stripW) {
+                val o = i * 4
+                if ((probe.get(o).toInt() and 0xFF) > 8 ||
+                    (probe.get(o + 1).toInt() and 0xFF) > 8 ||
+                    (probe.get(o + 2).toInt() and 0xFF) > 8
+                ) lit++
+            }
+            lastChunkLit = lit
+        }
+
         GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, 0)
         return bundle
     }
+
+    /** Lit pixels in the middle row of the last chunk drawn, measured inside renderRows. */
+    @Volatile var lastChunkLit = -1
+        private set
 
     /**
      * Rows drawn into the strip since the counter was reset, and the span of absolute
