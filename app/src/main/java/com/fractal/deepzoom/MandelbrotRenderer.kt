@@ -879,6 +879,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         exportOrbit = null
         // Start conservative; the first measured chunk corrects it immediately.
         stripRowBudget = 64
+        stripSegments = 1
     }
 
     private fun ensureStrip(w: Int, ring: Int) {
@@ -931,6 +932,9 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
 
     /** Rows per strip draw, adapted from measured chunk time. */
     private var stripRowBudget = 128
+    /** Angular pieces each chunk row is drawn in; raised when one row is still too slow. */
+    private var stripSegments = 1
+    private var lastPerDrawMs = 0.0
     private var chunksSinceMeasure = 0
     private var lastChunkMs = 0.0
 
@@ -1112,7 +1116,28 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
                 GLES31.glUniform1f(u["uSpanY"]!!, 1f)
             }
 
-            GLES31.glDrawArrays(GLES31.GL_TRIANGLES, 0, 3)
+            // One draw per angular segment rather than one for the whole row.
+            //
+            // The watchdog limits how long a single draw may run, not how much total
+            // work a chunk does, so once the row budget bottoms out at 1 the only way
+            // left to shorten a draw is to narrow it. gl_FragCoord.x stays in window
+            // coordinates under a narrowed viewport, so the angle the shader derives
+            // from it is unchanged and the segments tile the row exactly.
+            val segs = stripSegments.coerceIn(1, MAX_SEGMENTS)
+            if (segs == 1) {
+                GLES31.glDrawArrays(GLES31.GL_TRIANGLES, 0, 3)
+            } else {
+                var x = 0
+                for (seg in 0 until segs) {
+                    // Last segment takes the remainder, so widths always sum to stripW
+                    // even when it does not divide evenly.
+                    val segW = if (seg == segs - 1) stripW - x else stripW / segs
+                    if (segW <= 0) break
+                    GLES31.glViewport(x, dest, segW, count)
+                    GLES31.glDrawArrays(GLES31.GL_TRIANGLES, 0, 3)
+                    x += segW
+                }
+            }
             GLES31.glBindVertexArray(0)
 
             // A failed draw here is otherwise invisible: the rows just stay black and
@@ -1134,10 +1159,30 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
                 chunksSinceMeasure = 0
                 GLES31.glFinish()
                 val chunkMs = (System.nanoTime() - chunkStart) / 1e6
-                stripRowBudget = if (chunkMs > 1.0) {
-                    (count * CHUNK_TARGET_MS / chunkMs).toInt().coerceIn(1, MAX_CHUNK_ROWS)
-                } else MAX_CHUNK_ROWS
+
+                // What the watchdog sees is one draw, not the whole chunk.
+                val perDrawMs = chunkMs / segs
+                if (perDrawMs > CHUNK_TARGET_MS) {
+                    if (stripRowBudget > 1) {
+                        stripRowBudget = if (chunkMs > 1.0) {
+                            (count * CHUNK_TARGET_MS / chunkMs).toInt()
+                                .coerceIn(1, MAX_CHUNK_ROWS)
+                        } else MAX_CHUNK_ROWS
+                    } else {
+                        // Out of rows to give up: narrow the draw instead.
+                        stripSegments = (segs * 2).coerceAtMost(MAX_SEGMENTS)
+                    }
+                } else if (perDrawMs * 4 < CHUNK_TARGET_MS) {
+                    // Comfortably under: widen again before growing rows, so the cheap
+                    // shallow rows do not stay needlessly split.
+                    if (segs > 1) stripSegments = segs / 2
+                    else if (chunkMs > 1.0) {
+                        stripRowBudget = (count * CHUNK_TARGET_MS / chunkMs).toInt()
+                            .coerceIn(1, MAX_CHUNK_ROWS)
+                    } else stripRowBudget = MAX_CHUNK_ROWS
+                }
                 lastChunkMs = chunkMs
+                lastPerDrawMs = perDrawMs
             }
             val chunkMs = lastChunkMs
 
@@ -1370,7 +1415,8 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
             "\n  queries responding: $queryWorks (maxTex=${v[0]}, err 0x${afterQuery.toString(16)})" +
             "\n  1x1 readback worked: $tinyWorked" +
             "\n  read error 0x${err.toString(16)}" +
-            "\n  row budget $stripRowBudget, last chunk %.0fms\n".format(lastChunkMs)
+            "\n  row budget $stripRowBudget, segments $stripSegments" +
+            "\n  last chunk %.0fms, per draw %.0fms\n".format(lastChunkMs, lastPerDrawMs)
     }
 
     /** Draws the unwarped frame and leaves it bound, for an asynchronous read. */
@@ -1563,6 +1609,12 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
          * Improbable-as-real pixel value used to tell "the read wrote nothing" apart
          * from "the read wrote this". Fully opaque would be 0xFF alpha; this is not.
          */
+        /**
+         * Most angular pieces a row may be split into. At 4096 columns this bottoms out
+         * at 64 pixels per draw, which is far below anything a watchdog objects to.
+         */
+        private const val MAX_SEGMENTS = 64
+
         private const val SENTINEL = 0x5A3C7E01
 
         /** Returned by the row probes when the read left the buffer untouched. */
