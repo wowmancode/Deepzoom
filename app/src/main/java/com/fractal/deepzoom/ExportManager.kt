@@ -32,7 +32,8 @@ class ExportManager(private val view: MandelbrotView) {
         /** True renders the zoom inward, ending at the current view. */
         val zoomIn: Boolean = false,
         val dumpStrip: Boolean = false,
-        val holdFrames: Int = 12
+        /** Frames held on the destination at the end. Short on purpose. */
+        val holdFrames: Int = 4
     )
 
     interface Progress {
@@ -104,6 +105,9 @@ class ExportManager(private val view: MandelbrotView) {
                 )
                 val pipeline = java.util.concurrent.Executors.newSingleThreadExecutor()
                 var inFlight: java.util.concurrent.Future<*>? = null
+                // Counted so a path that silently skips frames cannot produce an empty
+                // file again.
+                var encoded = 0
                 val buf = buffers[0]
 
                 val frameState = snapshot.snapshot()
@@ -115,12 +119,6 @@ class ExportManager(private val view: MandelbrotView) {
                 val geom = stripFor(
                     settings, snapshot.spanY, view.renderer.maxTextureSizeCached
                 )
-                // Asynchronous readback where the driver supports it. Falls back to
-                // the blocking path otherwise.
-                val async = geom != null &&
-                    view.renderer.readbackEnsure(settings.width, settings.height)
-                var asyncPending = false
-
                 if (geom != null) {
                     view.renderer.stripBegin(geom)
                     view.renderer.onStripProgress = { done, target ->
@@ -181,32 +179,15 @@ class ExportManager(private val view: MandelbrotView) {
                         bundle = view.renderer.stripEnsureRange(
                             frameState, geom, window.first, window.last, bundle
                         )
-                        if (async) {
-                            view.renderer.stripUnwarpDraw(
-                                geom, frameState.spanY, settings.width, settings.height
-                            )
-                            view.renderer.readbackIssue(settings.width, settings.height)
-                            // Copy out the frame issued last time; its transfer has had
-                            // a full frame to complete, so this does not stall.
-                            val mapped = view.renderer.readbackMap()
-                            if (mapped != null && asyncPending) {
-                                val dst = buffers[i % 2]
-                                dst.position(0); mapped.position(0)
-                                dst.put(mapped)
-                                dst.position(0)
-                                view.renderer.readbackUnmap()
-                            } else {
-                                if (mapped != null) view.renderer.readbackUnmap()
-                                asyncPending = true
-                                progress.onProgress(i + 1, total)
-                                continue
-                            }
-                        } else {
-                            view.renderer.stripUnwarp(
-                                geom, frameState.spanY, settings.width, settings.height,
-                                buffers[i % 2]
-                            )
-                        }
+                        // Asynchronous readback through pixel buffer objects was
+                        // tried here and removed: glMapBufferRange returns null on some
+                        // drivers, and there is no way to know without attempting it
+                        // mid-export. The overlap it bought was modest next to the
+                        // conversion pipelining below, which works everywhere.
+                        view.renderer.stripUnwarp(
+                            geom, frameState.spanY, settings.width, settings.height,
+                            buffers[i % 2]
+                        )
                     } else {
                         bundle = view.renderer.renderOffscreen(
                             frameState, settings.width, settings.height,
@@ -218,24 +199,17 @@ class ExportManager(private val view: MandelbrotView) {
                     inFlight?.get()
                     val ready = buffers[i % 2]
                     inFlight = pipeline.submit { encoder.encodeFrame(ready) }
+                    encoded++
                     progress.onProgress(i + 1, total)
                 }
 
-                // One frame is still on the GPU when the loop ends.
-                if (async && asyncPending) {
-                    val mapped = view.renderer.readbackMap()
-                    if (mapped != null) {
-                        val dst = buffers[0]
-                        dst.position(0); mapped.position(0)
-                        dst.put(mapped)
-                        dst.position(0)
-                        view.renderer.readbackUnmap()
-                        inFlight?.get()
-                        inFlight = pipeline.submit { encoder.encodeFrame(dst) }
-                    }
-                }
-
                 inFlight?.get()
+                if (encoded != total) {
+                    throw IllegalStateException(
+                        "Encoded $encoded of $total frames — refusing to write a " +
+                            "truncated video"
+                    )
+                }
                 // finish() queues end-of-stream and drains the encoder. MediaCodec is
                 // not safe to drive from two threads, so it runs where every
                 // encodeFrame ran rather than on the GL thread.
