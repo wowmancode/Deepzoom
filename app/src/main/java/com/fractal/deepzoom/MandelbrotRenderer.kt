@@ -1283,12 +1283,36 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         return sb.toString()
     }
 
+    /** Frames whose readback reported a GL error or left the buffer untouched. */
+    @Volatile var readbackFailures = 0
+        private set
+    @Volatile var lastReadbackError = 0
+        private set
+
     /** Resamples the strip into a normal frame and reads it back. */
     fun stripUnwarp(geom: StripGeometry, spanY: Double, w: Int, h: Int, out: ByteBuffer) {
         stripUnwarpDraw(geom, spanY, w, h)
+        while (GLES31.glGetError() != GLES31.GL_NO_ERROR) { /* discard older errors */ }
+
+        // A sentinel in the first and last pixel. If the read writes nothing the caller
+        // keeps whatever it held, which with two ping-pong buffers is the frame from two
+        // back — indistinguishable from a correctly rendered repeat unless checked here.
+        val last = w * h * 4 - 4
+        out.putInt(0, SENTINEL)
+        out.putInt(last, SENTINEL)
+
         out.position(0)
         GLES31.glReadPixels(0, 0, w, h, GLES31.GL_RGBA, GLES31.GL_UNSIGNED_BYTE, out)
         out.position(0)
+
+        val err = GLES31.glGetError()
+        if (err != GLES31.GL_NO_ERROR ||
+            (out.getInt(0) == SENTINEL && out.getInt(last) == SENTINEL)
+        ) {
+            readbackFailures++
+            lastReadbackError = err
+        }
+
         GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, 0)
         GLES31.glViewport(0, 0, surfaceW, surfaceH)
     }
@@ -1479,6 +1503,12 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
     }
 
     companion object {
+        /**
+         * Improbable-as-real pixel value used to tell "the read wrote nothing" apart
+         * from "the read wrote this". Fully opaque would be 0xFF alpha; this is not.
+         */
+        private const val SENTINEL = 0x5A3C7E01
+
         const val TEX_WIDTH = 1024
         const val TEX_SHIFT = 10
         const val MAX_POINTS = 1024 * 128

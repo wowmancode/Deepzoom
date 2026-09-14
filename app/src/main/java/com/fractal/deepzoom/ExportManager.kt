@@ -378,7 +378,9 @@ class ExportManager(private val view: MandelbrotView) {
                 // duplicates there are expected and not worth reporting.
                 lastVideoDiag = describeDuplicates(
                     settings, total, firstDup, dupTotal, longestRun, longestAt,
-                    firstStall, stallTotal, minChanged, minChangedAt, lagHit, lagHitAt
+                    firstStall, stallTotal,
+                    view.renderer.readbackFailures, view.renderer.lastReadbackError,
+                    minChanged, minChangedAt, lagHit, lagHitAt
                 )
                 if (lastVideoDiag.isNotEmpty() && freezeReport.isNotEmpty()) {
                     lastVideoDiag += "\n\n" + freezeReport
@@ -466,6 +468,8 @@ class ExportManager(private val view: MandelbrotView) {
         longestAt: Int,
         firstStall: Int,
         stallTotal: Int,
+        readbackFailures: Int,
+        lastReadbackError: Int,
         minChanged: Double,
         minChangedAt: Int,
         lagHit: Int,
@@ -476,12 +480,18 @@ class ExportManager(private val view: MandelbrotView) {
         val realDup = firstDup in 0 until moving
         val realStall = firstStall in 0 until moving
         val realLag = lagHitAt in 0 until moving
-        if (!realDup && !realStall && !realLag) return ""
+        if (!realDup && !realStall && !realLag && readbackFailures == 0) return ""
 
         fun at(frame: Int) = "frame $frame (%.1fs)".format(frame.toDouble() / settings.fps)
 
         return buildString {
             append("Frozen or near-frozen frames detected.\n\n")
+            if (readbackFailures > 0) {
+                append("READBACK FAILED on $readbackFailures frames ")
+                append("(last GL error 0x${lastReadbackError.toString(16)}).\n")
+                append("Those frames kept whatever the buffer already held, which with ")
+                append("two alternating buffers is the frame from two back.\n\n")
+            }
             if (realDup) {
                 append("Identical frames:\n")
                 append("  first repeat ${at(firstDup)}\n")
