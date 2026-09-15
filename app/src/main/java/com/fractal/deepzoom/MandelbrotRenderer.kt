@@ -903,6 +903,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         stripMaskHi = -1
         rowsSinceFinish = 0
         finishStart = System.nanoTime()
+        cpuPauseNs = 0L
         msPerRow = 0.0
     }
 
@@ -964,8 +965,38 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
     private var finishStart = System.nanoTime()
     /** Running estimate of GPU cost per strip row; drives every budget below. */
     private var msPerRow = 0.0
+
+    /**
+     * Wall time since the last drain that was *not* strip rasterisation.
+     *
+     * The interval between drains contains more than the draws it is meant to measure:
+     * building a reference orbit is BigDecimal work that can run into seconds at depth,
+     * the row probes block on glReadPixels, and the tile mask is its own pass. Dividing
+     * all of that by the rows in the chunk attributes it to per-row GPU cost, which is
+     * the number every budget below is derived from.
+     *
+     * Left in, it is self-reinforcing rather than merely inaccurate. An inflated
+     * msPerRow drives stripSegments up and turns on the per-segment drain, so the next
+     * interval carries dozens of extra glFinish stalls, which inflate it again. The
+     * estimate ratchets up and never comes back down, and the export ends up spending
+     * nearly all of its time in driver round trips instead of in the shader.
+     *
+     * So the non-raster spans are timed and subtracted.
+     */
+    private var cpuPauseNs = 0L
+
     private var chunksSinceMeasure = 0
     private var lastChunkMs = 0.0
+
+    /** Runs a span that is not strip rasterisation, keeping it out of the row estimate. */
+    private inline fun <T> offClock(block: () -> T): T {
+        val t0 = System.nanoTime()
+        try {
+            return block()
+        } finally {
+            cpuPauseNs += System.nanoTime() - t0
+        }
+    }
 
     /**
      * Ensures every row in [lo, hi] is present, rendering only what is missing.
@@ -1069,7 +1100,9 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
             // Only here, not after every chunk: reading pixels back forces the GPU to
             // finish everything queued, and this is the one place the answer is used.
             bundle = renderRowsDirect(s, geom, lastRow, lastRow, bundle)
-            when (stripRowInterior(lastRow)) {
+            // The readback blocks until the GPU is idle. That stall belongs to the
+            // probe, not to the row that happened to be drawn before it.
+            when (offClock { stripRowInterior(lastRow) }) {
                 1 -> stripInteriorCeiling = lastRow
                 0 -> stripNonInteriorFrom = min(stripNonInteriorFrom, lastRow)
                 // -1 is a failed read: learn nothing rather than assume either way.
@@ -1096,19 +1129,24 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
             (firstRow < stripMaskLo || lastRow > stripMaskHi)
         ) {
             val blockLo = Math.floorDiv(firstRow, STRIP_TILE_BLOCK) * STRIP_TILE_BLOCK
-            bundle = buildStripTiles(
-                s, geom,
-                min(blockLo, firstRow),
-                max(blockLo + STRIP_TILE_BLOCK - 1, lastRow),
-                bundle
-            )
+            // Its own pass, with its own drains. Counting it as strip-row time would
+            // raise msPerRow, which is the very thing that decides whether this pass
+            // runs at all — so leaving it in lets the mask keep re-arming itself.
+            bundle = offClock {
+                buildStripTiles(
+                    s, geom,
+                    min(blockLo, firstRow),
+                    max(blockLo + STRIP_TILE_BLOCK - 1, lastRow),
+                    bundle
+                )
+            }
         }
         bundle = renderRowsDirect(s, geom, firstRow, lastRow, bundle)
         // A range too short to probe still gets one test, so slow zoom rates — where
         // every range is a few rows — do not lose interior skipping altogether. One
         // readback per call, not per chunk.
         if (lastRow > stripInteriorCeiling && lastRow < stripNonInteriorFrom) {
-            when (stripRowInterior(lastRow)) {
+            when (offClock { stripRowInterior(lastRow) }) {
                 1 -> stripInteriorCeiling = lastRow
                 0 -> stripNonInteriorFrom = min(stripNonInteriorFrom, lastRow)
             }
@@ -1368,7 +1406,9 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
 
             val probe = s.snapshot()
             probe.spanY = max(radius * 2.0, s.minSpan())
-            if (deep) bundle = bundleForExport(probe, 1.0, bundle)
+            // Off the clock: at depth this is a BigDecimal orbit and a BLA table, which
+            // can cost seconds and has nothing to do with what a row costs to draw.
+            if (deep) bundle = offClock { bundleForExport(probe, 1.0, bundle) }
 
             val u = if (deep) perturbStrip else directStrip
             val program = if (deep) perturbStripProgram else directStripProgram
@@ -1503,14 +1543,29 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
             val pendingMs = rowsSinceFinish * msPerRow
             if (debugSampling || pendingMs >= SUBMIT_TARGET_MS || msPerRow <= 0.0) {
                 GLES31.glFinish()
-                val elapsed = (System.nanoTime() - finishStart) / 1e6
-                val measured = elapsed / rowsSinceFinish.coerceAtLeast(1)
-                // Smoothed: cost per row varies between neighbouring rows, and reacting
-                // to a single sample makes the budget oscillate.
-                msPerRow = if (msPerRow <= 0.0) measured else msPerRow * 0.5 + measured * 0.5
-                lastChunkMs = elapsed
+                // Only the rasterisation part of the interval is per-row cost. Orbit
+                // builds, row probes and the tile mask are timed separately and taken
+                // out here; leaving them in is what let the estimate run away.
+                val wall = (System.nanoTime() - finishStart) / 1e6
+                val elapsed = max(0.0, wall - cpuPauseNs / 1e6)
+                // Floored, not left at zero. An interval whose time was all orbit
+                // building measures as zero raster cost, and a zero estimate re-enters
+                // the "never measured" branch, which forces a drain on every chunk
+                // afterwards. The floor is far below any real row.
+                val measured = max(elapsed / rowsSinceFinish.coerceAtLeast(1), MIN_ROW_MS)
+                // Asymmetric on purpose. Rising slowly keeps the watchdog guard honest
+                // when rows genuinely get expensive; falling immediately means one
+                // unrepresentative sample cannot pin the budget at its floor for the
+                // rest of the export, which is the failure this is guarding against.
+                msPerRow = when {
+                    msPerRow <= 0.0 -> measured
+                    measured < msPerRow -> measured
+                    else -> msPerRow * 0.5 + measured * 0.5
+                }
+                lastChunkMs = wall
                 lastPerDrawMs = msPerRow
                 rowsSinceFinish = 0
+                cpuPauseNs = 0L
                 finishStart = System.nanoTime()
 
                 // Rows per chunk, then angular splitting only if one row alone is over
@@ -2012,6 +2067,16 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
 
         /** Target milliseconds per strip draw. Well under typical watchdog limits. */
         private const val CHUNK_TARGET_MS = 150.0
+
+        /**
+         * Floor on the estimated cost of one strip row.
+         *
+         * Only there to keep the estimate strictly positive, since zero is the sentinel
+         * for "not measured yet" and would force a pipeline drain on every chunk. Two
+         * orders of magnitude below the cheapest row that has ever been measured, so it
+         * never binds in practice.
+         */
+        private const val MIN_ROW_MS = 0.01
 
         /**
          * Most GPU work allowed to queue behind one drain, in milliseconds.
