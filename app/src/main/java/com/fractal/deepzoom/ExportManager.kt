@@ -276,6 +276,10 @@ class ExportManager(private val view: MandelbrotView) {
                     return@queueEvent
                 }
 
+                val phaseNs = LongArray(4)
+                view.renderer.profReset()
+                val tExport = System.nanoTime()
+
                 for (i in 0 until total) {
                     frameState.spanY = spanForFrame(snapshot.spanY, settings, i, total)
 
@@ -284,18 +288,22 @@ class ExportManager(private val view: MandelbrotView) {
                             geom, frameState.spanY, settings.height, settings.width
                         )
                         view.renderer.stripResetRowsDrawn()
+                        val tRows = System.nanoTime()
                         bundle = view.renderer.stripEnsureRange(
                             frameState, geom, window.first, window.last, bundle
                         )
+                        phaseNs[PH_ROWS] += System.nanoTime() - tRows
                         // Asynchronous readback through pixel buffer objects was
                         // tried here and removed: glMapBufferRange returns null on some
                         // drivers, and there is no way to know without attempting it
                         // mid-export. The overlap it bought was modest next to the
                         // conversion pipelining below, which works everywhere.
+                        val tUnwarp = System.nanoTime()
                         view.renderer.stripUnwarp(
                             geom, frameState.spanY, settings.width, settings.height,
                             buffers[i % 2]
                         )
+                        phaseNs[PH_UNWARP] += System.nanoTime() - tUnwarp
                         val failNow = view.renderer.readbackFailures
                         if (failNow > prevFailCount) {
                             if (firstFailAt < 0) firstFailAt = i
@@ -315,6 +323,7 @@ class ExportManager(private val view: MandelbrotView) {
                     // Checksum before handing the buffer to the encoder. The frame that
                     // last used this buffer was awaited on the previous iteration, so
                     // nothing else is reading it now.
+                    val tCheck = System.nanoTime()
                     val sum = checksum(frameInts[i % 2])
 
                     // Fraction of pixels differing from the previous frame. Both frames
@@ -356,6 +365,8 @@ class ExportManager(private val view: MandelbrotView) {
                             }
                         }
                     }
+                    phaseNs[PH_VERIFY] += System.nanoTime() - tCheck
+
                     for (k in HISTORY - 1 downTo 1) history[k] = history[k - 1]
                     history[0] = sum
 
@@ -384,9 +395,11 @@ class ExportManager(private val view: MandelbrotView) {
 
                     // Wait for the frame before last, which is the one that used this
                     // buffer, then hand this frame off and carry on rendering.
+                    val tEnc = System.nanoTime()
                     inFlight?.get()
                     val ready = buffers[i % 2]
                     inFlight = pipeline.submit { encoder.encodeFrame(ready) }
+                    phaseNs[PH_ENCODE] += System.nanoTime() - tEnc
                     encoded++
                     progress.onProgress(i + 1, total)
                 }
@@ -403,7 +416,32 @@ class ExportManager(private val view: MandelbrotView) {
                     view.renderer.readbackHealth,
                     minChanged, minChangedAt, lagHit, lagHitAt
                 )
-                if (lastVideoDiag.isNotEmpty() && freezeReport.isNotEmpty()) {
+                val wallS = (System.nanoTime() - tExport) / 1e9
+                val names = arrayOf(
+                    "building rows", "unwarp + readback", "checksum + diff", "encode wait"
+                )
+                val breakdown = buildString {
+                    append("Export took %.0fs for %d frames (%.2fs per frame).\n"
+                        .format(wallS, total, wallS / max(1, total)))
+                    append("Frame time by phase:\n")
+                    for (k in names.indices) {
+                        append("  %-18s %7.1fs  %4.1f%%\n".format(
+                            names[k], phaseNs[k] / 1e9,
+                            if (wallS > 0) 100.0 * phaseNs[k] / 1e9 / wallS else 0.0
+                        ))
+                    }
+                    val acc = phaseNs.sum() / 1e9
+                    append("  %-18s %7.1fs  %4.1f%%\n".format(
+                        "unaccounted", wallS - acc,
+                        if (wallS > 0) 100.0 * (wallS - acc) / wallS else 0.0
+                    ))
+                    val strip = view.renderer.profReport()
+                    if (strip.isNotEmpty()) append("\n").append(strip)
+                }
+                lastVideoDiag =
+                    if (lastVideoDiag.isEmpty()) breakdown
+                    else lastVideoDiag + "\n\n" + breakdown
+                if (freezeReport.isNotEmpty()) {
                     lastVideoDiag += "\n\n" + freezeReport
                 }
 
@@ -591,6 +629,12 @@ class ExportManager(private val view: MandelbrotView) {
 
         /** Ceiling on the strip ring buffer. Beyond this, fall back to plain frames. */
         const val STRIP_MEMORY_BUDGET = 160L * 1024 * 1024
+
+        /** Phase slots for the per-frame export profile. */
+        private const val PH_ROWS = 0
+        private const val PH_UNWARP = 1
+        private const val PH_VERIFY = 2
+        private const val PH_ENCODE = 3
 
         /** Upper bound on the strip dump's probe, so a slow zoom rate cannot run away. */
         const val DUMP_FRAMES_MAX = 2000

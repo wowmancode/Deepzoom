@@ -988,14 +988,48 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
     private var chunksSinceMeasure = 0
     private var lastChunkMs = 0.0
 
+    /**
+     * Where strip time goes, by category: orbit builds, tile mask, probe readbacks,
+     * and rasterising. Accumulated across a whole export and reported at the end.
+     *
+     * Without this the only timing the app surfaces sits inside the GL health dump,
+     * which prints only after a failed readback. An export that is merely slow gives
+     * up no numbers at all, so every diagnosis has to be inferred from symptoms.
+     */
+    private val profNs = LongArray(4)
+
     /** Runs a span that is not strip rasterisation, keeping it out of the row estimate. */
-    private inline fun <T> offClock(block: () -> T): T {
+    private inline fun <T> offClock(slot: Int, block: () -> T): T {
         val t0 = System.nanoTime()
         try {
             return block()
         } finally {
-            cpuPauseNs += System.nanoTime() - t0
+            val d = System.nanoTime() - t0
+            cpuPauseNs += d
+            profNs[slot] += d
         }
+    }
+
+    /** Clears the strip profile. Called when an export starts. */
+    fun profReset() {
+        for (i in profNs.indices) profNs[i] = 0L
+    }
+
+    /** Strip time by category, in seconds with percentages. */
+    fun profReport(): String {
+        val total = profNs.sum()
+        if (total <= 0L) return ""
+        val names = arrayOf("orbit + BLA build", "tile mask", "probe readback", "rasterising")
+        val sb = StringBuilder("Strip time by category:\n")
+        for (i in names.indices) {
+            sb.append(
+                "  %-18s %7.1fs  %4.1f%%\n".format(
+                    names[i], profNs[i] / 1e9, 100.0 * profNs[i] / total
+                )
+            )
+        }
+        sb.append("  %-18s %7.1fs\n".format("total", total / 1e9))
+        return sb.toString()
     }
 
     /**
@@ -1128,7 +1162,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
             bundle = renderRowsDirect(s, geom, lastRow, lastRow, bundle)
             // The readback blocks until the GPU is idle. That stall belongs to the
             // probe, not to the row that happened to be drawn before it.
-            when (offClock { stripRowInterior(lastRow) }) {
+            when (offClock(PROF_PROBE) { stripRowInterior(lastRow) }) {
                 1 -> stripInteriorCeiling = lastRow
                 0 -> stripNonInteriorFrom = min(stripNonInteriorFrom, lastRow)
                 // -1 is a failed read: learn nothing rather than assume either way.
@@ -1158,7 +1192,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
             // Its own pass, with its own drains. Counting it as strip-row time would
             // raise msPerRow, which is the very thing that decides whether this pass
             // runs at all — so leaving it in lets the mask keep re-arming itself.
-            bundle = offClock {
+            bundle = offClock(PROF_TILE) {
                 buildStripTiles(
                     s, geom,
                     min(blockLo, firstRow),
@@ -1172,7 +1206,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         // every range is a few rows — do not lose interior skipping altogether. One
         // readback per call, not per chunk.
         if (lastRow > stripInteriorCeiling && lastRow < stripNonInteriorFrom) {
-            when (offClock { stripRowInterior(lastRow) }) {
+            when (offClock(PROF_PROBE) { stripRowInterior(lastRow) }) {
                 1 -> stripInteriorCeiling = lastRow
                 0 -> stripNonInteriorFrom = min(stripNonInteriorFrom, lastRow)
             }
@@ -1434,7 +1468,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
             probe.spanY = max(radius * 2.0, s.minSpan())
             // Off the clock: at depth this is a BigDecimal orbit and a BLA table, which
             // can cost seconds and has nothing to do with what a row costs to draw.
-            if (deep) bundle = offClock { bundleForExport(probe, 1.0, bundle) }
+            if (deep) bundle = offClock(PROF_ORBIT) { bundleForExport(probe, 1.0, bundle) }
 
             val u = if (deep) perturbStrip else directStrip
             val program = if (deep) perturbStripProgram else directStripProgram
@@ -1574,6 +1608,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
                 // out here; leaving them in is what let the estimate run away.
                 val wall = (System.nanoTime() - finishStart) / 1e6
                 val elapsed = max(0.0, wall - cpuPauseNs / 1e6)
+                profNs[PROF_RASTER] += (elapsed * 1e6).toLong()
                 // Floored, not left at zero. An interval whose time was all orbit
                 // building measures as zero raster cost, and a zero estimate re-enters
                 // the "never measured" branch, which forces a drain on every chunk
@@ -2051,6 +2086,12 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
          * six-fold stall a four-times-larger block produced.
          */
         private const val STRIP_TILE_BLOCK = 256
+
+        /** Profile slots, indexes into profNs. */
+        private const val PROF_ORBIT = 0
+        private const val PROF_TILE = 1
+        private const val PROF_PROBE = 2
+        private const val PROF_RASTER = 3
 
         /**
          * Rows built beyond the frame that asked for them, when the ring has room.

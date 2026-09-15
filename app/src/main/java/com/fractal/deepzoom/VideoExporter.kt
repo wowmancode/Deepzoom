@@ -250,15 +250,21 @@ class VideoExporter(
         while (cx < width / 2) {
             val x0 = cx * 2
             val x1 = if (x0 + 1 < width) x0 + 1 else x0
-            var rs = 0; var gs = 0; var bs = 0
-            for (base in intArrayOf(row0, row1)) {
-                for (px in intArrayOf(x0, x1)) {
-                    val a = base + px * 4
-                    rs += rgbaFrame[a].toInt() and 0xFF
-                    gs += rgbaFrame[a + 1].toInt() and 0xFF
-                    bs += rgbaFrame[a + 2].toInt() and 0xFF
-                }
-            }
+            // Unrolled over the 2x2 block. Looping over the offsets instead reads
+            // better, but the loop subjects have to be materialised as arrays, and at
+            // one chroma sample per iteration that allocates twice per sample -- about
+            // a million short-lived arrays per frame, whose collection costs more than
+            // the arithmetic they carry.
+            val a00 = row0 + x0 * 4
+            val a01 = row0 + x1 * 4
+            val a10 = row1 + x0 * 4
+            val a11 = row1 + x1 * 4
+            val rs = (rgbaFrame[a00].toInt() and 0xFF) + (rgbaFrame[a01].toInt() and 0xFF) +
+                (rgbaFrame[a10].toInt() and 0xFF) + (rgbaFrame[a11].toInt() and 0xFF)
+            val gs = (rgbaFrame[a00 + 1].toInt() and 0xFF) + (rgbaFrame[a01 + 1].toInt() and 0xFF) +
+                (rgbaFrame[a10 + 1].toInt() and 0xFF) + (rgbaFrame[a11 + 1].toInt() and 0xFF)
+            val bs = (rgbaFrame[a00 + 2].toInt() and 0xFF) + (rgbaFrame[a01 + 2].toInt() and 0xFF) +
+                (rgbaFrame[a10 + 2].toInt() and 0xFF) + (rgbaFrame[a11 + 2].toInt() and 0xFF)
             val r = rs shr 2
             val g = gs shr 2
             val b = bs shr 2
