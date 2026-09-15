@@ -217,6 +217,29 @@ object Shaders {
             return texelFetch(uBlaR, ivec2(i & uWidthMask, i >> uWidthShift), 0).r;
         }
 
+        // Highest level this reference index may use, before any radius is consulted.
+        //
+        // Alignment, the iteration cap and the per-level entry count are all monotone
+        // in k, so this is a plain bound and costs no texture fetch. Alignment alone is
+        // the trailing-zero count of m-1: level k needs m-1 to be a multiple of 2^k.
+        int blaMaxLevel(int m, int n) {
+            int a = m - 1;
+            int k = uBlaLevels - 1;
+            if (a != 0) k = min(k, findLSB(a));
+            for (int i = 0; i < 24; i++) {
+                if (k < 0) break;
+                if (n + (1 << k) <= uMaxIter && (a >> k) < uBlaCount[k]) break;
+                k--;
+            }
+            return k;
+        }
+
+        // 0.7 compensates for using the max-norm rather than the true length, which
+        // would risk overflowing at this magnitude.
+        bool blaValid(int k, int m, float dzMag) {
+            return dzMag < fetchR(uBlaOffset[k] + ((m - 1) >> k)) * 0.7;
+        }
+
         bool escapesOffset(vec2 off, out int outN, out vec2 outZ) {
             vec2 dc = uDeltaCenter + off;
             outN = uMaxIter;
@@ -226,6 +249,11 @@ object Shaders {
             int m = 0;
             int n = 0;
             vec4 t = fetchZ(0);
+
+            // Level the BLA search settled on last iteration. Reset whenever the pixel
+            // rebases, since that restarts dz at its full value and collapses the
+            // usable prefix back to the bottom.
+            int kWarm = 0;
 
             // Periodicity check, as the direct path does. The complete state here is
             // the delta together with the reference index -- two iterations can share a
@@ -243,18 +271,39 @@ object Shaders {
                 int skip = 0;
                 int chosen = -1;
                 if (m >= 1) {
-                    for (int k = 0; k < uBlaLevels; k++) {
-                        int step = 1 << k;
-                        if (((m - 1) & (step - 1)) != 0) break;
-                        if (n + step > uMaxIter) break;
-                        int j = (m - 1) >> k;
-                        if (j >= uBlaCount[k]) break;
-                        int idx = uBlaOffset[k] + j;
-                        // 0.7 compensates for using the max-norm rather than the true
-                        // length, which would risk overflowing at this magnitude.
-                        if (dzMag >= fetchR(idx) * 0.7) break;
-                        skip = step;
-                        chosen = idx;
+                    // Resume the level search where the last iteration settled.
+                    //
+                    // Radii are non-increasing as levels merge, and the alignment and
+                    // bounds tests are monotone in k too, so the usable levels at any
+                    // index form a prefix and only its end has to be found. Climbing
+                    // from level 0 every time pays a fetch per level to rediscover an
+                    // answer that moves by about a step at a time, because dz grows
+                    // smoothly. Starting from the previous end turns that walk into a
+                    // short local adjustment, and it returns the same level, so the
+                    // image is unchanged.
+                    int kMax = blaMaxLevel(m, n);
+                    if (kMax >= 0) {
+                        int k = clamp(kWarm, 0, kMax);
+                        if (blaValid(k, m, dzMag)) {
+                            for (int i = 0; i < 24; i++) {
+                                if (k >= kMax || !blaValid(k + 1, m, dzMag)) break;
+                                k++;
+                            }
+                            skip = 1 << k;
+                            chosen = uBlaOffset[k] + ((m - 1) >> k);
+                        } else {
+                            for (int i = 0; i < 24; i++) {
+                                if (k <= 0) break;
+                                k--;
+                                if (blaValid(k, m, dzMag)) {
+                                    skip = 1 << k;
+                                    chosen = uBlaOffset[k] + ((m - 1) >> k);
+                                    break;
+                                }
+                            }
+                            if (chosen < 0) k = 0;
+                        }
+                        kWarm = k;
                     }
                 }
 
@@ -290,6 +339,7 @@ object Shaders {
                     dz = zs;
                     m = 0;
                     t = fetchZ(0);
+                    kWarm = 0;
                 }
 
                 if (dz == hareDz && m == hareM) return false;
