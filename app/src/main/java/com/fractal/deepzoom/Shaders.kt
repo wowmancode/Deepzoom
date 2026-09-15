@@ -206,6 +206,7 @@ object Shaders {
         uniform float uPixelSpan;      // complex units per pixel, pre-scaled
         uniform float uInvScale;
         uniform float uHalfScale;      // scale/2, a power of two, so exact in float
+        uniform float uDerLimit;       // squared derivative below which a point is interior
         uniform float uBailoutScaled;
 
         // Doubled reference orbit, 2*Z. The scaled form is this times uHalfScale.
@@ -267,6 +268,30 @@ object Shaders {
             int period = 1;
             int periodLimit = 1;
 
+            // Derivative of the pixel's value with respect to its first iterate.
+            //
+            // An interior point is drawn into an attracting cycle, and what marks that
+            // attraction is the derivative along the orbit collapsing toward zero. So
+            // once it falls far enough the point cannot escape and there is nothing
+            // left to compute.
+            //
+            // Taken with respect to the first iterate rather than the zeroth: the
+            // orbit starts at the critical point, so the zeroth derivative carries a
+            // factor of 2*0 and is identically zero, which says nothing. Starting a
+            // step later is well defined, and is exact here because the reference is a
+            // nucleus, where the orbit passes through zero.
+            //
+            // Nearly free. A plain step multiplies by twice the full value, which is
+            // already to hand; a skipped run multiplies by that run's own A
+            // coefficient, since z_{n+l} = A z_n + B c makes dz_{n+l}/dz_n exactly A,
+            // and A has already been fetched to advance dz.
+            //
+            // It complements the cycle test rather than replacing it, and complements
+            // the tile mask too: the mask skips solid blocks of interior, while this
+            // catches interior pixels scattered among escaping ones, where no block is
+            // ever solid.
+            vec2 der = vec2(1.0, 0.0);
+
             while (n < uMaxIter) {
                 float dzMag = max(abs(dz.x), abs(dz.y));
 
@@ -311,10 +336,14 @@ object Shaders {
 
                 if (chosen >= 0) {
                     vec4 ab = fetchAB(chosen);
+                    if (n >= 1) der = cmul(der, ab.xy);
                     dz = cmul(ab.xy, dz) + cmul(ab.zw, dc);
                     n += skip;
                     m += skip;
                 } else {
+                    // Twice the full value at this step, unscaled: t is already twice
+                    // the reference, and dz scaled back is the pixel's offset from it.
+                    if (n >= 1) der = cmul(der, t + dz * (2.0 * uInvScale));
                     // d^2 in scaled units is d*(d/scale). Computed this way the
                     // intermediate stays in range; a plain d*d would overflow.
                     vec2 sq = cmul(dz, dz * uInvScale);
@@ -322,6 +351,9 @@ object Shaders {
                     n++;
                     m++;
                 }
+
+                // Squared, to avoid a square root on the hot path.
+                if (dot(der, der) < uDerLimit) return false;
 
                 t = fetchZ(m);
 

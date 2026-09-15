@@ -210,6 +210,89 @@ class ReferenceOrbit(
             return arrayOf(ccx, ccy)
         }
 
+        /** A located minibrot: its nucleus, the period of its cycle, and its scale. */
+        class Minibrot(
+            val cx: BigDecimal,
+            val cy: BigDecimal,
+            val period: Int,
+            val size: Double
+        )
+
+        /**
+         * Nucleus nearest the given point, with the period and scale that go with it.
+         *
+         * findNucleus already locates the point but discards both, and the scale is
+         * what tells a search when to stop: a minibrot is found once the view is down
+         * to about its own width, not merely centred on it.
+         *
+         * The size follows the standard estimate: carry the derivative l along one
+         * period and accumulate b as the running sum of its reciprocals; the component
+         * is then about 1/(b*l^2) across. It is an estimate, and a good one only for
+         * well separated components, which is all a search needs to decide when to
+         * stop.
+         */
+        fun findMinibrot(
+            cx: BigDecimal,
+            cy: BigDecimal,
+            maxIter: Int,
+            spanY: Double,
+            precision: Int
+        ): Minibrot? {
+            val mc = MathContext(precision)
+            val n = findNucleus(cx, cy, maxIter, spanY, precision) ?: return null
+
+            // Re-derive the period at the located nucleus rather than at the point the
+            // search started from: that is where the orbit actually closes.
+            var zx = BigDecimal.ZERO
+            var zy = BigDecimal.ZERO
+            var best = Double.MAX_VALUE
+            var period = 0
+            val scan = min(maxIter, MAX_NUCLEUS_PERIOD)
+            for (i in 1..scan) {
+                val nx = zx.multiply(zx, mc).subtract(zy.multiply(zy, mc), mc).add(n[0], mc)
+                val ny = zx.multiply(zy, mc).multiply(TWO, mc).add(n[1], mc)
+                zx = nx.round(mc); zy = ny.round(mc)
+                val xd = zx.toDouble(); val yd = zy.toDouble()
+                val m = xd * xd + yd * yd
+                if (m > ESCAPE_SQ) break
+                if (m < best) { best = m; period = i }
+            }
+            if (period < 1) return null
+
+            // Doubles are enough from here: the estimate only needs an order of
+            // magnitude, and the orbit values themselves are all of order one.
+            val ncx = n[0].toDouble()
+            val ncy = n[1].toDouble()
+            var px = 0.0; var py = 0.0
+            var lx = 1.0; var ly = 0.0
+            var bx = 1.0; var by = 0.0
+            for (i in 1 until period) {
+                val t = px * px - py * py + ncx
+                py = 2.0 * px * py + ncy
+                px = t
+                val nlx = 2.0 * (px * lx - py * ly)
+                val nly = 2.0 * (px * ly + py * lx)
+                lx = nlx; ly = nly
+                val den = lx * lx + ly * ly
+                if (den == 0.0 || !den.isFinite()) return null
+                bx += lx / den
+                by += -ly / den
+            }
+            // b * l^2, not b * l. Checked against components of known width: this
+            // gives 1.0 for the cardioid, 0.5 for the period-2 disc and 0.019 for the
+            // period-3 island on the antenna, whose measured width is about 0.017.
+            val l2x = lx * lx - ly * ly
+            val l2y = 2.0 * lx * ly
+            val dx = bx * l2x - by * l2y
+            val dy = bx * l2y + by * l2x
+            val den = dx * dx + dy * dy
+            if (den == 0.0 || !den.isFinite()) return null
+            val size = 1.0 / kotlin.math.sqrt(den)
+            if (!size.isFinite() || size <= 0.0) return null
+
+            return Minibrot(n[0], n[1], period, size)
+        }
+
         fun compute(
             cx: BigDecimal,
             cy: BigDecimal,

@@ -153,6 +153,15 @@
                     android:text="Go to"
                     android:textColor="#7FA6D8"
                     android:textSize="14sp" />
+
+                <Button
+                    android:id="@+id/find_mini"
+                    style="?android:attr/borderlessButtonStyle"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Find minibrot"
+                    android:textColor="#7FA6D8"
+                    android:textSize="14sp" />
             </LinearLayout>
         </HorizontalScrollView>
     </LinearLayout>

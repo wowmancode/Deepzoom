@@ -592,6 +592,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         GLES31.glUniform1f(u["uPixelSpan"]!!, (pixelSpan * scale).toFloat())
         GLES31.glUniform1f(u["uInvScale"]!!, (1.0 / scale).toFloat())
         GLES31.glUniform1f(u["uHalfScale"]!!, (scale * 0.5).toFloat())
+        GLES31.glUniform1f(u["uDerLimit"]!!, DER_LIMIT_SQ)
         GLES31.glUniform1f(u["uBailoutScaled"]!!, (BAILOUT * scale).toFloat())
 
         GLES31.glUniform1i(u["uWidthMask"]!!, TEX_WIDTH - 1)
@@ -1394,6 +1395,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
                 GLES31.glUniform1f(u["uPixelSpan"]!!, 0f)
                 GLES31.glUniform1f(u["uInvScale"]!!, (1.0 / scale).toFloat())
         GLES31.glUniform1f(u["uHalfScale"]!!, (scale * 0.5).toFloat())
+        GLES31.glUniform1f(u["uDerLimit"]!!, DER_LIMIT_SQ)
                 GLES31.glUniform1f(u["uBailoutScaled"]!!, (BAILOUT * scale).toFloat())
                 GLES31.glUniform1i(u["uWidthMask"]!!, TEX_WIDTH - 1)
                 GLES31.glUniform1i(u["uWidthShift"]!!, TEX_SHIFT)
@@ -1596,6 +1598,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
                 GLES31.glUniform1f(u["uPixelSpan"]!!, 0f)
                 GLES31.glUniform1f(u["uInvScale"]!!, (1.0 / scale).toFloat())
         GLES31.glUniform1f(u["uHalfScale"]!!, (scale * 0.5).toFloat())
+        GLES31.glUniform1f(u["uDerLimit"]!!, DER_LIMIT_SQ)
                 GLES31.glUniform1f(u["uBailoutScaled"]!!, (BAILOUT * scale).toFloat())
                 GLES31.glUniform1i(u["uWidthMask"]!!, TEX_WIDTH - 1)
                 GLES31.glUniform1i(u["uWidthShift"]!!, TEX_SHIFT)
@@ -2196,7 +2199,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         private val PERTURB_UNIFORMS = SHARED_UNIFORMS + arrayOf(
             "uOrbit", "uBlaAB", "uBlaR", "uWidthMask", "uWidthShift", "uOrbitLen",
             "uBlaLevels", "uBlaOffset[0]", "uBlaCount[0]", "uDeltaCenter", "uPixelSpan",
-            "uInvScale", "uHalfScale", "uBailoutScaled"
+            "uInvScale", "uHalfScale", "uDerLimit", "uBailoutScaled"
         )
 
         /**
@@ -2214,6 +2217,16 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
 
         /** Ceiling on the interactive band count. */
         private const val MAX_SCENE_SEGMENTS = 32
+
+        /**
+         * Squared derivative below which a pixel is taken as interior.
+         *
+         * The threshold itself is 1e-3, following the reference; it is stored squared
+         * so the shader can test it without a square root. Conservative: an escaping
+         * point's derivative grows, so it never comes near this, and a point that does
+         * reach it is inside an attracting cycle's basin and cannot get back out.
+         */
+        private const val DER_LIMIT_SQ = 1e-6f
 
         /** Ceiling on rows per strip draw, whatever the timing suggests. */
         private const val MAX_CHUNK_ROWS = 512

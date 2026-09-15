@@ -98,6 +98,7 @@ class MainActivity : AppCompatActivity() {
         findViewById<Button>(R.id.save_video).setOnClickListener { showVideoDialog() }
         findViewById<Button>(R.id.share_pos).setOnClickListener { copyPosition() }
         findViewById<Button>(R.id.goto_pos).setOnClickListener { showGoToDialog() }
+        findViewById<Button>(R.id.find_mini).setOnClickListener { showFindMinibrotDialog() }
 
         view.onViewChanged = { runOnUiThread { updateReadout() } }
 
@@ -196,6 +197,131 @@ class MainActivity : AppCompatActivity() {
     // --- Colours ----------------------------------------------------------------------
 
     @SuppressLint("SetTextI18n")
+    // --- Find minibrot ------------------------------------------------------------------
+
+    /** Step of the running search, or -1 when idle. */
+    private var miniStep = -1
+    private val miniHandler = android.os.Handler(android.os.Looper.getMainLooper())
+
+    /**
+     * Walks inward to the nearest minibrot, one zoom at a time.
+     *
+     * Each step locates the nucleus nearest the centre, recentres on it, and zooms by
+     * the chosen factor. Because the view is redrawn between steps, the descent is
+     * visible rather than being a jump to a final answer, and the readout names what
+     * was found at each stage.
+     *
+     * It stops when the view is down to a few times the component's own width, which
+     * is what "found" means here: centred on it is not enough, it has to fill the
+     * frame. It also stops if no nucleus is in view, which is the honest outcome when
+     * the starting point is not on the way to one.
+     */
+    private fun showFindMinibrotDialog() {
+        if (miniStep >= 0) { stopMinibrotSearch("Search cancelled"); return }
+
+        val input = EditText(this).apply {
+            inputType = android.text.InputType.TYPE_CLASS_NUMBER or
+                android.text.InputType.TYPE_NUMBER_FLAG_DECIMAL
+            setText(minibrotFactor.toString())
+            hint = "Zoom per step"
+        }
+        val pad = (16 * resources.displayMetrics.density).toInt()
+        val box = android.widget.FrameLayout(this).apply {
+            setPadding(pad, pad, pad, 0)
+            addView(input)
+        }
+
+        AlertDialog.Builder(this)
+            .setTitle("Find minibrot")
+            .setMessage("Zooms in one step at a time, recentring on the nearest nucleus.")
+            .setView(box)
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton("Start") { _, _ ->
+                val f = input.text.toString().toDoubleOrNull()
+                if (f == null || !f.isFinite() || f <= 1.0) {
+                    toast("Zoom per step must be greater than 1")
+                } else {
+                    minibrotFactor = f
+                    startMinibrotSearch()
+                }
+            }
+            .show()
+    }
+
+    private fun startMinibrotSearch() {
+        miniStep = 0
+        stepMinibrot()
+    }
+
+    private fun stopMinibrotSearch(message: String) {
+        miniStep = -1
+        miniHandler.removeCallbacksAndMessages(null)
+        status.text = message
+        updateReadout()
+    }
+
+    private fun stepMinibrot() {
+        if (miniStep < 0) return
+        val step = miniStep
+        val s = view.state.snapshot()
+        status.text = "Finding minibrot: step ${step + 1}, looking for a nucleus..."
+
+        // The nucleus search is BigDecimal work and can take a moment at depth, so it
+        // runs off the main thread and reports back.
+        Thread {
+            val found = try {
+                ReferenceOrbit.findMinibrot(
+                    s.centerX, s.centerY, s.maxIter, s.spanY,
+                    ReferenceOrbit.precisionFor(s.spanY)
+                )
+            } catch (e: Exception) {
+                null
+            }
+            runOnUiThread {
+                if (miniStep < 0) return@runOnUiThread
+                if (found == null) {
+                    stopMinibrotSearch(
+                        "Stopped at step ${step + 1}: no nucleus in view from here"
+                    )
+                    return@runOnUiThread
+                }
+
+                val target = s.snapshot()
+                target.centerX = found.cx
+                target.centerY = found.cy
+
+                // Found once the frame is down to a small multiple of its width.
+                if (s.spanY <= found.size * MINI_FILL) {
+                    target.spanY = (found.size * MINI_FILL).coerceAtLeast(target.minSpan())
+                    view.applyState(target)
+                    stopMinibrotSearch(
+                        "Found: period ${found.period}, width ~%.3g".format(found.size) +
+                            ", after ${step + 1} steps"
+                    )
+                    return@runOnUiThread
+                }
+
+                target.spanY = (s.spanY / minibrotFactor).coerceAtLeast(target.minSpan())
+                view.applyState(target)
+                status.text =
+                    "Step ${step + 1}: period ${found.period}, target width ~%.3g".format(found.size) +
+                        ", now at %.3g".format(target.spanY)
+
+                if (target.spanY <= target.minSpan()) {
+                    stopMinibrotSearch("Stopped: hit the precision floor at step ${step + 1}")
+                    return@runOnUiThread
+                }
+                miniStep = step + 1
+                if (miniStep >= MINI_MAX_STEPS) {
+                    stopMinibrotSearch("Stopped after $MINI_MAX_STEPS steps")
+                    return@runOnUiThread
+                }
+                // Long enough that the frame for this step is actually seen.
+                miniHandler.postDelayed({ stepMinibrot() }, MINI_STEP_MS)
+            }
+        }.start()
+    }
+
     private fun showPaletteDialog() {
         val content = LayoutInflater.from(this).inflate(R.layout.dialog_palette, null)
         val preview = content.findViewById<View>(R.id.c_preview)
@@ -558,4 +684,22 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
         view.renderer.shutdown()
     }
+    /** Zoom applied per search step. Editable from the dialog; 5x by default. */
+    private var minibrotFactor = 5.0
+
+    companion object {
+        /**
+         * How much wider than the component the view is allowed to be when the search
+         * declares success. A few widths leaves the minibrot framed rather than
+         * filling the frame edge to edge.
+         */
+        private const val MINI_FILL = 4.0
+
+        /** Pause between steps, so each one is visible rather than flashing past. */
+        private const val MINI_STEP_MS = 650L
+
+        /** Cap on steps, in case the estimate never converges. */
+        private const val MINI_MAX_STEPS = 60
+    }
+
 }
