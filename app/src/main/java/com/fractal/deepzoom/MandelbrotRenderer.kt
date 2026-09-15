@@ -80,6 +80,14 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
 
     /** Levels are powers of two below native: 3 is eighth-size, 0 is native. */
     private var refineLevel = -1
+
+    /**
+     * Horizontal bands the interactive frame is split across.
+     *
+     * Starts high so the very first frame after a teleport is already split: that
+     * frame is the dangerous one, and there is no measurement to size it from yet.
+     */
+    private var sceneSegments = MAX_SCENE_SEGMENTS
     var finestLevel: Int = 0
         set(value) {
             field = value.coerceIn(0, 3)
@@ -381,6 +389,18 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
     private fun updateAdaptive(startNs: Long) {
         GLES31.glFinish()
         lastRenderMs = (System.nanoTime() - startNs) / 1e6
+
+        // Band count for the next frame, from what this one cost per band. Rises
+        // quickly and falls by one at a time: overshooting costs a few extra
+        // submissions, while undershooting is what loses the context.
+        val perSeg = lastRenderMs / sceneSegments.coerceAtLeast(1)
+        sceneSegments = if (perSeg > SEGMENT_TARGET_MS) {
+            Math.ceil(lastRenderMs / SEGMENT_TARGET_MS).toInt()
+                .coerceIn(1, MAX_SCENE_SEGMENTS)
+        } else {
+            max(1, sceneSegments - 1)
+        }
+
         if (lastRenderMs > SLOW_FRAME_MS) {
             adaptiveLevel = min(adaptiveLevel + 1, min(3, finestLevel + 3))
         } else if (lastRenderMs < FAST_FRAME_MS) {
@@ -419,11 +439,45 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         GLES31.glViewport(0, 0, w, h)
         GLES31.glClear(GLES31.GL_COLOR_BUFFER_BIT)
 
-        if (state.needsPerturbation()) {
-            if (bundle != null) drawPerturbation(state, bundle, w, h, tiles)
-            else drawDirect(state, w, h, tiles)
+        // Drawn in horizontal bands rather than one call.
+        //
+        // The strip export splits its work so that no single submission runs long
+        // enough for the GPU watchdog to decide the device has hung; the interactive
+        // path had no such guard and issued the whole frame as one draw. That is
+        // survivable while browsing, because a view reached by zooming passes through
+        // cheaper frames on the way and the progressive levels arrive first. Landing
+        // directly on a deep position is the case that is not: the finest pass runs at
+        // the full iteration limit over every pixel at once, and at a high resolution
+        // that is seconds inside one call. The watchdog resets the context and the
+        // process goes with it.
+        //
+        // Banding changes nothing about the work or the result -- each band computes
+        // its own fragments from gl_FragCoord exactly as before -- only how much of it
+        // is handed over at a time.
+        val segs = sceneSegments.coerceIn(1, MAX_SCENE_SEGMENTS)
+        if (segs <= 1) {
+            if (state.needsPerturbation() && bundle != null) {
+                drawPerturbation(state, bundle, w, h, tiles)
+            } else {
+                drawDirect(state, w, h, tiles)
+            }
         } else {
-            drawDirect(state, w, h, tiles)
+            GLES31.glEnable(GLES31.GL_SCISSOR_TEST)
+            for (seg in 0 until segs) {
+                val y0 = h * seg / segs
+                val y1 = h * (seg + 1) / segs
+                if (y1 <= y0) continue
+                GLES31.glScissor(0, y0, w, y1 - y0)
+                if (state.needsPerturbation() && bundle != null) {
+                    drawPerturbation(state, bundle, w, h, tiles)
+                } else {
+                    drawDirect(state, w, h, tiles)
+                }
+                // Hands this band to the driver as its own submission, which is what
+                // keeps any one of them short.
+                GLES31.glFlush()
+            }
+            GLES31.glDisable(GLES31.GL_SCISSOR_TEST)
         }
 
         GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, 0)
@@ -2151,6 +2205,15 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
          * more finely but spend a larger fraction of themselves on the perimeter.
          */
         const val TILE_SIZE = 32
+
+        /**
+         * Longest a single interactive submission is allowed to be. Chosen well under
+         * the couple of seconds a mobile GPU watchdog typically allows.
+         */
+        private const val SEGMENT_TARGET_MS = 250.0
+
+        /** Ceiling on the interactive band count. */
+        private const val MAX_SCENE_SEGMENTS = 32
 
         /** Ceiling on rows per strip draw, whatever the timing suggests. */
         private const val MAX_CHUNK_ROWS = 512
