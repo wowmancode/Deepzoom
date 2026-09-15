@@ -537,6 +537,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         )
         GLES31.glUniform1f(u["uPixelSpan"]!!, (pixelSpan * scale).toFloat())
         GLES31.glUniform1f(u["uInvScale"]!!, (1.0 / scale).toFloat())
+        GLES31.glUniform1f(u["uHalfScale"]!!, (scale * 0.5).toFloat())
         GLES31.glUniform1f(u["uBailoutScaled"]!!, (BAILOUT * scale).toFloat())
 
         GLES31.glUniform1i(u["uWidthMask"]!!, TEX_WIDTH - 1)
@@ -684,19 +685,19 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
     private fun uploadOrbit(gpu: OrbitGpuData) {
         val points = min(gpu.points, MAX_POINTS)
         val rows = rowsFor(points)
-        val buf = floatBuffer(rows * TEX_WIDTH * 4)
+        val buf = floatBuffer(rows * TEX_WIDTH * 2)
 
-        buf.put(gpu.packed, 0, points * 4)
+        buf.put(gpu.packed, 0, points * 2)
         // The shader never reads past uOrbitLen, but leaving the row tail uninitialised
         // invites driver-dependent surprises.
-        while (buf.position() < rows * TEX_WIDTH * 4) buf.put(0f)
+        while (buf.position() < rows * TEX_WIDTH * 2) buf.put(0f)
         buf.position(0)
 
         GLES31.glBindTexture(GLES31.GL_TEXTURE_2D, orbitTexture)
         GLES31.glPixelStorei(GLES31.GL_UNPACK_ALIGNMENT, 1)
         GLES31.glTexImage2D(
-            GLES31.GL_TEXTURE_2D, 0, GLES31.GL_RGBA32F,
-            TEX_WIDTH, rows, 0, GLES31.GL_RGBA, GLES31.GL_FLOAT, buf
+            GLES31.GL_TEXTURE_2D, 0, GLES31.GL_RG32F,
+            TEX_WIDTH, rows, 0, GLES31.GL_RG, GLES31.GL_FLOAT, buf
         )
         uploadedLen = points - 1
     }
@@ -1338,6 +1339,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
                     (offset[0] * scale).toFloat(), (offset[1] * scale).toFloat())
                 GLES31.glUniform1f(u["uPixelSpan"]!!, 0f)
                 GLES31.glUniform1f(u["uInvScale"]!!, (1.0 / scale).toFloat())
+        GLES31.glUniform1f(u["uHalfScale"]!!, (scale * 0.5).toFloat())
                 GLES31.glUniform1f(u["uBailoutScaled"]!!, (BAILOUT * scale).toFloat())
                 GLES31.glUniform1i(u["uWidthMask"]!!, TEX_WIDTH - 1)
                 GLES31.glUniform1i(u["uWidthShift"]!!, TEX_SHIFT)
@@ -1539,6 +1541,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
                     (offset[0] * scale).toFloat(), (offset[1] * scale).toFloat())
                 GLES31.glUniform1f(u["uPixelSpan"]!!, 0f)
                 GLES31.glUniform1f(u["uInvScale"]!!, (1.0 / scale).toFloat())
+        GLES31.glUniform1f(u["uHalfScale"]!!, (scale * 0.5).toFloat())
                 GLES31.glUniform1f(u["uBailoutScaled"]!!, (BAILOUT * scale).toFloat())
                 GLES31.glUniform1i(u["uWidthMask"]!!, TEX_WIDTH - 1)
                 GLES31.glUniform1i(u["uWidthShift"]!!, TEX_SHIFT)
@@ -2139,7 +2142,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         private val PERTURB_UNIFORMS = SHARED_UNIFORMS + arrayOf(
             "uOrbit", "uBlaAB", "uBlaR", "uWidthMask", "uWidthShift", "uOrbitLen",
             "uBlaLevels", "uBlaOffset[0]", "uBlaCount[0]", "uDeltaCenter", "uPixelSpan",
-            "uInvScale", "uBailoutScaled"
+            "uInvScale", "uHalfScale", "uBailoutScaled"
         )
 
         /**

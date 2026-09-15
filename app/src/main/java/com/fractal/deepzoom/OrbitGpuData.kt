@@ -26,19 +26,21 @@ class OrbitGpuData(
         fun build(orbit: ReferenceOrbit, scaleExp: Int, maxC: Double): OrbitGpuData {
             val scale = 2.0.pow(scaleExp)
             val points = orbit.count + 1
-            val packed = FloatArray(points * 4)
+            val packed = FloatArray(points * 2)
 
             for (n in 0 until points) {
-                val i = n * 4
-                val x = orbit.zx[n]
-                val y = orbit.zy[n]
-                // Both forms are needed every iteration — the doubled value for the
-                // 2*Z*d term, the scaled value to reconstruct the true position — so
-                // precomputing both removes two multiplies from the inner loop.
-                packed[i] = (x * 2.0).toFloat()
-                packed[i + 1] = (y * 2.0).toFloat()
-                packed[i + 2] = (x * scale).toFloat()
-                packed[i + 3] = (y * scale).toFloat()
+                val i = n * 2
+                // Only the doubled orbit is stored. The scaled form the shader also
+                // needs is that value times scale/2, and scale is a power of two, so
+                // the shader recovers it with a multiply that only shifts an exponent
+                // -- the same bits the fourth and third components used to hold.
+                //
+                // Worth the multiply because this is the hottest fetch in the loop:
+                // one per pass, a couple of thousand passes per pixel at depth, and it
+                // is dependent, so its latency is on the critical path. Halving the
+                // texel from sixteen bytes to eight halves that traffic.
+                packed[i] = (orbit.zx[n] * 2.0).toFloat()
+                packed[i + 1] = (orbit.zy[n] * 2.0).toFloat()
             }
 
             return OrbitGpuData(

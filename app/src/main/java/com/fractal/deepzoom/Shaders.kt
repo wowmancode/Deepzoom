@@ -205,10 +205,12 @@ object Shaders {
         uniform vec2  uDeltaCenter;    // (view centre - reference), pre-scaled
         uniform float uPixelSpan;      // complex units per pixel, pre-scaled
         uniform float uInvScale;
+        uniform float uHalfScale;      // scale/2, a power of two, so exact in float
         uniform float uBailoutScaled;
 
-        vec4 fetchZ(int i) {
-            return texelFetch(uOrbit, ivec2(i & uWidthMask, i >> uWidthShift), 0);
+        // Doubled reference orbit, 2*Z. The scaled form is this times uHalfScale.
+        vec2 fetchZ(int i) {
+            return texelFetch(uOrbit, ivec2(i & uWidthMask, i >> uWidthShift), 0).rg;
         }
         vec4 fetchAB(int i) {
             return texelFetch(uBlaAB, ivec2(i & uWidthMask, i >> uWidthShift), 0);
@@ -248,7 +250,7 @@ object Shaders {
             vec2 dz = vec2(0.0);
             int m = 0;
             int n = 0;
-            vec4 t = fetchZ(0);
+            vec2 t = fetchZ(0);
 
             // Level the BLA search settled on last iteration. Reset whenever the pixel
             // rebases, since that restarts dz at its full value and collapses the
@@ -316,7 +318,7 @@ object Shaders {
                     // d^2 in scaled units is d*(d/scale). Computed this way the
                     // intermediate stays in range; a plain d*d would overflow.
                     vec2 sq = cmul(dz, dz * uInvScale);
-                    dz = cmul(t.xy, dz) + sq + dc;
+                    dz = cmul(t, dz) + sq + dc;
                     n++;
                     m++;
                 }
@@ -325,7 +327,7 @@ object Shaders {
 
                 // True value, still scaled. Tests use the max-norm because a squared
                 // length would overflow up here.
-                vec2 zs = t.zw + dz;
+                vec2 zs = t * uHalfScale + dz;
                 float zMag = max(abs(zs.x), abs(zs.y));
 
                 if (zMag > uBailoutScaled) {
