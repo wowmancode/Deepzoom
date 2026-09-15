@@ -20,4 +20,23 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:max="100" />
+
+    <!-- Strip detail, below the frame line so the frame is never hidden by it. -->
+    <TextView
+        android:id="@+id/p_sub"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:textSize="13sp"
+        android:alpha="0.7"
+        android:paddingTop="12dp"
+        android:paddingBottom="6dp"
+        android:visibility="gone" />
+
+    <ProgressBar
+        android:id="@+id/p_subbar"
+        style="?android:attr/progressBarStyleHorizontal"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:max="100"
+        android:visibility="gone" />
 </LinearLayout>

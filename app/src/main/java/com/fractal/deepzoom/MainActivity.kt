@@ -449,6 +449,8 @@ class MainActivity : AppCompatActivity() {
         val content = LayoutInflater.from(this).inflate(R.layout.dialog_progress, null)
         val label = content.findViewById<TextView>(R.id.p_label)
         val bar = content.findViewById<ProgressBar>(R.id.p_bar)
+        val sub = content.findViewById<TextView>(R.id.p_sub)
+        val subBar = content.findViewById<ProgressBar>(R.id.p_subbar)
         label.text = "Rendering frame 0 of $total"
 
         val dialog = AlertDialog.Builder(this)
@@ -462,13 +464,23 @@ class MainActivity : AppCompatActivity() {
             override fun onProgress(frame: Int, total: Int) {
                 runOnUiThread {
                     label.text = "Rendering frame $frame of $total"
-                    bar.progress = frame * 100 / total
+                    bar.progress = frame * 100 / total.coerceAtLeast(1)
+                    // Row detail belongs to the frame being built; once the frame
+                    // advances it is stale, so it goes away rather than lingering.
+                    sub.visibility = View.GONE
+                    subBar.visibility = View.GONE
                 }
             }
+
             override fun onStripBuild(rowsDone: Int, rowsTarget: Int) {
                 runOnUiThread {
-                    label.text = "Building strip — row $rowsDone of $rowsTarget"
-                    bar.progress = rowsDone * 100 / rowsTarget.coerceAtLeast(1)
+                    // Only the row line is touched. The frame line above it keeps
+                    // showing which frame this build belongs to — overwriting it was
+                    // why the frame number disappeared during long strip builds.
+                    sub.visibility = View.VISIBLE
+                    subBar.visibility = View.VISIBLE
+                    sub.text = "Strip row $rowsDone of $rowsTarget"
+                    subBar.progress = rowsDone * 100 / rowsTarget.coerceAtLeast(1)
                 }
             }
         }
