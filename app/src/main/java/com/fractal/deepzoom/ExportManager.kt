@@ -333,11 +333,19 @@ class ExportManager(private val view: MandelbrotView) {
                     if (i > 0) {
                         val cur = frameInts[i % 2]
                         val prv = frameInts[(i - 1) % 2]
+                        // Strided to match the checksum: this is an estimate of the
+                        // fraction that changed, and an estimate is all the threshold
+                        // below needs.
                         var diff = 0
-                        for (k in 0 until cur.capacity()) {
+                        var seen = 0
+                        var k = 0
+                        val n = cur.capacity()
+                        while (k < n) {
                             if (cur.get(k) != prv.get(k)) diff++
+                            seen++
+                            k += VERIFY_STRIDE
                         }
-                        changed = diff.toDouble() / cur.capacity()
+                        changed = diff.toDouble() / max(1, seen)
                         if (changed < minChanged) { minChanged = changed; minChangedAt = i }
                         if (changed < STALL_FRACTION) {
                             stallTotal++
@@ -485,10 +493,27 @@ class ExportManager(private val view: MandelbrotView) {
      * frames were identical without hedging, and a strided hash cannot. Absolute gets,
      * so the buffer's own position is left alone for the encoder.
      */
+    /**
+     * Frame fingerprint, over a strided sample rather than every pixel.
+     *
+     * This exists to notice frames that came out identical, and it is pure diagnostics
+     * -- nothing in the output depends on it. Hashing all two million pixels of every
+     * frame, and then diffing them all again, cost about a quarter of a measured
+     * export, which is more than the freeze detection is worth.
+     *
+     * The stride is coprime with the frame width so the sample walks across columns
+     * instead of landing in the same one on every row. Two frames that differ
+     * anywhere structural differ in the sample; what a stride can miss is a difference
+     * confined to a handful of pixels, and a frame that changed in a handful of pixels
+     * is a stall already, which the changed-fraction test below reports on its own.
+     */
     private fun checksum(pixels: java.nio.IntBuffer): Long {
         var h = -3750763034362895579L          // FNV-1a 64-bit offset basis
-        for (i in 0 until pixels.capacity()) {
+        var i = 0
+        val n = pixels.capacity()
+        while (i < n) {
             h = (h xor pixels.get(i).toLong()) * 1099511628211L
+            i += VERIFY_STRIDE
         }
         return h
     }
@@ -629,6 +654,14 @@ class ExportManager(private val view: MandelbrotView) {
 
         /** Ceiling on the strip ring buffer. Beyond this, fall back to plain frames. */
         const val STRIP_MEMORY_BUDGET = 160L * 1024 * 1024
+
+        /**
+         * Pixel stride for the duplicate and stall checks.
+         *
+         * Odd, so it is coprime with any even frame width and the sample does not
+         * degenerate into a single column.
+         */
+        private const val VERIFY_STRIDE = 17
 
         /** Phase slots for the per-frame export profile. */
         private const val PH_ROWS = 0

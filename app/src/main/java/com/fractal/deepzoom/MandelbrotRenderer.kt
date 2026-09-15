@@ -901,6 +901,16 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         stripNonInteriorFrom = Int.MAX_VALUE
         stripMaskLo = 0
         stripMaskHi = -1
+        // Create the mask target here, not on first use.
+        //
+        // buildStripTiles calls ensureStripTileTarget, and ensureStripTileTarget is the
+        // only thing that assigns stripTileTex — but renderRows will not call
+        // buildStripTiles unless stripTileTex is already non-zero. Starting at zero,
+        // that condition can never become true, so the whole interior-skipping pass was
+        // unreachable and every solid tile was shaded pixel by pixel to the iteration
+        // limit. Building the target at strip setup, where stripW and stripRing are
+        // already known, is what lets the gate ever pass.
+        ensureStripTileTarget()
         rowsSinceFinish = 0
         finishStart = System.nanoTime()
         cpuPauseNs = 0L
