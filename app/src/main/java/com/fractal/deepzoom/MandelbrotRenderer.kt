@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 package com.fractal.deepzoom
 
 import android.opengl.GLES31
@@ -897,6 +898,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         stripRowBudget = 64
         stripSegments = 1
         stripInteriorCeiling = Int.MIN_VALUE
+        stripNonInteriorFrom = Int.MAX_VALUE
         stripMaskLo = 0
         stripMaskHi = -1
         rowsSinceFinish = 0
@@ -1022,6 +1024,18 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
     private var stripInteriorCeiling = Int.MIN_VALUE
 
     /**
+     * Lowest row known to have something escaping on it.
+     *
+     * "No escape anywhere on this circle" is downward-closed: if it holds at some row it
+     * holds at every row below, because the disc inside is enclosed. So the converse
+     * propagates upward — one row with an escaping point rules out every row above it,
+     * and probing any of them is provably wasted. Without this the binary search re-runs
+     * four-odd probes every frame across the whole expensive band, each with a readback
+     * that stalls the GPU, and none of them can ever succeed.
+     */
+    private var stripNonInteriorFrom = Int.MAX_VALUE
+
+    /**
      * Renders a range of strip rows, filling whatever is provably interior.
      *
      * Probes the top of a large range first. If that circle is entirely interior the
@@ -1048,12 +1062,18 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
             return renderRows(s, geom, stripInteriorCeiling + 1, lastRow, bundle)
         }
 
-        if (lastRow - firstRow >= PROBE_MIN_ROWS) {
+        // Nothing at or above a row with an escaping point can be interior, so do not
+        // probe or split — render it.
+        if (firstRow < stripNonInteriorFrom && lastRow - firstRow >= PROBE_MIN_ROWS) {
             // Render the top row for real, then ask whether anything on it escaped.
             // Only here, not after every chunk: reading pixels back forces the GPU to
             // finish everything queued, and this is the one place the answer is used.
             bundle = renderRowsDirect(s, geom, lastRow, lastRow, bundle)
-            if (stripRowInterior(lastRow) == 1) stripInteriorCeiling = lastRow
+            when (stripRowInterior(lastRow)) {
+                1 -> stripInteriorCeiling = lastRow
+                0 -> stripNonInteriorFrom = min(stripNonInteriorFrom, lastRow)
+                // -1 is a failed read: learn nothing rather than assume either way.
+            }
             if (stripInteriorCeiling >= lastRow) {
                 fillInterior(firstRow, lastRow - 1)
                 return bundle
@@ -1087,8 +1107,11 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         // A range too short to probe still gets one test, so slow zoom rates — where
         // every range is a few rows — do not lose interior skipping altogether. One
         // readback per call, not per chunk.
-        if (lastRow > stripInteriorCeiling && stripRowInterior(lastRow) == 1) {
-            stripInteriorCeiling = lastRow
+        if (lastRow > stripInteriorCeiling && lastRow < stripNonInteriorFrom) {
+            when (stripRowInterior(lastRow)) {
+                1 -> stripInteriorCeiling = lastRow
+                0 -> stripNonInteriorFrom = min(stripNonInteriorFrom, lastRow)
+            }
         }
         return bundle
     }
@@ -1941,10 +1964,12 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
          * Rows of tile mask built at a time.
          *
          * The mask costs about an eighth of rendering the rows it covers, so it has to
-         * serve many frames to pay for itself. At roughly twenty new rows a frame this
-         * block lasts about fifty frames.
+         * serve several frames to pay for itself — but it is built in one go, so a large
+         * block lands as a single stalled frame. At roughly twenty new rows a frame this
+         * covers about a dozen frames and costs under twice a normal one, instead of the
+         * six-fold stall a four-times-larger block produced.
          */
-        private const val STRIP_TILE_BLOCK = 1024
+        private const val STRIP_TILE_BLOCK = 256
 
         /** Cost per row below which the tile mask cannot repay what it costs to build. */
         private const val STRIP_TILE_MIN_MS = 5.0

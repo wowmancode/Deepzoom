@@ -251,6 +251,31 @@ the atom boundary the tile test saves 61% against the circle test's 35%, and out
 neither saves anything because those rows already cost about 15 iterations a pixel.
 The two together cover the whole radius range.
 
+**Periodicity check in the perturbation path.** An interior point settles into a cycle,
+so comparing each iterate against a lazily-updated earlier one (Brent, resaving at each
+power of two) detects it and stops early instead of running to `maxIter`. The direct
+path already did this; the perturbation path did not, and that is where the cost was —
+the partly-interior band around a minibrot's atom, which neither the whole-circle test
+nor the tile test can remove.
+
+Sampled only on plain steps: a BLA jump advances the orbit by a variable amount, so
+samples taken across jumps land on different phases of the cycle and would rarely
+match. Compared unscaled, so the threshold means the same thing whatever delta scale is
+in use.
+
+Measured at `tools/bench_derivative.py`: **3.4x** on pixels in that band that survive
+the existing skipping. Note the obvious dz/dz0 = prod 2*z_k derivative test does *not*
+work here — the orbit starts at the critical point z0 = 0, so the product is identically
+zero and every pixel would be flagged interior.
+
+### Licence
+
+AGPL-3.0-or-later. Chosen over a permissive licence so improvements stay available to
+the community, and over plain GPL because it keeps the option of incorporating code
+from Kalles Fraktaler 2+ and Fraktaler 3, both AGPL, which plain GPL would not allow.
+No code from either is present; the techniques here were implemented from their
+published descriptions, and techniques are not copyrightable.
+
 ### Verification
 
 `tools/validate_bla.py` mirrors the Kotlin BLA construction and the GLSL iteration

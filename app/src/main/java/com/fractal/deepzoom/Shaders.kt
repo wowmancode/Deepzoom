@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 package com.fractal.deepzoom
 
 object Shaders {
@@ -219,6 +220,18 @@ object Shaders {
             int n = 0;
             vec4 t = fetchZ(0);
 
+            // Periodicity check, as the direct path already does. An interior point
+            // settles into a cycle, so it can stop instead of grinding to uMaxIter --
+            // which is what the partly-interior band around a minibrot's atom costs,
+            // the part neither the whole-circle test nor the tile test can remove.
+            //
+            // Only sampled on plain steps. A BLA jump advances the orbit by a variable
+            // amount, so consecutive samples across jumps land on different phases of
+            // the cycle and would rarely match.
+            vec2 hare = vec2(0.0);
+            int period = 1;
+            int periodLimit = 1;
+
             while (n < uMaxIter) {
                 float dzMag = max(abs(dz.x), abs(dz.y));
 
@@ -266,6 +279,21 @@ object Shaders {
                     outN = n;
                     outZ = zs * uInvScale;
                     return true;
+                }
+
+                if (chosen < 0) {
+                    // Compared unscaled, so the threshold means the same thing here as
+                    // in the direct path regardless of the delta scale in use.
+                    vec2 zu = zs * uInvScale;
+                    if (abs(zu.x - hare.x) < 1e-9 && abs(zu.y - hare.y) < 1e-9) {
+                        return false;
+                    }
+                    period--;
+                    if (period == 0) {
+                        hare = zu;
+                        periodLimit *= 2;
+                        period = periodLimit;
+                    }
                 }
 
                 if (zMag < max(abs(dz.x), abs(dz.y)) || m >= uOrbitLen) {
