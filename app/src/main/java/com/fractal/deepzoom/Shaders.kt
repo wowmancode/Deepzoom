@@ -329,6 +329,11 @@ object Shaders {
             float r = uStripRBase * exp((gl_FragCoord.y - uStripRowBase) * uStripStep);
             vec2 off = r * vec2(cos(angle), sin(angle));
 
+            if (tileIsSolid()) {
+                fragColor = vec4(uInterior, 0.0);
+                return;
+            }
+
             int n;
             vec2 z;
             if (!escapesOffset(off, n, z)) {
@@ -336,6 +341,57 @@ object Shaders {
                 return;
             }
             fragColor = vec4(shade(n, z), 1.0);
+        }
+    """.trimIndent()
+
+    /**
+     * Border test for strip tiles.
+     *
+     * The whole-circle test only settles rows that are interior all the way round. At
+     * the edge of a minibrot's atom rows are partly interior, and there the ordinary
+     * tile border test wins instead — a tile is an annular sector, whose border is
+     * still a closed curve in the plane, so the same connectivity argument applies.
+     *
+     * Rows here are absolute, not ring texels, so tiles keep their identity as the ring
+     * wraps. That works because the ring height is a multiple of the tile size, so a
+     * tile never straddles the wrap and texel/TILE equals absoluteRow/TILE modulo the
+     * grid height.
+     */
+    private val STRIP_TILE_BODY = """
+        void main() {
+            ivec2 tile = ivec2(gl_FragCoord.xy);
+            int x0 = tile.x * uTileSize;
+            int x1 = min(x0 + uTileSize - 1, int(uStripWidth) - 1);
+            float r0 = float(tile.y * uTileSize);
+            float r1 = r0 + float(uTileSize - 1);
+
+            if (x0 > x1) { fragColor = vec4(0.0); return; }
+
+            int n;
+            vec2 z;
+
+            // Top and bottom edges.
+            for (int x = x0; x <= x1; x++) {
+                float a = ((float(x) + 0.5) / uStripWidth) * 6.28318530718;
+                vec2 dir = vec2(cos(a), sin(a));
+                float ra = uStripRBase * exp((r0 + 0.5 - uStripRowBase) * uStripStep);
+                float rb = uStripRBase * exp((r1 + 0.5 - uStripRowBase) * uStripStep);
+                if (escapesOffset(ra * dir, n, z)) { fragColor = vec4(0.0); return; }
+                if (escapesOffset(rb * dir, n, z)) { fragColor = vec4(0.0); return; }
+            }
+            // Left and right edges, corners already covered above.
+            for (int k = 1; k < uTileSize - 1; k++) {
+                float rr = uStripRBase * exp((r0 + float(k) + 0.5 - uStripRowBase) * uStripStep);
+                float al = ((float(x0) + 0.5) / uStripWidth) * 6.28318530718;
+                float ar = ((float(x1) + 0.5) / uStripWidth) * 6.28318530718;
+                if (escapesOffset(rr * vec2(cos(al), sin(al)), n, z)) {
+                    fragColor = vec4(0.0); return;
+                }
+                if (x1 != x0 && escapesOffset(rr * vec2(cos(ar), sin(ar)), n, z)) {
+                    fragColor = vec4(0.0); return;
+                }
+            }
+            fragColor = vec4(1.0);
         }
     """.trimIndent()
 
@@ -380,6 +436,8 @@ object Shaders {
     val PERTURB_TILE = "#version 310 es\n$COMMON\n$PERTURB_CORE\n$TILE_BODY"
     val DIRECT_STRIP = "#version 310 es\n$COMMON\n$DIRECT_CORE\n$STRIP_BODY"
     val PERTURB_STRIP = "#version 310 es\n$COMMON\n$PERTURB_CORE\n$STRIP_BODY"
+    val DIRECT_STRIP_TILE = "#version 310 es\n$COMMON\n$DIRECT_CORE\n$STRIP_TILE_BODY"
+    val PERTURB_STRIP_TILE = "#version 310 es\n$COMMON\n$PERTURB_CORE\n$STRIP_TILE_BODY"
 
     /**
      * Presents an already-rendered frame, optionally reprojected.

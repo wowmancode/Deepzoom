@@ -37,6 +37,17 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
     private var blitProgram = 0
     private var directStripProgram = 0
     private var perturbStripProgram = 0
+    private var directStripTileProgram = 0
+    private var perturbStripTileProgram = 0
+    private val directStripTile = HashMap<String, Int>()
+    private val perturbStripTile = HashMap<String, Int>()
+    private var stripTileTex = 0
+    private var stripTileFbo = 0
+    private var stripTileW = 0
+    private var stripTileH = 0
+    /** Absolute rows for which the strip tile mask is currently valid. */
+    private var stripMaskLo = 0
+    private var stripMaskHi = -1
     private var unwarpProgram = 0
 
     // Exponential-map strip, held as a ring buffer of rows.
@@ -152,6 +163,11 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         perturbStripProgram = buildProgram(Shaders.VERTEX, Shaders.PERTURB_STRIP)
         cacheUniforms(directStripProgram, directStrip, *DIRECT_UNIFORMS)
         cacheUniforms(perturbStripProgram, perturbStrip, *PERTURB_UNIFORMS)
+
+        directStripTileProgram = buildProgram(Shaders.VERTEX, Shaders.DIRECT_STRIP_TILE)
+        perturbStripTileProgram = buildProgram(Shaders.VERTEX, Shaders.PERTURB_STRIP_TILE)
+        cacheUniforms(directStripTileProgram, directStripTile, *DIRECT_UNIFORMS)
+        cacheUniforms(perturbStripTileProgram, perturbStripTile, *PERTURB_UNIFORMS)
 
         unwarpProgram = buildProgram(Shaders.VERTEX, Shaders.UNWARP)
         cacheUniforms(unwarpProgram, unwarp,
@@ -881,6 +897,8 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         stripRowBudget = 64
         stripSegments = 1
         stripInteriorCeiling = Int.MIN_VALUE
+        stripMaskLo = 0
+        stripMaskHi = -1
         rowsSinceFinish = 0
         finishStart = System.nanoTime()
         msPerRow = 0.0
@@ -1041,7 +1059,154 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
             bundle = renderRows(s, geom, firstRow, mid, bundle)
             return renderRows(s, geom, mid + 1, lastRow - 1, bundle)
         }
+        // Partly-interior rows are what is left once whole circles are exhausted, and
+        // that is exactly what the tile border test handles. Only worth its own cost
+        // over a range tall enough to contain whole tiles.
+        if (lastRow - firstRow >= TILE_SIZE * 2) {
+            bundle = buildStripTiles(s, geom, firstRow, lastRow, bundle)
+        }
         return renderRowsDirect(s, geom, firstRow, lastRow, bundle)
+    }
+
+    /** Mask target for strip tiles, one texel per tile across the whole ring. */
+    private fun ensureStripTileTarget() {
+        // Tiles are identified by absolute row / TILE_SIZE and looked up by texel row /
+        // TILE_SIZE. Those agree only if the ring is a whole number of tiles.
+        if (stripW % TILE_SIZE != 0 || stripRing % TILE_SIZE != 0) {
+            stripTileTex = 0
+            stripTileFbo = 0
+            return
+        }
+        val w = stripW / TILE_SIZE
+        val h = stripRing / TILE_SIZE
+        if (stripTileW == w && stripTileH == h && stripTileFbo != 0) return
+        val ids = IntArray(1)
+        if (stripTileFbo != 0) { ids[0] = stripTileFbo; GLES31.glDeleteFramebuffers(1, ids, 0) }
+        if (stripTileTex != 0) { ids[0] = stripTileTex; GLES31.glDeleteTextures(1, ids, 0) }
+        GLES31.glGenTextures(1, ids, 0)
+        stripTileTex = ids[0]
+        GLES31.glBindTexture(GLES31.GL_TEXTURE_2D, stripTileTex)
+        GLES31.glTexImage2D(
+            GLES31.GL_TEXTURE_2D, 0, GLES31.GL_R8, w, h, 0,
+            GLES31.GL_RED, GLES31.GL_UNSIGNED_BYTE, null
+        )
+        GLES31.glTexParameteri(GLES31.GL_TEXTURE_2D, GLES31.GL_TEXTURE_MIN_FILTER, GLES31.GL_NEAREST)
+        GLES31.glTexParameteri(GLES31.GL_TEXTURE_2D, GLES31.GL_TEXTURE_MAG_FILTER, GLES31.GL_NEAREST)
+        GLES31.glTexParameteri(GLES31.GL_TEXTURE_2D, GLES31.GL_TEXTURE_WRAP_S, GLES31.GL_REPEAT)
+        GLES31.glTexParameteri(GLES31.GL_TEXTURE_2D, GLES31.GL_TEXTURE_WRAP_T, GLES31.GL_REPEAT)
+        GLES31.glGenFramebuffers(1, ids, 0)
+        stripTileFbo = ids[0]
+        GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, stripTileFbo)
+        GLES31.glFramebufferTexture2D(
+            GLES31.GL_FRAMEBUFFER, GLES31.GL_COLOR_ATTACHMENT0,
+            GLES31.GL_TEXTURE_2D, stripTileTex, 0
+        )
+        GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, 0)
+        stripTileW = w
+        stripTileH = h
+        stripMaskHi = -1
+    }
+
+    /**
+     * Builds the tile mask for the tiles covering [firstRow, lastRow].
+     *
+     * Costs the tile borders only, about an eighth of a full render, and pays for
+     * itself wherever rows are partly interior — the band around a minibrot's atom,
+     * where the whole-circle test cannot help because no single row is interior all
+     * the way round.
+     */
+    private fun buildStripTiles(
+        s: ViewState,
+        geom: StripGeometry,
+        firstRow: Int,
+        lastRow: Int,
+        bundleIn: OrbitBundle?
+    ): OrbitBundle? {
+        var bundle = bundleIn
+        ensureStripTileTarget()
+        if (stripTileFbo == 0) return bundle
+
+        val firstTile = Math.floorDiv(firstRow, TILE_SIZE)
+        val lastTile = Math.floorDiv(lastRow, TILE_SIZE)
+
+        GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, stripTileFbo)
+        var tile = firstTile
+        while (tile <= lastTile) {
+            val destTile = Math.floorMod(tile, stripTileH)
+            val untilWrap = stripTileH - destTile
+            val countTiles = min(untilWrap, lastTile - tile + 1)
+
+            // Radius base for this run of tiles, in absolute rows. Same reason as the
+            // strip draw itself: at depth the absolute log radius cannot be held in a
+            // float, so it is rebuilt multiplicatively from a local base.
+            val baseRow = tile * TILE_SIZE
+            val radius = Math.exp(geom.logR0 + baseRow * geom.step)
+            val deep = radius < ViewState.DIRECT_LIMIT
+            val probe = s.snapshot()
+            probe.spanY = max(radius * 2.0, s.minSpan())
+            if (deep) bundle = bundleForExport(probe, 1.0, bundle)
+
+            val u = if (deep) perturbStripTile else directStripTile
+            val program = if (deep) perturbStripTileProgram else directStripTileProgram
+            val scale = if (deep) bundle!!.gpu.scale else 1.0
+            val rBase = (radius * scale).toFloat()
+            if (!rBase.isFinite() || rBase < 1e-36f) {
+                // Same guard as the strip draw: a zero base collapses every offset to
+                // the reference point and would mark tiles solid that are not.
+                GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, 0)
+                return bundle
+            }
+
+            GLES31.glViewport(0, destTile, stripTileW, countTiles)
+            GLES31.glUseProgram(program)
+            GLES31.glBindVertexArray(vao)
+            GLES31.glUniform2f(u["uResolution"]!!, stripW.toFloat(), stripRing.toFloat())
+            GLES31.glUniform1i(
+                u["uMaxIter"]!!,
+                if (deep) min(s.maxIter, bundle!!.orbit.iterBuilt) else s.maxIter
+            )
+            applyColorUniforms(u)
+            applyTileUniforms(u, false)
+            GLES31.glUniform1i(u["uTileSize"]!!, TILE_SIZE)
+            GLES31.glUniform1f(u["uStripWidth"]!!, stripW.toFloat())
+            GLES31.glUniform1f(u["uStripStep"]!!, geom.step.toFloat())
+            GLES31.glUniform1f(u["uStripRBase"]!!, rBase)
+            // gl_FragCoord.y in the tile pass is the wrapped tile index, so the base
+            // must be in the same space: the texel row this run starts at. Using 0 here
+            // would offset the radius by however far the ring had wrapped.
+            GLES31.glUniform1f(u["uStripRowBase"]!!, (destTile * TILE_SIZE).toFloat())
+            if (deep) {
+                val b = bundle!!
+                val offset = probe.offsetFrom(b.orbit)
+                GLES31.glUniform2f(u["uDeltaCenter"]!!,
+                    (offset[0] * scale).toFloat(), (offset[1] * scale).toFloat())
+                GLES31.glUniform1f(u["uPixelSpan"]!!, 0f)
+                GLES31.glUniform1f(u["uInvScale"]!!, (1.0 / scale).toFloat())
+                GLES31.glUniform1f(u["uBailoutScaled"]!!, (BAILOUT * scale).toFloat())
+                GLES31.glUniform1i(u["uWidthMask"]!!, TEX_WIDTH - 1)
+                GLES31.glUniform1i(u["uWidthShift"]!!, TEX_SHIFT)
+                GLES31.glUniform1i(u["uOrbitLen"]!!, uploadedLen)
+                GLES31.glUniform1i(u["uBlaLevels"]!!, uploadedBlaLevels)
+                if (uploadedBlaLevels > 0) {
+                    GLES31.glUniform1iv(u["uBlaOffset[0]"]!!, uploadedBlaLevels, uploadedBlaOffset, 0)
+                    GLES31.glUniform1iv(u["uBlaCount[0]"]!!, uploadedBlaLevels, uploadedBlaCount, 0)
+                }
+                bindTexture(0, orbitTexture, u["uOrbit"]!!)
+                bindTexture(1, blaAbTexture, u["uBlaAB"]!!)
+                bindTexture(2, blaRTexture, u["uBlaR"]!!)
+            } else {
+                GLES31.glUniform2f(u["uCenter"]!!, s.centerX.toFloat(), s.centerY.toFloat())
+                GLES31.glUniform1f(u["uSpanY"]!!, 1f)
+            }
+            GLES31.glDrawArrays(GLES31.GL_TRIANGLES, 0, 3)
+            GLES31.glBindVertexArray(0)
+            GLES31.glFinish()   // bound the submission, same as the strip draw
+            tile += countTiles
+        }
+        GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, 0)
+        stripMaskLo = firstTile * TILE_SIZE
+        stripMaskHi = lastTile * TILE_SIZE + TILE_SIZE - 1
+        return bundle
     }
 
     /** Fills rows with the interior colour, wrapping the ring, with no iteration. */
@@ -1169,7 +1334,13 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
             GLES31.glUniform2f(u["uResolution"]!!, stripW.toFloat(), stripRing.toFloat())
             GLES31.glUniform1i(u["uMaxIter"]!!, if (deep) min(s.maxIter, bundle!!.orbit.iterBuilt) else s.maxIter)
             applyColorUniforms(u)
-            applyTileUniforms(u, false)
+            // Use the tile mask only where it was actually built for these rows, so a
+            // stale mask can never mark live rows solid.
+            val maskCovers = stripTileTex != 0 &&
+                row >= stripMaskLo && row + count - 1 <= stripMaskHi
+            GLES31.glUniform1i(u["uTileSize"]!!, TILE_SIZE)
+            GLES31.glUniform1i(u["uUseTiles"]!!, if (maskCovers) 1 else 0)
+            bindTexture(5, stripTileTex, u["uTiles"]!!)
 
             // Radius is built multiplicatively from a per-chunk base: at depth the
             // absolute log radius is around -130, where a float cannot separate rows.

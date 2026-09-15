@@ -237,6 +237,20 @@ atom are 100% interior and cost the full iteration cap per pixel — these are t
 that dominate render time — while rows outside cost around 15 iterations a pixel and
 gain nothing. The saving is therefore concentrated exactly where the cost is.
 
+**Tile skipping at the atom boundary.** The whole-circle test settles rows that are
+interior all the way round, which is the deep bulk. Around the edge of a minibrot's
+atom rows are only partly interior and it cannot help. There the ordinary 32px border
+test wins instead, so the strip also builds a tile mask over absolute rows. Tiles are
+identified by `absoluteRow / 32` and looked up by `texelRow / 32`; those agree only
+because the ring height is a whole number of tiles, and the code refuses to build a
+mask when it is not.
+
+Measured in iterations (`tools/bench_strip.py`), which is what the shader actually
+spends: inside the atom the circle test saves 94.5% against the tile test's 87.5%, at
+the atom boundary the tile test saves 61% against the circle test's 35%, and outside
+neither saves anything because those rows already cost about 15 iterations a pixel.
+The two together cover the whole radius range.
+
 ### Verification
 
 `tools/validate_bla.py` mirrors the Kotlin BLA construction and the GLSL iteration
