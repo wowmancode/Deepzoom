@@ -215,6 +215,28 @@ Palettes are rendered to a 1024-wide ramp texture and sampled with linear filter
 repeat wrapping, which is what gives the blending and a seamless wrap. Any number of
 colour stops works without touching the shader.
 
+### Interior row skipping on the strip
+
+A strip row is a full circle around the view centre. The exterior of the set is
+connected and unbounded, so an escaping point inside a circle would need a path to
+infinity crossing it — a circle on which nothing escapes therefore encloses nothing
+that escapes, and **every row below it is interior**. That is a stronger statement than
+the live view's 32px tile test, and it fits the strip's geometry exactly: one proven
+row settles every row beneath it.
+
+The strip shader writes the escape flag into alpha (0 interior, 1 escaped); the unwarp
+samples `.rgb`, so alpha was spare. A rendered row is then tested by reading it back.
+Large ranges probe their top row first: if it is interior the whole range is filled at
+once, and if not the range is halved and each half probed, finding the boundary in
+about a dozen probes rather than by iterating every row to the cap. A failed readback
+counts as "unknown" and never as interior, so a silent read failure cannot blank the
+strip.
+
+Measured on circles around a nucleus (`tools/model_strip_skip.py`): rows inside the
+atom are 100% interior and cost the full iteration cap per pixel — these are the rows
+that dominate render time — while rows outside cost around 15 iterations a pixel and
+gain nothing. The saving is therefore concentrated exactly where the cost is.
+
 ### Verification
 
 `tools/validate_bla.py` mirrors the Kotlin BLA construction and the GLSL iteration
@@ -224,8 +246,11 @@ table construction or the shader loop is ever changed — a wrong merge formula 
 images that look plausible rather than obviously broken.
 
 `tools/harness/verify.sh` type-checks the whole Kotlin source set against a real
-`android.jar` plus signature-only stubs for AppCompat, Material and the generated `R`.
-No Android SDK or Gradle needed. See `tools/harness/README.md`.
+`android.jar` plus signature-only stubs for AppCompat, Material and the generated `R`,
+then compiles every shader with `glslangValidator`. No Android SDK or Gradle needed.
+The compiler version must match `build.gradle.kts` and the script refuses to run if it
+does not — 1.9.x is K1 and 2.0+ is K2, and K2 accepts code K1 rejects. See
+`tools/harness/README.md`.
 
 `tools/model_strip_freeze.py` and `tools/model_ring_contents.py` model the zoom-video
 strip pipeline — geometry, the per-frame row window, the ring-buffer bookkeeping, and

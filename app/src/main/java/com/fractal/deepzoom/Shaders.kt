@@ -313,6 +313,16 @@ object Shaders {
      * an absolute log, because at depth the absolute log radius is around -130 and a
      * float there has nowhere near enough resolution to separate adjacent rows.
      */
+    /**
+     * Alpha carries whether the pixel escaped: 0 for interior, 1 for escaped.
+     *
+     * The unwarp samples .rgb only, so alpha is spare, and it lets a single row be
+     * tested for "nothing here escaped" by reading the row back. That is the whole
+     * basis of skipping: a strip row is a full circle, and the exterior of the set is
+     * connected and unbounded, so an escaping point inside a circle would need a path
+     * to infinity crossing it. A circle with no escaping point therefore encloses none,
+     * and every row below it can be filled without iterating.
+     */
     private val STRIP_BODY = """
         void main() {
             float angle = (gl_FragCoord.x / uStripWidth) * 6.28318530718;
@@ -322,7 +332,7 @@ object Shaders {
             int n;
             vec2 z;
             if (!escapesOffset(off, n, z)) {
-                fragColor = vec4(uInterior, 1.0);
+                fragColor = vec4(uInterior, 0.0);
                 return;
             }
             fragColor = vec4(shade(n, z), 1.0);

@@ -45,4 +45,13 @@ trap 'rm -rf "$OUT"' EXIT
     "$HERE"/stubs/*.kt \
     "$ROOT"/app/src/main/java/com/fractal/deepzoom/*.kt
 
+# GLSL too: the shaders are assembled from string fragments, so a broken one only
+# shows up on device unless it is compiled here.
+if command -v glslangValidator >/dev/null 2>&1; then
+    python3 "$HERE/validate_glsl.py"
+else
+    echo "NOTE: glslangValidator not installed, shaders not checked"
+    echo "      apt install glslang-tools"
+fi
+
 echo "OK: source set type-checks clean"

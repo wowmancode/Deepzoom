@@ -880,6 +880,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         // Start conservative; the first measured chunk corrects it immediately.
         stripRowBudget = 64
         stripSegments = 1
+        stripInteriorCeiling = Int.MIN_VALUE
         rowsSinceFinish = 0
         finishStart = System.nanoTime()
         msPerRow = 0.0
@@ -993,7 +994,109 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         return bundle
     }
 
+    /**
+     * Highest absolute row proven to be a circle on which nothing escapes.
+     *
+     * Every row at or below it is interior and can be filled without iterating. Rows
+     * only ever get more interior as the radius shrinks, so this is monotone and one
+     * proven row settles everything beneath it for the rest of the export.
+     */
+    private var stripInteriorCeiling = Int.MIN_VALUE
+
+    /**
+     * Renders a range of strip rows, filling whatever is provably interior.
+     *
+     * Probes the top of a large range first. If that circle is entirely interior the
+     * whole range is, and costs one row instead of thousands. If it is not, the range
+     * is halved and each half probed in turn, which finds where the interior ends in
+     * about a dozen probes rather than by rendering every row to the iteration cap.
+     */
     private fun renderRows(
+        s: ViewState,
+        geom: StripGeometry,
+        firstRow: Int,
+        lastRow: Int,
+        bundleIn: OrbitBundle?
+    ): OrbitBundle? {
+        var bundle = bundleIn
+        if (lastRow < firstRow) return bundle
+
+        if (lastRow <= stripInteriorCeiling) {
+            fillInterior(firstRow, lastRow)
+            return bundle
+        }
+        if (firstRow <= stripInteriorCeiling) {
+            fillInterior(firstRow, stripInteriorCeiling)
+            return renderRows(s, geom, stripInteriorCeiling + 1, lastRow, bundle)
+        }
+
+        if (lastRow - firstRow >= PROBE_MIN_ROWS) {
+            // Render the top row for real, then ask whether anything on it escaped.
+            bundle = renderRowsDirect(s, geom, lastRow, lastRow, bundle)
+            if (stripInteriorCeiling >= lastRow) {
+                fillInterior(firstRow, lastRow - 1)
+                return bundle
+            }
+            val mid = firstRow + (lastRow - firstRow) / 2
+            bundle = renderRows(s, geom, firstRow, mid, bundle)
+            return renderRows(s, geom, mid + 1, lastRow - 1, bundle)
+        }
+        return renderRowsDirect(s, geom, firstRow, lastRow, bundle)
+    }
+
+    /** Fills rows with the interior colour, wrapping the ring, with no iteration. */
+    private fun fillInterior(firstRow: Int, lastRow: Int) {
+        if (lastRow < firstRow || stripFbo == 0) return
+        val p = palette
+        GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, stripFbo)
+        GLES31.glClearColor(
+            ((p.interior shr 16) and 0xFF) / 255f,
+            ((p.interior shr 8) and 0xFF) / 255f,
+            (p.interior and 0xFF) / 255f,
+            0f // interior, matching what the strip shader writes
+        )
+        GLES31.glEnable(GLES31.GL_SCISSOR_TEST)
+        var row = firstRow
+        while (row <= lastRow) {
+            val dest = ((row % stripRing) + stripRing) % stripRing
+            val count = min(stripRing - dest, lastRow - row + 1)
+            GLES31.glScissor(0, dest, stripW, count)
+            GLES31.glClear(GLES31.GL_COLOR_BUFFER_BIT)
+            row += count
+        }
+        GLES31.glDisable(GLES31.GL_SCISSOR_TEST)
+        GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, 0)
+    }
+
+    /**
+     * Reads one rendered row's alpha and reports whether nothing on it escaped.
+     *
+     * Returns 1 for all-interior, 0 for not, -1 when the read itself failed — which
+     * must not be treated as interior, or a failed readback would silently blank a
+     * region of the strip.
+     */
+    private fun stripRowInterior(absoluteRow: Int): Int {
+        if (stripFbo == 0 || stripW == 0) return -1
+        val texel = ((absoluteRow % stripRing) + stripRing) % stripRing
+        val cached = rowProbeBuf
+        val buf: ByteBuffer =
+            if (cached != null && cached.capacity() >= stripW * 4) cached
+            else ByteBuffer.allocateDirect(stripW * 4)
+                .order(ByteOrder.nativeOrder())
+                .also { rowProbeBuf = it }
+        val end = (stripW - 1) * 4
+        buf.putInt(0, SENTINEL)
+        buf.putInt(end, SENTINEL)
+        buf.position(0)
+        GLES31.glReadPixels(0, texel, stripW, 1, GLES31.GL_RGBA, GLES31.GL_UNSIGNED_BYTE, buf)
+        if (buf.getInt(0) == SENTINEL && buf.getInt(end) == SENTINEL) return -1
+        for (i in 0 until stripW) {
+            if ((buf.get(i * 4 + 3).toInt() and 0xFF) != 0) return 0
+        }
+        return 1
+    }
+
+    private fun renderRowsDirect(
         s: ViewState,
         geom: StripGeometry,
         firstRow: Int,
@@ -1220,6 +1323,16 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
             } else {
                 lastDiag += "\n"
             }
+            // With the chunk drawn, ask whether its top circle had anything escape on
+            // it. One row proving interior settles every row beneath it. Only the top
+            // row is worth testing: if a lower one were interior the top might not be,
+            // but the converse is what the fill relies on.
+            if (row + count - 1 > stripInteriorCeiling) {
+                if (stripRowInterior(row + count - 1) == 1) {
+                    stripInteriorCeiling = row + count - 1
+                }
+            }
+
             // Recorded before row advances, so the range refers to the rows this chunk
             // actually covered.
             stripRowsDrawn += count
@@ -1630,6 +1743,13 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
          * at 64 pixels per draw, which is far below anything a watchdog objects to.
          */
         private const val MAX_SEGMENTS = 64
+
+        /**
+         * Shortest range worth probing before rendering.
+         *
+         * A probe costs one row, so on a short range it could cost more than it saves.
+         */
+        private const val PROBE_MIN_ROWS = 8
 
         private const val SENTINEL = 0x5A3C7E01
 
