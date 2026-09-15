@@ -251,22 +251,33 @@ the atom boundary the tile test saves 61% against the circle test's 35%, and out
 neither saves anything because those rows already cost about 15 iterations a pixel.
 The two together cover the whole radius range.
 
-**Periodicity check in the perturbation path.** An interior point settles into a cycle,
-so comparing each iterate against a lazily-updated earlier one (Brent, resaving at each
-power of two) detects it and stops early instead of running to `maxIter`. The direct
-path already did this; the perturbation path did not, and that is where the cost was —
-the partly-interior band around a minibrot's atom, which neither the whole-circle test
-nor the tile test can remove.
+**Periodicity check — exact repeat, never an epsilon.** An interior point settles into
+a cycle, so comparing each iterate against a lazily-updated earlier one (Brent, resaving
+at each power of two) detects it and stops instead of running to `maxIter`.
 
-Sampled only on plain steps: a BLA jump advances the orbit by a variable amount, so
-samples taken across jumps land on different phases of the cycle and would rarely
-match. Compared unscaled, so the threshold means the same thing whatever delta scale is
-in use.
+The test must be exact equality. An epsilon cannot be made safe: an escaping orbit just
+outside a minibrot returns close to an earlier value once per period, and how close
+scales with the atom size, so any fixed threshold starts calling escaping pixels
+interior once the zoom is deep enough. That renders as black speckles scattered through
+the coloured bands. Measured at an atom of 1.5e-2, escaping points return to within
+5.6e-6 absolute and 3.2e-6 relative, while some genuinely interior points only reach
+9.4e-5 relative — the two ranges overlap, so no threshold separates them.
 
-Measured at `tools/bench_derivative.py`: **3.4x** on pixels in that band that survive
-the existing skipping. Note the obvious dz/dz0 = prod 2*z_k derivative test does *not*
-work here — the orbit starts at the critical point z0 = 0, so the product is identically
-zero and every pixel would be flagged interior.
+Exact equality has no such failure mode, and the reason is a proof rather than a
+measurement: if the float orbit lands on a value it already held, it is periodic in
+float arithmetic and can never escape, so stopping returns precisely what running to
+the cap would. In the perturbation path the complete state is the delta together with
+the reference index, since two iterations can share a value while sitting at different
+points of the reference orbit; both are compared.
+
+Measured in float32 (`tools/validate_cycle.py`, and the float32 check in the notes):
+escape verdicts identical to running with no test at all, with **14.6x** on the atom
+boundary, 42x inside the atom and 396x deep inside. Slightly negative (0.85x) far
+outside, where orbits escape in a few iterations and there is nothing to save.
+
+Note the obvious dz/dz0 = prod 2*z_k derivative test does *not* work here: the orbit
+starts at the critical point z0 = 0, so the product is identically zero and every pixel
+would be flagged interior.
 
 ### Licence
 

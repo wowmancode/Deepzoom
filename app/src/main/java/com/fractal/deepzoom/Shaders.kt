@@ -143,7 +143,14 @@ object Shaders {
                 d = dot(z, z);
                 if (d > 65536.0) { outN = i; outZ = z; return true; }
 
-                if (abs(z.x - hare.x) < 1e-9 && abs(z.y - hare.y) < 1e-9) return false;
+                // Exact repeat, not an epsilon. If the float orbit lands on a value it
+                // already held, it is periodic in float arithmetic and can never
+                // escape, so stopping returns exactly what running to uMaxIter would.
+                // An epsilon cannot be made safe here: escaping orbits near a minibrot
+                // return to within a distance that scales with the atom, so any fixed
+                // threshold starts marking escaping pixels interior once the zoom is
+                // deep enough, which shows up as black speckles.
+                if (z == hare) return false;
                 period--;
                 if (period == 0) {
                     hare = z;
@@ -220,15 +227,13 @@ object Shaders {
             int n = 0;
             vec4 t = fetchZ(0);
 
-            // Periodicity check, as the direct path already does. An interior point
-            // settles into a cycle, so it can stop instead of grinding to uMaxIter --
-            // which is what the partly-interior band around a minibrot's atom costs,
-            // the part neither the whole-circle test nor the tile test can remove.
-            //
-            // Only sampled on plain steps. A BLA jump advances the orbit by a variable
-            // amount, so consecutive samples across jumps land on different phases of
-            // the cycle and would rarely match.
-            vec2 hare = vec2(0.0);
+            // Periodicity check, as the direct path does. The complete state here is
+            // the delta together with the reference index -- two iterations can share a
+            // value while sitting at different points of the reference orbit, and would
+            // then continue differently. Comparing both makes an exact repeat a genuine
+            // cycle of the computed iteration, so it provably never escapes.
+            vec2 hareDz = vec2(0.0);
+            int hareM = -1;
             int period = 1;
             int periodLimit = 1;
 
@@ -281,25 +286,19 @@ object Shaders {
                     return true;
                 }
 
-                if (chosen < 0) {
-                    // Compared unscaled, so the threshold means the same thing here as
-                    // in the direct path regardless of the delta scale in use.
-                    vec2 zu = zs * uInvScale;
-                    if (abs(zu.x - hare.x) < 1e-9 && abs(zu.y - hare.y) < 1e-9) {
-                        return false;
-                    }
-                    period--;
-                    if (period == 0) {
-                        hare = zu;
-                        periodLimit *= 2;
-                        period = periodLimit;
-                    }
-                }
-
                 if (zMag < max(abs(dz.x), abs(dz.y)) || m >= uOrbitLen) {
                     dz = zs;
                     m = 0;
                     t = fetchZ(0);
+                }
+
+                if (dz == hareDz && m == hareM) return false;
+                period--;
+                if (period == 0) {
+                    hareDz = dz;
+                    hareM = m;
+                    periodLimit *= 2;
+                    period = periodLimit;
                 }
             }
             return false;
