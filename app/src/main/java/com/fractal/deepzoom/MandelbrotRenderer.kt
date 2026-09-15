@@ -1021,15 +1021,41 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
             stripBuiltHi = hi
             return bundle
         }
+
+        // Build past what this frame needs, into whatever the ring has spare.
+        //
+        // A frame exposes only about twenty new rows, and the caller reads the result
+        // back immediately to unwarp it. That readback drains the pipeline, so asking
+        // for exactly one frame's rows means a full GPU round trip per twenty rows —
+        // and twenty rows is far less work than one round trip costs. The exponential
+        // map made the per-frame work small enough that synchronisation, not shading,
+        // became the limit, which is why the device stays cool while the export
+        // crawls.
+        //
+        // Rows do not belong to frames, so there is nothing to stop them being built
+        // early. The ring holds a good deal more than one window, and the surplus is
+        // otherwise idle. Filling it turns one drain per frame into one per batch, and
+        // renderRows still drains internally on its own budget, so the watchdog guard
+        // is unaffected.
+        //
+        // The bound is the ring itself: rows this frame is about to sample must not be
+        // overwritten by rows built ahead of it.
+        val slack = stripRing - (hi - lo + 1) - 1
+        val ahead = min(STRIP_LOOKAHEAD_ROWS, max(0, slack))
+
         if (hi > stripBuiltHi) {
-            bundle = renderRows(s, geom, stripBuiltHi + 1, hi, bundle)
-            stripBuiltHi = hi
-            stripBuiltLo = max(stripBuiltLo, hi - stripRing + 1)
+            // Ascending, so the surplus goes above.
+            val target = hi + ahead
+            bundle = renderRows(s, geom, stripBuiltHi + 1, target, bundle)
+            stripBuiltHi = target
+            stripBuiltLo = max(stripBuiltLo, target - stripRing + 1)
         }
         if (lo < stripBuiltLo) {
-            bundle = renderRows(s, geom, lo, stripBuiltLo - 1, bundle)
-            stripBuiltLo = lo
-            stripBuiltHi = min(stripBuiltHi, lo + stripRing - 1)
+            // Descending, so it goes below. Absolute rows are clamped at zero.
+            val target = max(0, lo - ahead)
+            bundle = renderRows(s, geom, target, stripBuiltLo - 1, bundle)
+            stripBuiltLo = target
+            stripBuiltHi = min(stripBuiltHi, target + stripRing - 1)
         }
 
         // The unwarp samples [lo, hi] unconditionally. If those rows are not all valid
@@ -2025,6 +2051,16 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
          * six-fold stall a four-times-larger block produced.
          */
         private const val STRIP_TILE_BLOCK = 256
+
+        /**
+         * Rows built beyond the frame that asked for them, when the ring has room.
+         *
+         * Sized to cover a few dozen frames at typical zoom rates: enough that the
+         * fixed cost of a drain is spread thin, while still small enough that the
+         * progress bar moves and a cancel is noticed promptly. The ring's spare
+         * capacity caps it in any case, so a tall window quietly gets less.
+         */
+        private const val STRIP_LOOKAHEAD_ROWS = 512
 
         /** Cost per row below which the tile mask cannot repay what it costs to build. */
         private const val STRIP_TILE_MIN_MS = 5.0
