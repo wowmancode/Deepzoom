@@ -1050,7 +1050,10 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
 
         if (lastRow - firstRow >= PROBE_MIN_ROWS) {
             // Render the top row for real, then ask whether anything on it escaped.
+            // Only here, not after every chunk: reading pixels back forces the GPU to
+            // finish everything queued, and this is the one place the answer is used.
             bundle = renderRowsDirect(s, geom, lastRow, lastRow, bundle)
+            if (stripRowInterior(lastRow) == 1) stripInteriorCeiling = lastRow
             if (stripInteriorCeiling >= lastRow) {
                 fillInterior(firstRow, lastRow - 1)
                 return bundle
@@ -1060,12 +1063,34 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
             return renderRows(s, geom, mid + 1, lastRow - 1, bundle)
         }
         // Partly-interior rows are what is left once whole circles are exhausted, and
-        // that is exactly what the tile border test handles. Only worth its own cost
-        // over a range tall enough to contain whole tiles.
-        if (lastRow - firstRow >= TILE_SIZE * 2) {
-            bundle = buildStripTiles(s, geom, firstRow, lastRow, bundle)
+        // that is what the tile border test handles.
+        //
+        // Built a block at a time rather than per range. A frame only asks for about
+        // twenty new rows, so building per range would pay the mask's cost for a strip
+        // two tiles tall and then throw it away every frame — the mask has to outlive
+        // the range that triggered it to be worth anything.
+        // Only where rows are expensive enough to be worth it. The mask costs about an
+        // eighth of rendering the rows it covers, so on cheap rows — anything outside a
+        // minibrot, which runs a handful of iterations a pixel — it is a pure loss.
+        if (stripTileTex != 0 && msPerRow > STRIP_TILE_MIN_MS &&
+            (firstRow < stripMaskLo || lastRow > stripMaskHi)
+        ) {
+            val blockLo = Math.floorDiv(firstRow, STRIP_TILE_BLOCK) * STRIP_TILE_BLOCK
+            bundle = buildStripTiles(
+                s, geom,
+                min(blockLo, firstRow),
+                max(blockLo + STRIP_TILE_BLOCK - 1, lastRow),
+                bundle
+            )
         }
-        return renderRowsDirect(s, geom, firstRow, lastRow, bundle)
+        bundle = renderRowsDirect(s, geom, firstRow, lastRow, bundle)
+        // A range too short to probe still gets one test, so slow zoom rates — where
+        // every range is a few rows — do not lose interior skipping altogether. One
+        // readback per call, not per chunk.
+        if (lastRow > stripInteriorCeiling && stripRowInterior(lastRow) == 1) {
+            stripInteriorCeiling = lastRow
+        }
+        return bundle
     }
 
     /** Mask target for strip tiles, one texel per tile across the whole ring. */
@@ -1494,16 +1519,6 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
             } else {
                 lastDiag += "\n"
             }
-            // With the chunk drawn, ask whether its top circle had anything escape on
-            // it. One row proving interior settles every row beneath it. Only the top
-            // row is worth testing: if a lower one were interior the top might not be,
-            // but the converse is what the fill relies on.
-            if (row + count - 1 > stripInteriorCeiling) {
-                if (stripRowInterior(row + count - 1) == 1) {
-                    stripInteriorCeiling = row + count - 1
-                }
-            }
-
             // Recorded before row advances, so the range refers to the rows this chunk
             // actually covered.
             stripRowsDrawn += count
@@ -1921,6 +1936,18 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
          * A probe costs one row, so on a short range it could cost more than it saves.
          */
         private const val PROBE_MIN_ROWS = 8
+
+        /**
+         * Rows of tile mask built at a time.
+         *
+         * The mask costs about an eighth of rendering the rows it covers, so it has to
+         * serve many frames to pay for itself. At roughly twenty new rows a frame this
+         * block lasts about fifty frames.
+         */
+        private const val STRIP_TILE_BLOCK = 1024
+
+        /** Cost per row below which the tile mask cannot repay what it costs to build. */
+        private const val STRIP_TILE_MIN_MS = 5.0
 
         private const val SENTINEL = 0x5A3C7E01
 
