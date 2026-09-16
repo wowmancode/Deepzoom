@@ -2163,6 +2163,25 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         private const val PROF_PROBE = 2
         private const val PROF_RASTER = 3
 
+        // --- Bisect switches -------------------------------------------------------
+        //
+        // Two of the recent changes can alter what ends up on screen, as opposed to
+        // only how fast it gets there. Each is disabled by a single value here, so a
+        // rendering fault can be attributed without unpicking anything:
+        //
+        //   STRIP_LOOKAHEAD_ROWS = 0   builds only the rows the current frame needs,
+        //                              which is what the ring did before. Try this
+        //                              first for anything that appears partway into a
+        //                              video, since that is when the ring starts
+        //                              overwriting rows.
+        //
+        //   DER_LIMIT_SQ = 0f          never lets the derivative call a pixel interior,
+        //                              since a squared magnitude is never below zero.
+        //                              Try this for speckle, which is what a wrong
+        //                              interior verdict on scattered pixels looks like.
+        //
+        // Change one, rebuild, and see which one the fault follows.
+
         /**
          * Rows built beyond the frame that asked for them, when the ring has room.
          *
