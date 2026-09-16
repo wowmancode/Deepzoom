@@ -183,10 +183,19 @@ class BlaTable(
 
         fun maxCFor(spanY: Double, aspect: Double): Double {
             val halfDiag = 0.5 * spanY * hypot(1.0, abs(aspect))
-            // Tables are reused while the view grows, so this is deliberately
-            // overstated: a larger bound shrinks radii, which costs a little speed but
-            // never correctness, and it means zooming out 16x before a rebuild.
-            return halfDiag * 16.0
+            // Overstated so a table survives the view growing, but only modestly.
+            //
+            // This bound is subtracted from every merged radius, scaled by |B|, and |B|
+            // grows by about |2Z| per level. So the bound does not cost "a little
+            // speed": it decides how many levels exist at all. Measured on a real
+            // table, sixteen times the half-diagonal left levels three and up entirely
+            // zero -- the longest jump the renderer could take was two iterations, out
+            // of a thirteen-level table. At twice the half-diagonal, levels three and
+            // four survive.
+            //
+            // The cost is rebuilding after a smaller zoom-out, and a rebuild here is
+            // only a repack of the table, not a new reference orbit.
+            return halfDiag * 2.0
         }
     }
 }
