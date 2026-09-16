@@ -966,7 +966,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         // unreachable and every solid tile was shaded pixel by pixel to the iteration
         // limit. Building the target at strip setup, where stripW and stripRing are
         // already known, is what lets the gate ever pass.
-        ensureStripTileTarget()
+        if (STRIP_TILE_MASK) ensureStripTileTarget()
         rowsSinceFinish = 0
         finishStart = System.nanoTime()
         cpuPauseNs = 0L
@@ -2163,24 +2163,36 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         private const val PROF_PROBE = 2
         private const val PROF_RASTER = 3
 
+        /**
+         * Whether the interior tile mask runs at all.
+         *
+         * It was unreachable until recently -- the target it needs was only created
+         * from inside the pass that would not start without it -- so although the code
+         * is old, it has never actually executed and has never been exercised against
+         * a wrapping ring. Off until the rendering faults are pinned down.
+         */
+        private const val STRIP_TILE_MASK = false
+
         // --- Bisect switches -------------------------------------------------------
         //
         // Two of the recent changes can alter what ends up on screen, as opposed to
         // only how fast it gets there. Each is disabled by a single value here, so a
         // rendering fault can be attributed without unpicking anything:
         //
-        //   STRIP_LOOKAHEAD_ROWS = 0   builds only the rows the current frame needs,
-        //                              which is what the ring did before. Try this
-        //                              first for anything that appears partway into a
-        //                              video, since that is when the ring starts
-        //                              overwriting rows.
+        // All three are currently off, which should render exactly as the project did
+        // before any of them existed:
         //
-        //   DER_LIMIT_SQ = 0f          never lets the derivative call a pixel interior,
-        //                              since a squared magnitude is never below zero.
-        //                              Try this for speckle, which is what a wrong
-        //                              interior verdict on scattered pixels looks like.
+        //   STRIP_LOOKAHEAD_ROWS   512 builds rows ahead of the asking frame. Fewer
+        //                          pipeline drains; more of the ring in use at once.
         //
-        // Change one, rebuild, and see which one the fault follows.
+        //   DER_LIMIT_SQ           1e-6f lets a collapsing derivative end an interior
+        //                          pixel early. Zero can never be reached by a squared
+        //                          magnitude, so zero disables it.
+        //
+        //   STRIP_TILE_MASK        true skips tiles whose border never escapes.
+        //
+        // Re-enable one per build, in that order, and whichever brings a fault back is
+        // the one at fault.
 
         /**
          * Rows built beyond the frame that asked for them, when the ring has room.
@@ -2190,7 +2202,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
          * progress bar moves and a cancel is noticed promptly. The ring's spare
          * capacity caps it in any case, so a tall window quietly gets less.
          */
-        private const val STRIP_LOOKAHEAD_ROWS = 512
+        private const val STRIP_LOOKAHEAD_ROWS = 0
 
         /** Cost per row below which the tile mask cannot repay what it costs to build. */
         private const val STRIP_TILE_MIN_MS = 5.0
@@ -2245,7 +2257,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
          * point's derivative grows, so it never comes near this, and a point that does
          * reach it is inside an attracting cycle's basin and cannot get back out.
          */
-        private const val DER_LIMIT_SQ = 1e-6f
+        private const val DER_LIMIT_SQ = 0f
 
         /** Ceiling on rows per strip draw, whatever the timing suggests. */
         private const val MAX_CHUNK_ROWS = 512
