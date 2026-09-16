@@ -586,6 +586,9 @@ class MainActivity : AppCompatActivity() {
             .create()
         dialog.show()
 
+        // Latest live breakdown, kept so it survives the per-frame reset below.
+        var phaseLine = ""
+
         val progress = object : ExportManager.Progress {
             override fun onProgress(frame: Int, total: Int) {
                 runOnUiThread {
@@ -593,8 +596,23 @@ class MainActivity : AppCompatActivity() {
                     bar.progress = frame * 100 / total.coerceAtLeast(1)
                     // Row detail belongs to the frame being built; once the frame
                     // advances it is stale, so it goes away rather than lingering.
-                    sub.visibility = View.GONE
+                    // The phase breakdown describes a window of frames instead, so it
+                    // stays up until the next one replaces it.
+                    if (phaseLine.isEmpty()) {
+                        sub.visibility = View.GONE
+                    } else {
+                        sub.text = phaseLine
+                        sub.visibility = View.VISIBLE
+                    }
                     subBar.visibility = View.GONE
+                }
+            }
+
+            override fun onPhaseSummary(line: String) {
+                runOnUiThread {
+                    phaseLine = line
+                    sub.text = line
+                    sub.visibility = View.VISIBLE
                 }
             }
 

@@ -41,6 +41,16 @@ class ExportManager(private val view: MandelbrotView) {
         fun onProgress(frame: Int, total: Int)
         /** Strip rows built, for the first frame where that dominates. */
         fun onStripBuild(rowsDone: Int, rowsTarget: Int) {}
+
+        /**
+         * A short breakdown of the frames just rendered, issued periodically.
+         *
+         * The end-of-export summary is no use while an export is still running, and an
+         * export whose cost piles up at one end can leave hours between the slowdown
+         * and any report of it. This describes the recent window only, so it tracks
+         * what the export is doing now rather than its average.
+         */
+        fun onPhaseSummary(line: String) {}
     }
 
     fun savePng(
@@ -280,7 +290,28 @@ class ExportManager(private val view: MandelbrotView) {
                 view.renderer.profReset()
                 val tExport = System.nanoTime()
 
+                // The last stretch is measured on its own as well as in the total.
+                // An export whose cost is concentrated at one end averages out to
+                // nothing useful otherwise: a few hundred expensive frames disappear
+                // behind a few thousand cheap ones, and the summary describes the
+                // cheap ones.
+                // Rolling window for the live summary.
+                var winStart = tExport
+                var winFrame = 0
+                var winProf = view.renderer.profSnapshot()
+                var winPhase = LongArray(4)
+
+                val tailFrom = (total * 4) / 5
+                val tailPhase = LongArray(4)
+                var tailMark: LongArray? = null
+                var tTail = 0L
+
                 for (i in 0 until total) {
+                    if (i == tailFrom) {
+                        tailMark = view.renderer.profSnapshot()
+                        tTail = System.nanoTime()
+                    }
+                    val phaseBefore = if (i >= tailFrom) phaseNs.copyOf() else null
                     frameState.spanY = spanForFrame(snapshot.spanY, settings, i, total)
 
                     if (geom != null) {
@@ -375,6 +406,34 @@ class ExportManager(private val view: MandelbrotView) {
                     }
                     phaseNs[PH_VERIFY] += System.nanoTime() - tCheck
 
+                    if (phaseBefore != null) {
+                        for (k in tailPhase.indices) tailPhase[k] += phaseNs[k] - phaseBefore[k]
+                    }
+
+                    if ((i + 1) % PHASE_REPORT_EVERY == 0) {
+                        val now = System.nanoTime()
+                        val windowS = (now - winStart) / 1e9
+                        val frames = i + 1 - winFrame
+                        val prof = view.renderer.profSnapshot()
+                        if (windowS > 0 && frames > 0) {
+                            val raster = (prof[3] - winProf[3]) / 1e9
+                            val orbit = (prof[0] - winProf[0]) / 1e9
+                            val read = ((phaseNs[PH_UNWARP] - winPhase[PH_UNWARP]) +
+                                (phaseNs[PH_VERIFY] - winPhase[PH_VERIFY])) / 1e9
+                            progress.onPhaseSummary(
+                                "%.1fs/frame · raster %.0f%% · orbit %.0f%% · readback %.0f%%"
+                                    .format(
+                                        windowS / frames,
+                                        100.0 * raster / windowS,
+                                        100.0 * orbit / windowS,
+                                        100.0 * read / windowS
+                                    )
+                            )
+                        }
+                        winStart = now; winFrame = i + 1
+                        winProf = prof; winPhase = phaseNs.copyOf()
+                    }
+
                     for (k in HISTORY - 1 downTo 1) history[k] = history[k - 1]
                     history[0] = sum
 
@@ -445,6 +504,22 @@ class ExportManager(private val view: MandelbrotView) {
                     ))
                     val strip = view.renderer.profReport()
                     if (strip.isNotEmpty()) append("\n").append(strip)
+
+                    val tailCount = total - tailFrom
+                    if (tailMark != null && tailCount > 0) {
+                        val tailS = (System.nanoTime() - tTail) / 1e9
+                        append("\n--- last %d frames only ---\n".format(tailCount))
+                        append("Took %.0fs (%.2fs per frame, %.1fx the overall rate).\n"
+                            .format(tailS, tailS / tailCount,
+                                if (wallS > 0) (tailS / tailCount) / (wallS / total) else 0.0))
+                        for (k in names.indices) {
+                            append("  %-18s %7.1fs  %4.1f%%\n".format(
+                                names[k], tailPhase[k] / 1e9,
+                                if (tailS > 0) 100.0 * tailPhase[k] / 1e9 / tailS else 0.0))
+                        }
+                        val ts = view.renderer.profReport(tailMark)
+                        if (ts.isNotEmpty()) append("\n").append(ts)
+                    }
                 }
                 lastVideoDiag =
                     if (lastVideoDiag.isEmpty()) breakdown
@@ -662,6 +737,12 @@ class ExportManager(private val view: MandelbrotView) {
          * degenerate into a single column.
          */
         private const val VERIFY_STRIDE = 17
+
+        /**
+         * Frames between live breakdowns. Short enough to follow a changing export,
+         * long enough that the numbers are not noise from a single frame.
+         */
+        private const val PHASE_REPORT_EVERY = 20
 
         /** Phase slots for the per-frame export profile. */
         private const val PH_ROWS = 0

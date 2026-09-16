@@ -1076,13 +1076,22 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         }
     }
 
+    /** Current strip profile, for measuring a stretch of an export on its own. */
+    fun profSnapshot(): LongArray = profNs.copyOf()
+
     /** Clears the strip profile. Called when an export starts. */
     fun profReset() {
         for (i in profNs.indices) profNs[i] = 0L
     }
 
-    /** Strip time by category, in seconds with percentages. */
-    fun profReport(): String {
+    /** Strip time by category, in seconds with percentages, optionally since a mark. */
+    fun profReport(since: LongArray? = null): String {
+        val cur = if (since == null) profNs
+        else LongArray(profNs.size) { profNs[it] - since[it] }
+        return profReportOf(cur)
+    }
+
+    private fun profReportOf(profNs: LongArray): String {
         val total = profNs.sum()
         if (total <= 0L) return ""
         val names = arrayOf("orbit + BLA build", "tile mask", "probe readback", "rasterising")
