@@ -119,6 +119,13 @@ class ReferenceOrbit(
         /** How far in this orbit can be zoomed before its digits run short. */
         const val ZOOM_IN_MARGIN = 1e-6
 
+        /**
+         * Furthest a nucleus may sit from centre, as a fraction of the span, to be used
+         * as the reference. Equal to canReuse's 0.7 of a half-span, measured along the
+         * shorter axis, so anything accepted here is also kept there.
+         */
+        const val NUCLEUS_ACCEPT = 0.35
+
         /** Periods beyond this are not worth the Newton cost. */
         private const val MAX_NUCLEUS_PERIOD = 8192
         private const val NEWTON_STEPS = 12
@@ -201,11 +208,20 @@ class ReferenceOrbit(
                 ccy = ccy.subtract(sy, mc)
             }
 
-            // Only worth it if the nucleus is actually in view.
+            // Only worth it if the nucleus is close enough to be kept.
+            //
+            // The bound has to agree with canReuse, which drops a reference further
+            // than 0.7 of a half-span from centre. Accepting a nucleus beyond that
+            // opens a gap: the reference is built, the view rejects it as too far off,
+            // a rebuild is ordered, this finds the same nucleus again, and round it
+            // goes -- a full high-precision orbit per chunk. Zooming in on a point
+            // inside a minibrot but off its nucleus walks straight through that gap,
+            // since the offset is fixed while the span shrinks under it, and stays in
+            // it for about a threefold change of scale.
             val offX = ccx.subtract(cx, mc).toDouble()
             val offY = ccy.subtract(cy, mc).toDouble()
             if (!offX.isFinite() || !offY.isFinite()) return null
-            if (hypot(offX, offY) > spanY) return null
+            if (hypot(offX, offY) > spanY * NUCLEUS_ACCEPT) return null
 
             return arrayOf(ccx, ccy)
         }
