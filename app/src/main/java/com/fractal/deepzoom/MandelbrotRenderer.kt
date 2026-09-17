@@ -2194,7 +2194,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
          * is old, it has never actually executed and has never been exercised against
          * a wrapping ring. Off until the rendering faults are pinned down.
          */
-        private const val STRIP_TILE_MASK = true
+        private const val STRIP_TILE_MASK = false
 
         // --- Bisect switches -------------------------------------------------------
         //
@@ -2209,7 +2209,13 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         // iteration limit. Re-enabling it means making those caches aware that rows
         // can be built early, which is more than a constant.
         //
-        // The tile mask is on; the derivative test stays off. Uniform
+        // The tile mask is off too. With it on, a strip draw failed with
+        // GL_INVALID_VALUE at absolute row 72857 -- far past the ring's 8192 rows --
+        // so the mask path is using an absolute row where it needs one wrapped into
+        // the ring. That only shows once a long export runs past the wrap, which is
+        // why it survived the shorter ones. Off until that indexing is fixed.
+        //
+        // The derivative test stays off as well. Uniform
         // speckle is a per-pixel value error, which a wrong interior verdict produces
         // and a ring fault does not -- a ring fault shows as blocks or bands. So these
         // two are the pair worth having back, and the derivative is the one worth
