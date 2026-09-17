@@ -1680,7 +1680,21 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
             // submission.
             rowsSinceFinish += count
             val pendingMs = rowsSinceFinish * msPerRow
-            if (debugSampling || pendingMs >= SUBMIT_TARGET_MS || msPerRow <= 0.0) {
+            // Also drained on a plain row count, not only on estimated cost.
+            //
+            // The estimate falls to whatever the last measurement said, so one cheap
+            // stretch can put it near the floor. From there the cost-based trigger
+            // cannot be reached in any reasonable number of rows, so no drain happens,
+            // so nothing re-measures it and it stays there. The estimate latches low
+            // and the accounting below goes blind: work still happens, but it is never
+            // added to any category, which is how a strip total ends up a hundredth of
+            // the wall time spent producing it.
+            //
+            // A row-count trigger cannot latch, because it does not depend on the
+            // number it is there to correct.
+            if (debugSampling || pendingMs >= SUBMIT_TARGET_MS ||
+                rowsSinceFinish >= MAX_ROWS_PER_DRAIN || msPerRow <= 0.0
+            ) {
                 GLES31.glFinish()
                 // Only the rasterisation part of the interval is per-row cost. Orbit
                 // builds, row probes and the tile mask are timed separately and taken
@@ -2180,7 +2194,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
          * is old, it has never actually executed and has never been exercised against
          * a wrapping ring. Off until the rendering faults are pinned down.
          */
-        private const val STRIP_TILE_MASK = false
+        private const val STRIP_TILE_MASK = true
 
         // --- Bisect switches -------------------------------------------------------
         //
@@ -2188,8 +2202,18 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         // only how fast it gets there. Each is disabled by a single value here, so a
         // rendering fault can be attributed without unpicking anything:
         //
-        // All three are currently off, which should render exactly as the project did
-        // before any of them existed:
+        // Lookahead is off: renderRows keeps two monotone probe caches that assume
+        // rows arrive in order, and stripNonInteriorFrom is set with min(), so probing
+        // rows far ahead of the frame switches interior detection off for everything
+        // above them. Solid interior rows then get shaded pixel by pixel to the
+        // iteration limit. Re-enabling it means making those caches aware that rows
+        // can be built early, which is more than a constant.
+        //
+        // The tile mask is on; the derivative test stays off. Uniform
+        // speckle is a per-pixel value error, which a wrong interior verdict produces
+        // and a ring fault does not -- a ring fault shows as blocks or bands. So these
+        // two are the pair worth having back, and the derivative is the one worth
+        // suspecting:
         //
         //   STRIP_LOOKAHEAD_ROWS   512 builds rows ahead of the asking frame. Fewer
         //                          pipeline drains; more of the ring in use at once.
@@ -2267,6 +2291,15 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
          * reach it is inside an attracting cycle's basin and cannot get back out.
          */
         private const val DER_LIMIT_SQ = 0f
+
+        /**
+         * Rows after which the pipeline is drained regardless of estimated cost.
+         *
+         * Sets a floor on how often the estimate is refreshed and the profile updated.
+         * Large enough that a drain costs little against the work it covers, small
+         * enough that a whole export cannot pass without several.
+         */
+        private const val MAX_ROWS_PER_DRAIN = 256
 
         /** Ceiling on rows per strip draw, whatever the timing suggests. */
         private const val MAX_CHUNK_ROWS = 512
