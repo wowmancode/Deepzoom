@@ -51,9 +51,6 @@ class ExportManager(private val view: MandelbrotView) {
          * what the export is doing now rather than its average.
          */
         fun onPhaseSummary(line: String) {}
-
-        /** Called when the export stops and starts again, so the UI can say so. */
-        fun onPaused(paused: Boolean) {}
     }
 
     fun savePng(
@@ -99,7 +96,6 @@ class ExportManager(private val view: MandelbrotView) {
         val snapshot = view.state.snapshot()
         val total = frameCount(snapshot.spanY, settings)
         lastVideoDiag = ""
-        paused = false
 
         view.queueEvent {
             var uri: Uri? = null
@@ -304,35 +300,13 @@ class ExportManager(private val view: MandelbrotView) {
                 var winFrame = 0
                 var winProf = view.renderer.profSnapshot()
                 var winPhase = LongArray(4)
-                var winPaused = 0L
 
                 val tailFrom = (total * 4) / 5
                 val tailPhase = LongArray(4)
                 var tailMark: LongArray? = null
                 var tTail = 0L
 
-                var pausedNs = 0L
-                var tailPausedNs = 0L
-
                 for (i in 0 until total) {
-                    if (paused) {
-                        val pStart = System.nanoTime()
-                        progress.onPaused(true)
-                        while (paused) {
-                            try {
-                                Thread.sleep(150)
-                            } catch (e: InterruptedException) {
-                                Thread.currentThread().interrupt()
-                                break
-                            }
-                        }
-                        progress.onPaused(false)
-                        val waited = System.nanoTime() - pStart
-                        pausedNs += waited
-                        winPaused += waited
-                        if (i >= tailFrom) tailPausedNs += waited
-                    }
-
                     if (i == tailFrom) {
                         tailMark = view.renderer.profSnapshot()
                         tTail = System.nanoTime()
@@ -438,7 +412,7 @@ class ExportManager(private val view: MandelbrotView) {
 
                     if ((i + 1) % PHASE_REPORT_EVERY == 0) {
                         val now = System.nanoTime()
-                        val windowS = (now - winStart - winPaused) / 1e9
+                        val windowS = (now - winStart) / 1e9
                         val frames = i + 1 - winFrame
                         val prof = view.renderer.profSnapshot()
                         if (windowS > 0 && frames > 0) {
@@ -457,7 +431,7 @@ class ExportManager(private val view: MandelbrotView) {
                             )
                         }
                         winStart = now; winFrame = i + 1
-                        winProf = prof; winPhase = phaseNs.copyOf(); winPaused = 0L
+                        winProf = prof; winPhase = phaseNs.copyOf()
                     }
 
                     for (k in HISTORY - 1 downTo 1) history[k] = history[k - 1]
@@ -509,7 +483,7 @@ class ExportManager(private val view: MandelbrotView) {
                     view.renderer.readbackHealth,
                     minChanged, minChangedAt, lagHit, lagHitAt
                 )
-                val wallS = (System.nanoTime() - tExport - pausedNs) / 1e9
+                val wallS = (System.nanoTime() - tExport) / 1e9
                 val names = arrayOf(
                     "building rows", "unwarp + readback", "checksum + diff", "encode wait"
                 )
@@ -533,7 +507,7 @@ class ExportManager(private val view: MandelbrotView) {
 
                     val tailCount = total - tailFrom
                     if (tailMark != null && tailCount > 0) {
-                        val tailS = (System.nanoTime() - tTail - tailPausedNs) / 1e9
+                        val tailS = (System.nanoTime() - tTail) / 1e9
                         append("\n--- last %d frames only ---\n".format(tailCount))
                         append("Took %.0fs (%.2fs per frame, %.1fx the overall rate).\n"
                             .format(tailS, tailS / tailCount,
@@ -586,17 +560,6 @@ class ExportManager(private val view: MandelbrotView) {
     @Volatile
     var lastVideoDiag: String = ""
         private set
-
-    /**
-     * Set from the UI to hold the export where it is.
-     *
-     * The render loop runs on the GL thread, so it waits in place rather than
-     * unwinding: nothing is torn down, no frame is half-written, and the encoder keeps
-     * whatever it already has. Time spent waiting is tracked and taken out of the
-     * report, so a long pause does not masquerade as slow rendering.
-     */
-    @Volatile
-    var paused: Boolean = false
 
     /**
      * Order-sensitive checksum of one rendered frame.

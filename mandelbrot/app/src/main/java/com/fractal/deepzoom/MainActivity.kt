@@ -586,13 +586,6 @@ class MainActivity : AppCompatActivity() {
             .create()
         dialog.show()
 
-        val pause = content.findViewById<Button>(R.id.p_pause)
-        pause.visibility = View.VISIBLE
-        pause.setOnClickListener {
-            exporter.paused = !exporter.paused
-            pause.text = if (exporter.paused) "Resume" else "Pause"
-        }
-
         // Latest live breakdown, kept so it survives the per-frame reset below.
         var phaseLine = ""
 
@@ -620,14 +613,6 @@ class MainActivity : AppCompatActivity() {
                     phaseLine = line
                     sub.text = line
                     sub.visibility = View.VISIBLE
-                }
-            }
-
-            override fun onPaused(paused: Boolean) {
-                runOnUiThread {
-                    // The frame line is restored by the next onProgress, so pausing
-                    // only borrows it.
-                    if (paused) label.text = "Paused - tap Resume to continue"
                 }
             }
 

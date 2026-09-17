@@ -1,0 +1,62 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+  # Lets you trigger a build by hand from the Actions tab, which is the practical
+  # way to rebuild from a phone without pushing a dummy commit.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # Provides the `gradle` CLI and handles dependency caching between runs.
+      # This is also why no Gradle wrapper JAR needs to be committed to the repo.
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Accept Android SDK licences
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Build debug APK
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      # Available from the run summary page, but downloads as a .zip.
+      - name: Upload APK as build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deepzoom-debug
+          path: app/build/outputs/apk/debug/*.apk
+          retention-days: 30
+
+      # The release asset downloads as a raw .apk, so tapping the link on your phone
+      # goes straight to Android's installer with no unzipping step.
+      - name: Publish to rolling "latest" release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          APK=$(find app/build/outputs/apk/debug -name '*.apk' | head -n1)
+          mv "$APK" deepzoom.apk
+
+          # Recreate the tag each run so the release always points at this build.
+          gh release delete latest --yes --cleanup-tag 2>/dev/null || true
+          gh release create latest deepzoom.apk \
+            --title "Latest debug build" \
+            --notes "Debug APK from commit ${GITHUB_SHA:0:7}. Debug-signed: fine for sideloading, not for distribution." \
+            --prerelease

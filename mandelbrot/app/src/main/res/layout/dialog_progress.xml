@@ -39,17 +39,4 @@
         android:layout_height="wrap_content"
         android:max="100"
         android:visibility="gone" />
-    <!-- Pause lives in the layout rather than as a dialog button, because a dialog
-         button dismisses the dialog and this one must leave it standing. Hidden
-         unless the caller shows it, so the image export dialog is unchanged. -->
-    <Button
-        android:id="@+id/p_pause"
-        style="?android:attr/borderlessButtonStyle"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_gravity="end"
-        android:text="Pause"
-        android:textColor="#7FA6D8"
-        android:textSize="14sp"
-        android:visibility="gone" />
 </LinearLayout>
