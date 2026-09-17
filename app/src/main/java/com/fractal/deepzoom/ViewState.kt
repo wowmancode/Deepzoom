@@ -84,7 +84,23 @@ class ViewState {
         const val DIRECT_LIMIT = 1e-4
 
         private const val LN2 = 0.6931471805599453
-        private const val TARGET_EXPONENT = 80
+        /**
+         * Where the view's half-diagonal sits, as a power of two, in scaled units.
+         *
+         * This is the only thing standing between the renderer and another eight
+         * decades of depth, and it was set with far more room than it needs. It has to
+         * leave a pixel's delta a normal float: a pixel sits this many powers below one,
+         * plus the log of the grid width, and 2^-126 is where normals end. At 80, with
+         * a 4096-wide strip, a pixel landed at 2^-92 -- thirty-four powers of spare
+         * range that no pixel was ever going to use.
+         *
+         * At 108 a pixel lands at 2^-120, six powers clear, and the floor moves from
+         * 6.2e-61 to 2.3e-69. The top end is untouched: that is MAX_SCALE_EXP's
+         * business, and it is genuinely at its limit.
+         *
+         * tools/validate_exponent_budget.py works both ends out.
+         */
+        private const val TARGET_EXPONENT = 108
         private const val SCALE_QUANTUM = 8
 
         // 2^118 leaves headroom for the squared term at bailout magnitude without
