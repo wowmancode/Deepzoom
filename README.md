@@ -69,19 +69,29 @@ colour detail on the finest filaments.
 
 ## How deep it goes
 
-Roughly **1e60**, set by float32's exponent range rather than by precision.
+About **1e-290**, set by the doubles the CPU side uses for the span, the offset from
+the reference and the BLA radii. The GPU side no longer sets a limit.
 
-Two rendering paths, switched automatically and shown in the readout:
+Three rendering paths, switched automatically and shown in the readout:
 
-- **direct** — above 1e-4 span. Plain float32 iteration, with analytic cardioid and
-  period-2 bulb tests to skip the two largest interior regions.
-- **perturbed** — below 1e-4 span. Each pixel iterates its offset from a shared
-  reference orbit.
+- **direct** — while float32 can still tell neighbouring pixels apart. Plain float32
+  iteration, with analytic cardioid and period-2 bulb tests to skip the two largest
+  interior regions.
+- **perturbed** — once a pixel is narrower than four float steps at the view's
+  coordinates, and always below 1e-4 span. Each pixel iterates its offset from a
+  shared reference orbit.
+- **rescaled** — below 2.3e-69, where the perturbed path's one shared delta scale
+  runs out. Each pixel carries its own exponent; see *Past 1e-69* below.
+
+The switch is measured in pixels, not span: at 1e-4 across 2400 rows a pixel is about
+4e-8 wide, while a float near -1.75 steps by 1.2e-7, so three pixels would share one c.
+On a phone screen perturbation now takes over around 5e-4, and an 8640p export
+switches earlier still.
 
 ### How perturbation works here
 
-The CPU iterates one point in `BigDecimal` at whatever precision the current depth
-needs (`30 + decades` digits). Those orbit values are O(1), so they ship to the GPU
+The CPU iterates one point in fixed-point arithmetic (`FixedPoint.kt`) at whatever
+precision the current depth needs (`30 + decades` digits). Those orbit values are O(1), so they ship to the GPU
 as plain floats in an `RG32F` texture. Each pixel then iterates its *offset* from
 that orbit:
 
@@ -133,11 +143,28 @@ Measured against high-precision ground truth, in loop iterations per pixel:
 
 The speedup grows with depth, which is the opposite of how the naive loop behaves.
 
-**Orbit reuse** is the one you feel while browsing. The reference orbit costs roughly
-300 ms per 65536 iterations on a desktop JVM and worse on a phone, and precision barely
-affects that — 40 digits and 150 digits are within 15% of each other, because the cost
-is allocation, not arithmetic. So the answer is not a faster orbit but fewer of them.
-The orbit is now decoupled from zoom entirely:
+**Reference cost.** The orbit used to be iterated in `BigDecimal`, at roughly 300 ms
+per 65536 iterations on a desktop JVM. That cost was allocation and decimal rounding,
+not arithmetic, so it is now plain fixed-point: 28-bit limbs in preallocated arrays,
+with two guard limbs, and no allocation per step. Measured on a desktop JVM against
+the old code, 8–12x faster for a full-length orbit from 1e-20 to 1e-65, matching
+3x-precision ground truth to the last bit of a double.
+
+**Nucleus references stop at one period.** When the reference is a minibrot nucleus
+its orbit returns to zero after one period, and the shader already rebases a pixel
+at the end of the stored orbit, carrying its full value — which is exact at any
+index. So only one period is computed and stored. A period-8007 nucleus under a
+65536-iteration limit is an eighth of the orbit, and a smaller BLA table with it.
+Checked by running the shader's loop against both orbits: identical escape counts
+on every pixel, and both match arbitrary-precision truth.
+
+The nucleus search itself stops Newton once its step falls below 1e-20 of the span
+rather than always running twelve full periods, and carries the Newton derivative in
+doubles with its own exponent (it only sets the step; the iterate keeps full
+precision). Together with fixed-point, `findNucleus` went from about 400 ms to about
+10 ms on a desktop JVM, and the orbit behind it from about 160 ms to about 3 ms.
+
+**Orbit reuse** is the other half. The orbit is decoupled from zoom entirely:
 
 - Zooming **out** never rebuilds. The orbit has more digits than it needs.
 - Zooming **in** reuses it for six decades, on the guard digits it was built with.
@@ -295,6 +322,13 @@ It is what the epsilon choice above is based on, and it is worth re-running if t
 table construction or the shader loop is ever changed — a wrong merge formula produces
 images that look plausible rather than obviously broken.
 
+`tools/fixedpoint/run.sh` checks the fixed-point orbit against arbitrary-precision
+ground truth — full precision on the first iterates, double precision over thousands
+— confirms that `extendTo` agrees with computing the longer orbit directly, and runs
+the shader's perturbation loop against full and period-truncated nucleus orbits to
+confirm they give identical escape counts. Deliberately dropping a product column or
+a doubling makes it fail.
+
 `tools/harness/verify.sh` type-checks the whole Kotlin source set against a real
 `android.jar` plus signature-only stubs for AppCompat, Material and the generated `R`,
 then compiles every shader with `glslangValidator`. No Android SDK or Gradle needed.
@@ -317,12 +351,55 @@ inside the deliberate hold at the end are ignored; anything else is reported in 
 dialog on save. It costs one pass over the frame buffer, and it splits a freeze in the
 renderer from one downstream of it without needing logcat.
 
-### Going deeper than 1e60
+### Past 1e-69: rescaled perturbation
 
-The limit is float32 exponent range, not the algorithm. Past this point deltas need
-a **floatexp** representation — mantissa plus a separate integer exponent — which
-removes the range ceiling entirely at some cost in shader speed.
+The perturbed path carries every delta as a float in units of one shared 2^k, and k
+is capped because the reference orbit and the bailout live in the same units. Around
+2.3e-69 no single k can hold both a pixel's starting delta and what it grows into
+before escaping.
 
-The other worthwhile addition is **series approximation**: a truncated power series
-can skip the first several thousand iterations for most pixels, which is what makes
-very deep zooms fast rather than merely possible.
+Below that, a separate shader takes over. Each pixel's delta is `w * 2^e`: `w` a
+float mantissa held in [1, 2) by max-norm, `e` a per-pixel int. The reference stays a
+plain float, since it is O(1). Each step is formed as terms whose exponents are known
+— `2Z*dz` at `e`, `dz^2` at `2e`, `dc` at its own fixed exponent — and they are scaled
+to the largest before adding. The result therefore never underflows even when it is
+far smaller than the delta it came from, as on the step after a rebase, where Z is
+zero and the new value is `dz^2 + dc`. Powers of two are built from their bits rather
+than with `exp2`, so every rescale is exact. BLA radii are stored as log2, because at
+these depths they span far more than float's range, so validity is one compare
+against `e + log2|w|`.
+
+Above 2.3e-69 nothing changes: the fast shader is used exactly as before, and this one
+is never compiled into its loop.
+
+**Checked by emulation** (`tools/rescaled/run.sh`). The GLSL is ported line for line
+to Kotlin `Float`, which is IEEE float32 as the GPU's highp is. It uses the app's own
+orbit, nucleus and BLA code, and runs every case twice, with denormals kept and
+flushed, since mobile GPUs flush them.
+
+- Where both shaders apply, the rescaled one reproduces the fast one pixel for pixel,
+  on views around c = i and around period-45 and period-59 minibrots.
+- Below the old floor it matches arbitrary-precision truth: views around c = i at
+  1e-100, 1e-200 and 1e-285, and framed on minibrots of period 107 (5e-80) and
+  period 159 (4e-119), with nucleus references and up to 264 distinct escape counts
+  in a 20x20 grid.
+- Planting an error in the step, doubling the `dz^2` term, makes it fail.
+
+Neither shader matches truth on every pixel near a minibrot's edge. At escape counts
+in the thousands, float32 perturbation puts about one pixel in a hundred off by more
+than an iteration. The fast shader does the same on the same kind of view, and the
+identical algorithm in double matches truth exactly, so that is float32, not the
+rescaling.
+
+**Cost.** The rescaled step does more integer and scaling work than the fast one,
+roughly 2–3x the ALU per plain iteration, which is the repo's own earlier estimate for
+floatexp. At these depths most of a pixel's iterations are BLA jumps, and those cost
+only a little more than before. The reference orbit at 315 digits (1e-285) takes
+about 160 ms for 65536 iterations on a desktop JVM, and the nucleus search about 30 ms.
+
+**The next limit** is the CPU's doubles. The span, offsets and BLA radii are all
+doubles, which end at 2.2e-308, and the floor sits about eighteen decades short of
+that. Going further would mean carrying those as mantissa-plus-exponent too.
+
+Series approximation is not planned. BLA already covers what it would skip: about
+ten loop iterations per pixel at 1e-55.

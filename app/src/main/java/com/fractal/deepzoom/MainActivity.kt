@@ -120,7 +120,11 @@ class MainActivity : AppCompatActivity() {
 
     @SuppressLint("SetTextI18n")
     private fun updateReadout() {
-        val mode = if (view.state.needsPerturbation()) "perturbed" else "direct"
+        val mode = when {
+            !view.state.needsPerturbation(view.height) -> "direct"
+            view.state.needsRescaled() -> "rescaled"
+            else -> "perturbed"
+        }
         val res = when (view.finestLevel) {
             0 -> "native"
             1 -> "1/2"

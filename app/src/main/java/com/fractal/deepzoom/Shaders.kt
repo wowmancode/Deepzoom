@@ -393,6 +393,254 @@ object Shaders {
         }
     """.trimIndent()
 
+    /**
+     * Perturbation past the reach of one shared delta scale: each pixel carries its
+     * own binary exponent.
+     *
+     * The fast core keeps every delta as a float in units of one global 2^k. That k
+     * is capped, because the reference orbit and the bailout are held in the same
+     * units, and past about 1e-69 no k can hold both a pixel's starting delta and what
+     * it grows into. Here the delta is w * 2^e: w is a float mantissa kept in [1, 2)
+     * by max-norm, e an int per pixel. The reference Z stays a plain float, because it
+     * is O(1).
+     *
+     * Each step is formed as a sum of terms whose exponents are known -- 2Z*dz at e,
+     * dz^2 at 2e, dc at ec -- scaled to the largest before adding. So the result never
+     * underflows even when it is far smaller than the delta it came from, which is
+     * exactly what happens on the step after a rebase, where Z is zero and the new
+     * value is dz^2 + dc. Measuring the terms and scaling to the largest costs more
+     * ALU than the fast core, which is why this is a separate program used only below
+     * the fast core's floor.
+     *
+     * BLA radii arrive as log2 of the true radius, so validity is one compare against
+     * e + log2|w|.
+     */
+    private val PERTURB_RESCALED_CORE = """
+        uniform sampler2D uOrbit;
+        uniform sampler2D uBlaAB;
+        uniform sampler2D uBlaR;
+
+        uniform int   uWidthMask;
+        uniform int   uWidthShift;
+        uniform int   uOrbitLen;
+
+        uniform int   uBlaLevels;
+        uniform int   uBlaOffset[24];
+        uniform int   uBlaCount[24];
+
+        uniform vec2  uDeltaCenter;    // (view centre - reference) * 2^uScaleExp
+        uniform float uPixelSpan;      // complex units per pixel * 2^uScaleExp
+        uniform int   uScaleExp;
+        uniform float uDerLimit;
+        uniform float uBailout;        // unscaled
+
+        vec2 fetchZ(int i) {
+            return texelFetch(uOrbit, ivec2(i & uWidthMask, i >> uWidthShift), 0).rg;
+        }
+        vec4 fetchAB(int i) {
+            return texelFetch(uBlaAB, ivec2(i & uWidthMask, i >> uWidthShift), 0);
+        }
+        float fetchR(int i) {
+            return texelFetch(uBlaR, ivec2(i & uWidthMask, i >> uWidthShift), 0).r;
+        }
+
+        int blaMaxLevel(int m, int n) {
+            int a = m - 1;
+            int k = uBlaLevels - 1;
+            if (a != 0) k = min(k, findLSB(a));
+            for (int i = 0; i < 24; i++) {
+                if (k < 0) break;
+                if (n + (1 << k) <= uMaxIter && (a >> k) < uBlaCount[k]) break;
+                k--;
+            }
+            return k;
+        }
+
+        // Binary exponent of a non-negative float: x in [2^k, 2^(k+1)). Read straight
+        // from the bits, so it is exact and cheap. Zero gives -127, below any real term.
+        int expOf(float x) {
+            return ((floatBitsToInt(x) >> 23) & 255) - 127;
+        }
+
+        // 2^k built from its bits: exact, unlike exp2(), for k in [-126, 127].
+        float pow2(int k) {
+            return intBitsToFloat((k + 127) << 23);
+        }
+
+        // x * 2^k in two exact halves, so shifts up to 252 either way never form an
+        // out-of-range power. Every call here shifts a term down to the largest one,
+        // so a shift past -252 is a term far below float precision, and 0 is right.
+        vec2 scaleBy(vec2 x, int k) {
+            k = clamp(k, -252, 252);
+            int h = k >> 1;
+            return (x * pow2(h)) * pow2(k - h);
+        }
+
+        float maxAbs(vec2 v) {
+            return max(abs(v.x), abs(v.y));
+        }
+
+        // Radii are stored as log2(0.7 * r); the 0.7 is the same max-norm allowance
+        // the fast core applies. A disabled entry holds -1e30, below any real delta.
+        bool blaValid(int k, int m, float logDz) {
+            return logDz < fetchR(uBlaOffset[k] + ((m - 1) >> k));
+        }
+
+        bool escapesOffset(vec2 off, out int outN, out vec2 outZ) {
+            // dc = u * 2^ec, fixed for the pixel.
+            vec2 u = uDeltaCenter + off;
+            int ec = -uScaleExp;
+            int eu = ec + expOf(maxAbs(u));
+            outN = uMaxIter;
+            outZ = vec2(0.0);
+
+            // dz = w * 2^e, with |w| in [1, 2) whenever dz is non-zero.
+            vec2 w = vec2(0.0);
+            int e = ec;
+            int m = 0;
+            int n = 0;
+            vec2 t = fetchZ(0);
+            int kWarm = 0;
+
+            // The full state is (w, e, m): an exact repeat of all three is a cycle of
+            // the computed iteration, so it provably never escapes.
+            vec2 hareW = vec2(0.0);
+            int hareE = 0;
+            int hareM = -1;
+            int period = 1;
+            int periodLimit = 1;
+
+            vec2 der = vec2(1.0, 0.0);
+
+            while (n < uMaxIter) {
+                float wMag = maxAbs(w);
+                float logDz = wMag > 0.0 ? float(e) + log2(wMag) : -1.0e20;
+
+                int skip = 0;
+                int chosen = -1;
+                if (m >= 1) {
+                    int kMax = blaMaxLevel(m, n);
+                    if (kMax >= 0) {
+                        int k = clamp(kWarm, 0, kMax);
+                        if (blaValid(k, m, logDz)) {
+                            for (int i = 0; i < 24; i++) {
+                                if (k >= kMax || !blaValid(k + 1, m, logDz)) break;
+                                k++;
+                            }
+                            skip = 1 << k;
+                            chosen = uBlaOffset[k] + ((m - 1) >> k);
+                        } else {
+                            for (int i = 0; i < 24; i++) {
+                                if (k <= 0) break;
+                                k--;
+                                if (blaValid(k, m, logDz)) {
+                                    skip = 1 << k;
+                                    chosen = uBlaOffset[k] + ((m - 1) >> k);
+                                    break;
+                                }
+                            }
+                            if (chosen < 0) k = 0;
+                        }
+                        kWarm = k;
+                    }
+                }
+
+                if (chosen >= 0) {
+                    // dz' = A dz + B dc
+                    vec4 ab = fetchAB(chosen);
+                    if (n >= 1) der = cmul(der, ab.xy);
+                    vec2 aw = cmul(ab.xy, w);
+                    vec2 bu = cmul(ab.zw, u);
+                    int E = max(e + expOf(maxAbs(aw)), ec + expOf(maxAbs(bu)));
+                    w = scaleBy(aw, e - E) + scaleBy(bu, ec - E);
+                    e = E;
+                    n += skip;
+                    m += skip;
+                } else {
+                    // dz' = 2Z dz + dz^2 + dc. t is 2Z; 2*dz is w * 2^(e+1).
+                    if (n >= 1) der = cmul(der, t + scaleBy(w, e + 1));
+                    vec2 tw = cmul(t, w);
+                    vec2 ww = cmul(w, w);
+                    int E = max(max(e + expOf(maxAbs(tw)), 2 * e + expOf(maxAbs(ww))), eu);
+                    w = scaleBy(tw, e - E) + scaleBy(ww, 2 * e - E) + scaleBy(u, ec - E);
+                    e = E;
+                    n++;
+                    m++;
+                }
+
+                // Back to [1, 2), so every magnitude estimate above stays within a
+                // factor of two.
+                float mx = maxAbs(w);
+                if (mx > 0.0) {
+                    int k = expOf(mx);
+                    w = scaleBy(w, -k);
+                    e += k;
+                }
+
+                if (dot(der, der) < uDerLimit) return false;
+
+                t = fetchZ(m);
+                vec2 Z = 0.5 * t;
+
+                // Full value. When dz is far below Z the scaled term is zero and this
+                // is Z itself, which is exact to float precision.
+                vec2 zf = Z + scaleBy(w, e);
+                if (maxAbs(zf) > uBailout) {
+                    outN = n;
+                    outZ = zf;
+                    return true;
+                }
+
+                // Rebase when the full value is smaller than the delta, or at the end
+                // of the stored orbit. Compared in the delta's own units unless Z is so
+                // much larger that no rebase is possible -- then, if one is forced, the
+                // full value is Z to float precision.
+                bool forced = m >= uOrbitLen;
+                bool rebase = false;
+                float zM = maxAbs(Z);
+                if (zM > 0.0 && expOf(zM) > e + 30) {
+                    if (forced) {
+                        w = Z;
+                        e = 0;
+                        rebase = true;
+                    }
+                } else {
+                    vec2 zw = w + scaleBy(Z, -e);
+                    if (forced || maxAbs(zw) < maxAbs(w)) {
+                        w = zw;
+                        rebase = true;
+                    }
+                }
+                if (rebase) {
+                    float rm = maxAbs(w);
+                    if (rm > 0.0) {
+                        int k = expOf(rm);
+                        w = scaleBy(w, -k);
+                        e += k;
+                    }
+                    m = 0;
+                    t = fetchZ(0);
+                    kWarm = 0;
+                }
+
+                if (w == hareW && e == hareE && m == hareM) return false;
+                period--;
+                if (period == 0) {
+                    hareW = w;
+                    hareE = e;
+                    hareM = m;
+                    periodLimit *= 2;
+                    period = periodLimit;
+                }
+            }
+            return false;
+        }
+
+        bool escapes(vec2 frag, out int outN, out vec2 outZ) {
+            return escapesOffset((frag - 0.5 * uResolution) * uPixelSpan, outN, outZ);
+        }
+    """.trimIndent()
+
     private val MAIN_BODY = """
         void main() {
             if (tileIsSolid()) {
@@ -549,6 +797,12 @@ object Shaders {
     val PERTURB_STRIP = "#version 310 es\n$COMMON\n$PERTURB_CORE\n$STRIP_BODY"
     val DIRECT_STRIP_TILE = "#version 310 es\n$COMMON\n$DIRECT_CORE\n$STRIP_TILE_BODY"
     val PERTURB_STRIP_TILE = "#version 310 es\n$COMMON\n$PERTURB_CORE\n$STRIP_TILE_BODY"
+
+    // The same four entry points on the rescaled core, used below ViewState.FAST_MIN_SPAN.
+    val RESCALED = "#version 310 es\n$COMMON\n$PERTURB_RESCALED_CORE\n$MAIN_BODY"
+    val RESCALED_TILE = "#version 310 es\n$COMMON\n$PERTURB_RESCALED_CORE\n$TILE_BODY"
+    val RESCALED_STRIP = "#version 310 es\n$COMMON\n$PERTURB_RESCALED_CORE\n$STRIP_BODY"
+    val RESCALED_STRIP_TILE = "#version 310 es\n$COMMON\n$PERTURB_RESCALED_CORE\n$STRIP_TILE_BODY"
 
     /**
      * Presents an already-rendered frame, optionally reprojected.

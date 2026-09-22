@@ -18,12 +18,19 @@ class OrbitGpuData(
     val points: Int,
     val bla: BlaTable?,
     val scaleExp: Int,
-    val maxC: Double
+    val maxC: Double,
+    /** Built for the rescaled shader: BLA radii are logs. See ViewState.needsRescaled. */
+    val rescaled: Boolean = false
 ) {
     val scale: Double get() = 2.0.pow(scaleExp)
 
     companion object {
-        fun build(orbit: ReferenceOrbit, scaleExp: Int, maxC: Double): OrbitGpuData {
+        fun build(
+            orbit: ReferenceOrbit,
+            scaleExp: Int,
+            maxC: Double,
+            rescaled: Boolean = false
+        ): OrbitGpuData {
             val scale = 2.0.pow(scaleExp)
             val points = orbit.count + 1
             val packed = FloatArray(points * 2)
@@ -45,8 +52,8 @@ class OrbitGpuData(
 
             return OrbitGpuData(
                 packed, points,
-                BlaTable.build(orbit, maxC, scale),
-                scaleExp, maxC
+                BlaTable.build(orbit, maxC, scale, logRadius = rescaled),
+                scaleExp, maxC, rescaled
             )
         }
     }

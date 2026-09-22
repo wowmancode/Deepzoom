@@ -42,7 +42,14 @@ class BlaTable(
     val levelOffset: IntArray,
     val levelCount: IntArray,
     val levels: Int,
-    val total: Int
+    val total: Int,
+    /**
+     * True when `radius` holds log2 of the true radius (times the 0.7 max-norm
+     * allowance) instead of the radius times the delta scale. The rescaled shader
+     * needs this: at its depths the radii run from about 1e-14 down past 1e-300, far
+     * wider than any single float scale can hold, while their logs are small numbers.
+     */
+    val logRadius: Boolean = false
 ) {
     companion object {
         /**
@@ -66,7 +73,18 @@ class BlaTable(
 
         const val MAX_LEVELS = 24
 
-        fun build(orbit: ReferenceOrbit, maxC: Double, scale: Double): BlaTable? {
+        /** Stored for an unusable entry in log form; no finite delta is below it. */
+        const val LOG_RADIUS_NEVER = -1.0e30f
+
+        /** The max-norm allowance the fast shader applies at runtime, as a log. */
+        private val LOG2_MAXNORM = kotlin.math.ln(0.7) / kotlin.math.ln(2.0)
+
+        fun build(
+            orbit: ReferenceOrbit,
+            maxC: Double,
+            scale: Double,
+            logRadius: Boolean = false
+        ): BlaTable? {
             // Level 0 starts at iteration 1: iteration 0 sits on the critical point,
             // where the validity radius is always zero.
             val count0 = orbit.count - 1
@@ -144,7 +162,7 @@ class BlaTable(
             for (i in 0 until total) {
                 val a = hypot(ax[i], ay[i])
                 val b = hypot(bx[i], by[i])
-                val rScaled = rr[i] * scale
+                val rScaled = if (logRadius) rr[i] else rr[i] * scale
 
                 // Coefficients grow without bound as levels merge. Where they leave
                 // float range the entry is simply disabled: its radius would have been
@@ -159,16 +177,20 @@ class BlaTable(
                     ab[o + 1] = ay[i].toFloat()
                     ab[o + 2] = bx[i].toFloat()
                     ab[o + 3] = by[i].toFloat()
-                    radius[i] = rScaled.toFloat()
+                    radius[i] = if (logRadius) {
+                        (kotlin.math.ln(rScaled) / kotlin.math.ln(2.0) + LOG2_MAXNORM).toFloat()
+                    } else {
+                        rScaled.toFloat()
+                    }
                 } else {
-                    radius[i] = 0f
+                    radius[i] = if (logRadius) LOG_RADIUS_NEVER else 0f
                 }
             }
 
             return BlaTable(
                 ab, radius, offsets,
                 IntArray(levels) { counts[it] },
-                levels, total
+                levels, total, logRadius
             )
         }
 

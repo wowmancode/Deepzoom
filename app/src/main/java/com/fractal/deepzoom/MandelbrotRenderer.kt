@@ -10,6 +10,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
+import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.max
 import kotlin.math.hypot
@@ -40,6 +41,16 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
     private var perturbStripProgram = 0
     private var directStripTileProgram = 0
     private var perturbStripTileProgram = 0
+
+    // Rescaled counterparts, used when the bundle is built below ViewState.FAST_MIN_SPAN.
+    private var rescaledProgram = 0
+    private var rescaledTileProgram = 0
+    private var rescaledStripProgram = 0
+    private var rescaledStripTileProgram = 0
+    private val rescaled = HashMap<String, Int>()
+    private val rescaledTile = HashMap<String, Int>()
+    private val rescaledStrip = HashMap<String, Int>()
+    private val rescaledStripTile = HashMap<String, Int>()
     private val directStripTile = HashMap<String, Int>()
     private val perturbStripTile = HashMap<String, Int>()
     private var stripTileTex = 0
@@ -177,6 +188,15 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         perturbStripTileProgram = buildProgram(Shaders.VERTEX, Shaders.PERTURB_STRIP_TILE)
         cacheUniforms(directStripTileProgram, directStripTile, *DIRECT_UNIFORMS)
         cacheUniforms(perturbStripTileProgram, perturbStripTile, *PERTURB_UNIFORMS)
+
+        rescaledProgram = buildProgram(Shaders.VERTEX, Shaders.RESCALED)
+        rescaledTileProgram = buildProgram(Shaders.VERTEX, Shaders.RESCALED_TILE)
+        rescaledStripProgram = buildProgram(Shaders.VERTEX, Shaders.RESCALED_STRIP)
+        rescaledStripTileProgram = buildProgram(Shaders.VERTEX, Shaders.RESCALED_STRIP_TILE)
+        cacheUniforms(rescaledProgram, rescaled, *PERTURB_UNIFORMS)
+        cacheUniforms(rescaledTileProgram, rescaledTile, *PERTURB_UNIFORMS)
+        cacheUniforms(rescaledStripProgram, rescaledStrip, *PERTURB_UNIFORMS)
+        cacheUniforms(rescaledStripTileProgram, rescaledStripTile, *PERTURB_UNIFORMS)
 
         unwarpProgram = buildProgram(Shaders.VERTEX, Shaders.UNWARP)
         cacheUniforms(unwarpProgram, unwarp,
@@ -419,7 +439,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         // pass can fill them without iterating. Only worth it once the frame is big
         // enough that the perimeter is a small fraction of the tile.
         val tiles = w >= TILE_MIN_WIDTH
-        val bundle = if (state.needsPerturbation()) {
+        val bundle = if (state.needsPerturbation(surfaceH)) {
             ensureBundleAsync()
             active
         } else null
@@ -456,7 +476,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         // is handed over at a time.
         val segs = sceneSegments.coerceIn(1, MAX_SCENE_SEGMENTS)
         if (segs <= 1) {
-            if (state.needsPerturbation() && bundle != null) {
+            if (state.needsPerturbation(surfaceH) && bundle != null) {
                 drawPerturbation(state, bundle, w, h, tiles)
             } else {
                 drawDirect(state, w, h, tiles)
@@ -468,7 +488,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
                 val y1 = h * (seg + 1) / segs
                 if (y1 <= y0) continue
                 GLES31.glScissor(0, y0, w, y1 - y0)
-                if (state.needsPerturbation() && bundle != null) {
+                if (state.needsPerturbation(surfaceH) && bundle != null) {
                     drawPerturbation(state, bundle, w, h, tiles)
                 } else {
                     drawDirect(state, w, h, tiles)
@@ -570,8 +590,13 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         s: ViewState, b: OrbitBundle, w: Int, h: Int,
         tiles: Boolean, tilePass: Boolean = false
     ) {
-        val u = if (tilePass) perturbTile else perturb
-        GLES31.glUseProgram(if (tilePass) perturbTileProgram else perturbProgram)
+        val r = b.gpu.rescaled
+        val u = if (r) (if (tilePass) rescaledTile else rescaled)
+                else (if (tilePass) perturbTile else perturb)
+        GLES31.glUseProgram(
+            if (r) (if (tilePass) rescaledTileProgram else rescaledProgram)
+            else (if (tilePass) perturbTileProgram else perturbProgram)
+        )
         GLES31.glBindVertexArray(vao)
 
         val scale = b.gpu.scale
@@ -594,6 +619,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         GLES31.glUniform1f(u["uHalfScale"]!!, (scale * 0.5).toFloat())
         GLES31.glUniform1f(u["uDerLimit"]!!, DER_LIMIT_SQ)
         GLES31.glUniform1f(u["uBailoutScaled"]!!, (BAILOUT * scale).toFloat())
+        applyRescaledUniforms(u, b.gpu)
 
         GLES31.glUniform1i(u["uWidthMask"]!!, TEX_WIDTH - 1)
         GLES31.glUniform1i(u["uWidthShift"]!!, TEX_SHIFT)
@@ -611,6 +637,15 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
 
         GLES31.glDrawArrays(GLES31.GL_TRIANGLES, 0, 3)
         GLES31.glBindVertexArray(0)
+    }
+
+    /**
+     * The rescaled core's two extra inputs. Harmless for the fast programs, which do
+     * not declare them: their locations are -1, and GL ignores those.
+     */
+    private fun applyRescaledUniforms(u: HashMap<String, Int>, gpu: OrbitGpuData) {
+        GLES31.glUniform1i(u["uScaleExp"]!!, gpu.scaleExp)
+        GLES31.glUniform1f(u["uBailout"]!!, BAILOUT.toFloat())
     }
 
     private fun applyTileUniforms(u: HashMap<String, Int>, enabled: Boolean) {
@@ -632,6 +667,8 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         if (state.maxIter > b.orbit.iterBuilt) return true
         if (!state.canReuse(b.orbit, aspect)) return true
         if (b.gpu.scaleExp != state.deltaScaleExponent()) return true
+        // The two paths read the BLA radii in different forms.
+        if (b.gpu.rescaled != state.needsRescaled()) return true
         // A table built for a larger bound stays valid; only growing past it forces work.
         return BlaTable.maxCFor(state.spanY, aspect) > b.gpu.maxC
     }
@@ -685,8 +722,10 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         if (orbit == null || !probe.canReuse(orbit, aspect)) {
             // Prefer a minibrot nucleus. Its orbit returns near zero every period,
             // which keeps BLA coefficients small and their radii large, so pixels take
-            // longer jumps. findNucleus declines when the nucleus is out of view, in
-            // which case the view centre is used as before.
+            // longer jumps -- and only one period of it has to be computed, since the
+            // shader rebases at the end of the stored orbit. findNucleus declines when
+            // the nucleus is out of view, in which case the view centre is used as
+            // before, with a full-length orbit.
             val nucleus = try {
                 ReferenceOrbit.findNucleus(
                     cx, cy, iter, span, ReferenceOrbit.precisionFor(span)
@@ -694,9 +733,11 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
             } catch (e: Exception) {
                 null
             }
-            val rx = nucleus?.get(0) ?: cx
-            val ry = nucleus?.get(1) ?: cy
-            orbit = ReferenceOrbit.compute(rx, ry, iter, span)
+            orbit = if (nucleus != null) {
+                ReferenceOrbit.compute(nucleus.cx, nucleus.cy, iter, span, nucleus.period)
+            } else {
+                ReferenceOrbit.compute(cx, cy, iter, span)
+            }
         } else if (iter > orbit.iterBuilt) {
             orbit.extendTo(iter)
         }
@@ -705,7 +746,10 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         val snap = orbit.snapshot()
         val off = probe.offsetFrom(snap)
         val effectiveMaxC = max(maxC, BlaTable.maxCFor(span, aspect, hypot(off[0], off[1])))
-        return OrbitBundle(snap, OrbitGpuData.build(snap, exp, effectiveMaxC))
+        return OrbitBundle(
+            snap,
+            OrbitGpuData.build(snap, exp, effectiveMaxC, ViewState.rescaledFor(span))
+        )
     }
 
     /** Synchronous variant for export, where frames must not be skipped. */
@@ -714,6 +758,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
             s.maxIter <= cached.orbit.iterBuilt &&
             s.canReuse(cached.orbit, aspect) &&
             cached.gpu.scaleExp == s.deltaScaleExponent() &&
+            cached.gpu.rescaled == s.needsRescaled() &&
             BlaTable.maxCFor(s.spanY, aspect) <= cached.gpu.maxC
         ) return cached
 
@@ -779,8 +824,11 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
 
         val rBuf = floatBuffer(rows * TEX_WIDTH)
         rBuf.put(bla.radius, 0, bla.total)
-        // Zero radius means "never valid", so padding is inert by construction.
-        while (rBuf.position() < rows * TEX_WIDTH) rBuf.put(0f)
+        // Padding is never indexed, but is filled with the "never valid" value for
+        // whichever form the radii are in: zero for scaled radii, a huge negative
+        // log for log radii (where zero would mean a radius of one).
+        val pad = if (bla.logRadius) BlaTable.LOG_RADIUS_NEVER else 0f
+        while (rBuf.position() < rows * TEX_WIDTH) rBuf.put(pad)
         rBuf.position(0)
 
         GLES31.glBindTexture(GLES31.GL_TEXTURE_2D, blaRTexture)
@@ -902,7 +950,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         // most here. It runs against the export's own dimensions, not the screen's.
         val tiles = w >= TILE_MIN_WIDTH
         var used: OrbitBundle? = null
-        if (s.needsPerturbation()) used = bundleForExport(s, w.toDouble() / h, cached)
+        if (s.needsPerturbation(h)) used = bundleForExport(s, w.toDouble() / h, cached)
 
         if (tiles) {
             ensureTileTargetFor(w, h)
@@ -1336,6 +1384,25 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
      * where the whole-circle test cannot help because no single row is interior all
      * the way round.
      */
+    /**
+     * Radius below which strip rows need perturbation.
+     *
+     * The strip measures pixels differently from a frame: a row at radius r is r times
+     * the row step apart radially, and 2*pi*r over the strip width apart around the
+     * circle, so the finer of the two decides. Measured against the same float grid as
+     * the live view, and never shallower than the fixed floor this used before.
+     */
+    private fun stripDirectRadius(s: ViewState, geom: StripGeometry): Double {
+        val perRadius = min(geom.step, 2.0 * Math.PI / geom.width)
+        if (!(perRadius > 0.0)) return ViewState.DIRECT_LIMIT
+        // Rows near the limit are far smaller than the coordinates themselves unless
+        // the centre is near the origin, so a small allowance for r covers them.
+        val magnitude = max(abs(s.centerX.toDouble()), abs(s.centerY.toDouble())) + 1e-2
+        var r = ViewState.DIRECT_LIMIT
+        while (r < 1.0 && !ViewState.directResolves(r * perRadius, magnitude)) r *= 2.0
+        return r
+    }
+
     private fun buildStripTiles(
         s: ViewState,
         geom: StripGeometry,
@@ -1344,6 +1411,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         bundleIn: OrbitBundle?
     ): OrbitBundle? {
         var bundle = bundleIn
+        val directRadius = stripDirectRadius(s, geom)
         ensureStripTileTarget()
         if (stripTileFbo == 0) return bundle
 
@@ -1362,13 +1430,15 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
             // float, so it is rebuilt multiplicatively from a local base.
             val baseRow = tile * TILE_SIZE
             val radius = Math.exp(geom.logR0 + baseRow * geom.step)
-            val deep = radius < ViewState.DIRECT_LIMIT
+            val deep = radius < directRadius
             val probe = s.snapshot()
             probe.spanY = max(radius * 2.0, s.minSpan())
             if (deep) bundle = bundleForExport(probe, 1.0, bundle)
 
-            val u = if (deep) perturbStripTile else directStripTile
-            val program = if (deep) perturbStripTileProgram else directStripTileProgram
+            val resc = deep && bundle!!.gpu.rescaled
+            val u = if (resc) rescaledStripTile else if (deep) perturbStripTile else directStripTile
+            val program = if (resc) rescaledStripTileProgram
+                else if (deep) perturbStripTileProgram else directStripTileProgram
             val scale = if (deep) bundle!!.gpu.scale else 1.0
             val rBase = (radius * scale).toFloat()
             if (!rBase.isFinite() || rBase < 1e-36f) {
@@ -1406,6 +1476,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         GLES31.glUniform1f(u["uHalfScale"]!!, (scale * 0.5).toFloat())
         GLES31.glUniform1f(u["uDerLimit"]!!, DER_LIMIT_SQ)
                 GLES31.glUniform1f(u["uBailoutScaled"]!!, (BAILOUT * scale).toFloat())
+                applyRescaledUniforms(u, bundle!!.gpu)
                 GLES31.glUniform1i(u["uWidthMask"]!!, TEX_WIDTH - 1)
                 GLES31.glUniform1i(u["uWidthShift"]!!, TEX_SHIFT)
                 GLES31.glUniform1i(u["uOrbitLen"]!!, uploadedLen)
@@ -1493,6 +1564,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
     ): OrbitBundle? {
         var bundle = cached
         if (lastRow < firstRow) return bundle
+        val directRadius = stripDirectRadius(s, geom)
 
         GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, stripFbo)
         uploadPaletteIfDirty()
@@ -1508,11 +1580,11 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
             val dest = row % stripRing
             val untilWrap = stripRing - dest
             val radius = Math.exp(geom.logR0 + row * geom.step)
-            val deep = radius < ViewState.DIRECT_LIMIT
+            val deep = radius < directRadius
 
             var count = min(untilWrap, lastRow - row + 1)
             if (deep) {
-                val crossing = ((ln(ViewState.DIRECT_LIMIT) - geom.logR0) / geom.step).toInt() - row
+                val crossing = ((ln(directRadius) - geom.logR0) / geom.step).toInt() - row
                 if (crossing in 1 until count) count = crossing
             }
             // Cap the radius range a single chunk may cover. The delta scale, the BLA
@@ -1547,8 +1619,10 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
             // can cost seconds and has nothing to do with what a row costs to draw.
             if (deep) bundle = offClock(PROF_ORBIT) { bundleForExport(probe, 1.0, bundle) }
 
-            val u = if (deep) perturbStrip else directStrip
-            val program = if (deep) perturbStripProgram else directStripProgram
+            val resc = deep && bundle!!.gpu.rescaled
+            val u = if (resc) rescaledStrip else if (deep) perturbStrip else directStrip
+            val program = if (resc) rescaledStripProgram
+                else if (deep) perturbStripProgram else directStripProgram
             val scale = if (deep) bundle!!.gpu.scale else 1.0
 
             val chunkStart = System.nanoTime()
@@ -1609,6 +1683,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         GLES31.glUniform1f(u["uHalfScale"]!!, (scale * 0.5).toFloat())
         GLES31.glUniform1f(u["uDerLimit"]!!, DER_LIMIT_SQ)
                 GLES31.glUniform1f(u["uBailoutScaled"]!!, (BAILOUT * scale).toFloat())
+                applyRescaledUniforms(u, bundle!!.gpu)
                 GLES31.glUniform1i(u["uWidthMask"]!!, TEX_WIDTH - 1)
                 GLES31.glUniform1i(u["uWidthShift"]!!, TEX_SHIFT)
                 GLES31.glUniform1i(u["uOrbitLen"]!!, uploadedLen)
@@ -2269,7 +2344,10 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         private val PERTURB_UNIFORMS = SHARED_UNIFORMS + arrayOf(
             "uOrbit", "uBlaAB", "uBlaR", "uWidthMask", "uWidthShift", "uOrbitLen",
             "uBlaLevels", "uBlaOffset[0]", "uBlaCount[0]", "uDeltaCenter", "uPixelSpan",
-            "uInvScale", "uHalfScale", "uDerLimit", "uBailoutScaled"
+            "uInvScale", "uHalfScale", "uDerLimit", "uBailoutScaled",
+            // Rescaled core only. The fast programs report -1 for these, and GL
+            // ignores a uniform set at -1, so one list serves both.
+            "uScaleExp", "uBailout"
         )
 
         /**
