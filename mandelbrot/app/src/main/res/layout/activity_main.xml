@@ -1,0 +1,168 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#000000">
+
+    <com.fractal.deepzoom.MandelbrotView
+        android:id="@+id/gl_view"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent" />
+
+    <LinearLayout
+        android:id="@+id/controls"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom"
+        android:orientation="vertical"
+        android:background="#B0000000"
+        android:paddingStart="20dp"
+        android:paddingEnd="20dp"
+        android:paddingTop="14dp"
+        android:paddingBottom="24dp"
+        android:fitsSystemWindows="true">
+
+        <TextView
+            android:id="@+id/status"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Computing reference orbit"
+            android:textColor="#7FA6D8"
+            android:textSize="13sp"
+            android:visibility="gone"
+            android:paddingBottom="2dp" />
+
+        <TextView
+            android:id="@+id/readout"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:textColor="#D8DCE4"
+            android:textSize="13sp"
+            android:paddingBottom="6dp" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Detail"
+            android:textColor="#8A93A3"
+            android:textSize="12sp" />
+
+        <com.google.android.material.slider.Slider
+            android:id="@+id/iter_slider"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            app:labelBehavior="gone"
+            app:thumbColor="#E4E8F0"
+            app:trackColorActive="#7FA6D8"
+            app:trackColorInactive="#2A2F38" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Render resolution"
+            android:textColor="#8A93A3"
+            android:textSize="12sp" />
+
+        <com.google.android.material.slider.Slider
+            android:id="@+id/res_slider"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            app:labelBehavior="gone"
+            app:thumbColor="#E4E8F0"
+            app:trackColorActive="#7FA6D8"
+            app:trackColorInactive="#2A2F38" />
+
+        <TextView
+            android:id="@+id/motion_label"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:textColor="#8A93A3"
+            android:textSize="12sp" />
+
+        <com.google.android.material.slider.Slider
+            android:id="@+id/motion_slider"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            app:labelBehavior="gone"
+            app:thumbColor="#E4E8F0"
+            app:trackColorActive="#7FA6D8"
+            app:trackColorInactive="#2A2F38" />
+
+        <HorizontalScrollView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:scrollbars="none"
+            android:paddingTop="2dp">
+
+            <LinearLayout
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+
+                <Button
+                    android:id="@+id/reset"
+                    style="?android:attr/borderlessButtonStyle"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Reset"
+                    android:textColor="#7FA6D8"
+                    android:textSize="14sp" />
+
+                <Button
+                    android:id="@+id/colors"
+                    style="?android:attr/borderlessButtonStyle"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Colors"
+                    android:textColor="#7FA6D8"
+                    android:textSize="14sp" />
+
+                <Button
+                    android:id="@+id/save_png"
+                    style="?android:attr/borderlessButtonStyle"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Save PNG"
+                    android:textColor="#7FA6D8"
+                    android:textSize="14sp" />
+
+                <Button
+                    android:id="@+id/save_video"
+                    style="?android:attr/borderlessButtonStyle"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Save video"
+                    android:textColor="#7FA6D8"
+                    android:textSize="14sp" />
+
+                <Button
+                    android:id="@+id/share_pos"
+                    style="?android:attr/borderlessButtonStyle"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Copy position"
+                    android:textColor="#7FA6D8"
+                    android:textSize="14sp" />
+
+                <Button
+                    android:id="@+id/goto_pos"
+                    style="?android:attr/borderlessButtonStyle"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Go to"
+                    android:textColor="#7FA6D8"
+                    android:textSize="14sp" />
+
+                <Button
+                    android:id="@+id/find_mini"
+                    style="?android:attr/borderlessButtonStyle"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Find minibrot"
+                    android:textColor="#7FA6D8"
+                    android:textSize="14sp" />
+            </LinearLayout>
+        </HorizontalScrollView>
+    </LinearLayout>
+</FrameLayout>
