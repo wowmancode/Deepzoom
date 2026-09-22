@@ -10,7 +10,6 @@ import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
-import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.max
 import kotlin.math.hypot
@@ -420,7 +419,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         // pass can fill them without iterating. Only worth it once the frame is big
         // enough that the perimeter is a small fraction of the tile.
         val tiles = w >= TILE_MIN_WIDTH
-        val bundle = if (state.needsPerturbation(surfaceH)) {
+        val bundle = if (state.needsPerturbation()) {
             ensureBundleAsync()
             active
         } else null
@@ -457,7 +456,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         // is handed over at a time.
         val segs = sceneSegments.coerceIn(1, MAX_SCENE_SEGMENTS)
         if (segs <= 1) {
-            if (state.needsPerturbation(surfaceH) && bundle != null) {
+            if (state.needsPerturbation() && bundle != null) {
                 drawPerturbation(state, bundle, w, h, tiles)
             } else {
                 drawDirect(state, w, h, tiles)
@@ -469,7 +468,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
                 val y1 = h * (seg + 1) / segs
                 if (y1 <= y0) continue
                 GLES31.glScissor(0, y0, w, y1 - y0)
-                if (state.needsPerturbation(surfaceH) && bundle != null) {
+                if (state.needsPerturbation() && bundle != null) {
                     drawPerturbation(state, bundle, w, h, tiles)
                 } else {
                     drawDirect(state, w, h, tiles)
@@ -686,10 +685,8 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         if (orbit == null || !probe.canReuse(orbit, aspect)) {
             // Prefer a minibrot nucleus. Its orbit returns near zero every period,
             // which keeps BLA coefficients small and their radii large, so pixels take
-            // longer jumps -- and only one period of it has to be computed, since the
-            // shader rebases at the end of the stored orbit. findNucleus declines when
-            // the nucleus is out of view, in which case the view centre is used as
-            // before, with a full-length orbit.
+            // longer jumps. findNucleus declines when the nucleus is out of view, in
+            // which case the view centre is used as before.
             val nucleus = try {
                 ReferenceOrbit.findNucleus(
                     cx, cy, iter, span, ReferenceOrbit.precisionFor(span)
@@ -697,11 +694,9 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
             } catch (e: Exception) {
                 null
             }
-            orbit = if (nucleus != null) {
-                ReferenceOrbit.compute(nucleus.cx, nucleus.cy, iter, span, nucleus.period)
-            } else {
-                ReferenceOrbit.compute(cx, cy, iter, span)
-            }
+            val rx = nucleus?.get(0) ?: cx
+            val ry = nucleus?.get(1) ?: cy
+            orbit = ReferenceOrbit.compute(rx, ry, iter, span)
         } else if (iter > orbit.iterBuilt) {
             orbit.extendTo(iter)
         }
@@ -907,7 +902,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         // most here. It runs against the export's own dimensions, not the screen's.
         val tiles = w >= TILE_MIN_WIDTH
         var used: OrbitBundle? = null
-        if (s.needsPerturbation(h)) used = bundleForExport(s, w.toDouble() / h, cached)
+        if (s.needsPerturbation()) used = bundleForExport(s, w.toDouble() / h, cached)
 
         if (tiles) {
             ensureTileTargetFor(w, h)
@@ -1341,25 +1336,6 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
      * where the whole-circle test cannot help because no single row is interior all
      * the way round.
      */
-    /**
-     * Radius below which strip rows need perturbation.
-     *
-     * The strip measures pixels differently from a frame: a row at radius r is r times
-     * the row step apart radially, and 2*pi*r over the strip width apart around the
-     * circle, so the finer of the two decides. Measured against the same float grid as
-     * the live view, and never shallower than the fixed floor this used before.
-     */
-    private fun stripDirectRadius(s: ViewState, geom: StripGeometry): Double {
-        val perRadius = min(geom.step, 2.0 * Math.PI / geom.width)
-        if (!(perRadius > 0.0)) return ViewState.DIRECT_LIMIT
-        // Rows near the limit are far smaller than the coordinates themselves unless
-        // the centre is near the origin, so a small allowance for r covers them.
-        val magnitude = max(abs(s.centerX.toDouble()), abs(s.centerY.toDouble())) + 1e-2
-        var r = ViewState.DIRECT_LIMIT
-        while (r < 1.0 && !ViewState.directResolves(r * perRadius, magnitude)) r *= 2.0
-        return r
-    }
-
     private fun buildStripTiles(
         s: ViewState,
         geom: StripGeometry,
@@ -1368,7 +1344,6 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         bundleIn: OrbitBundle?
     ): OrbitBundle? {
         var bundle = bundleIn
-        val directRadius = stripDirectRadius(s, geom)
         ensureStripTileTarget()
         if (stripTileFbo == 0) return bundle
 
@@ -1387,7 +1362,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
             // float, so it is rebuilt multiplicatively from a local base.
             val baseRow = tile * TILE_SIZE
             val radius = Math.exp(geom.logR0 + baseRow * geom.step)
-            val deep = radius < directRadius
+            val deep = radius < ViewState.DIRECT_LIMIT
             val probe = s.snapshot()
             probe.spanY = max(radius * 2.0, s.minSpan())
             if (deep) bundle = bundleForExport(probe, 1.0, bundle)
@@ -1518,7 +1493,6 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
     ): OrbitBundle? {
         var bundle = cached
         if (lastRow < firstRow) return bundle
-        val directRadius = stripDirectRadius(s, geom)
 
         GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, stripFbo)
         uploadPaletteIfDirty()
@@ -1534,11 +1508,11 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
             val dest = row % stripRing
             val untilWrap = stripRing - dest
             val radius = Math.exp(geom.logR0 + row * geom.step)
-            val deep = radius < directRadius
+            val deep = radius < ViewState.DIRECT_LIMIT
 
             var count = min(untilWrap, lastRow - row + 1)
             if (deep) {
-                val crossing = ((ln(directRadius) - geom.logR0) / geom.step).toInt() - row
+                val crossing = ((ln(ViewState.DIRECT_LIMIT) - geom.logR0) / geom.step).toInt() - row
                 if (crossing in 1 until count) count = crossing
             }
             // Cap the radius range a single chunk may cover. The delta scale, the BLA
