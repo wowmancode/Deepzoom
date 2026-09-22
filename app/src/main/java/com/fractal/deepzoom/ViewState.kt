@@ -74,14 +74,45 @@ class ViewState {
      */
     fun minSpan(): Double = 2.0.pow(-TARGET_EXPONENT - MAX_SCALE_EXP)
 
-    fun needsPerturbation(): Boolean = spanY < DIRECT_LIMIT
+    /**
+     * Whether this view, drawn `heightPx` pixels tall, is past what float32 resolves.
+     *
+     * A span alone cannot answer this. What matters is the pixel spacing against the
+     * float spacing of the coordinates themselves: at 1e-4 across 2400 rows a pixel is
+     * about 4e-8 wide, while a float near -1.75 can only step by 1.2e-7, so three
+     * neighbouring pixels share one c and the image goes blocky well before the old
+     * span threshold. An 8640-row export at the same span is far worse.
+     *
+     * DIRECT_LIMIT stays as a floor, so no view goes direct deeper than it used to.
+     */
+    fun needsPerturbation(heightPx: Int): Boolean {
+        if (spanY < DIRECT_LIMIT) return true
+        val pixel = spanY / heightPx.coerceAtLeast(1)
+        val magnitude = maxOf(abs(centerX.toDouble()), abs(centerY.toDouble())) + spanY
+        return !directResolves(pixel, magnitude)
+    }
 
     companion object {
         const val DEFAULT_SPAN = 3.0
         const val MAX_SPAN = 8.0
 
-        /** Below this span, direct float32 iteration visibly quantises. */
+        /** Below this span, direct float32 iteration is never used. */
         const val DIRECT_LIMIT = 1e-4
+
+        /**
+         * Float steps a pixel must span for the direct path. One would give every
+         * pixel its own c, but rounding c and every iterate by up to half a step each
+         * leaves visible jitter at that spacing; four keeps it below a quarter pixel.
+         */
+        private const val DIRECT_ULPS = 4.0
+
+        /**
+         * Whether plain float32 separates pixels `pixel` apart at coordinates of about
+         * `magnitude`. Shared by the view and the strip, which measure pixels
+         * differently but hit the same float grid.
+         */
+        fun directResolves(pixel: Double, magnitude: Double): Boolean =
+            pixel >= DIRECT_ULPS * Math.ulp(magnitude.toFloat()).toDouble()
 
         private const val LN2 = 0.6931471805599453
         /**
