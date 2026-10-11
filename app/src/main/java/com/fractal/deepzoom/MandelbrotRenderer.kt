@@ -475,29 +475,10 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         // its own fragments from gl_FragCoord exactly as before -- only how much of it
         // is handed over at a time.
         val segs = sceneSegments.coerceIn(1, MAX_SCENE_SEGMENTS)
-        if (segs <= 1) {
-            if (state.needsPerturbation(surfaceH) && bundle != null) {
-                drawPerturbation(state, bundle, w, h, tiles)
-            } else {
-                drawDirect(state, w, h, tiles)
-            }
+        if (bundle != null) {
+            drawPerturbation(state, bundle, w, h, tiles, segments = segs)
         } else {
-            GLES31.glEnable(GLES31.GL_SCISSOR_TEST)
-            for (seg in 0 until segs) {
-                val y0 = h * seg / segs
-                val y1 = h * (seg + 1) / segs
-                if (y1 <= y0) continue
-                GLES31.glScissor(0, y0, w, y1 - y0)
-                if (state.needsPerturbation(surfaceH) && bundle != null) {
-                    drawPerturbation(state, bundle, w, h, tiles)
-                } else {
-                    drawDirect(state, w, h, tiles)
-                }
-                // Hands this band to the driver as its own submission, which is what
-                // keeps any one of them short.
-                GLES31.glFlush()
-            }
-            GLES31.glDisable(GLES31.GL_SCISSOR_TEST)
+            drawDirect(state, w, h, tiles, segments = segs)
         }
 
         GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, 0)
@@ -570,7 +551,29 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         bindTexture(3, paletteTexture, u["uPalette"]!!)
     }
 
-    private fun drawDirect(s: ViewState, w: Int, h: Int, tiles: Boolean, tilePass: Boolean = false) {
+    /** Submit bands without repeating shader setup or precision-sensitive state maths. */
+    private fun drawSceneBands(w: Int, h: Int, segments: Int) {
+        if (segments <= 1) {
+            GLES31.glDrawArrays(GLES31.GL_TRIANGLES, 0, 3)
+            return
+        }
+        GLES31.glEnable(GLES31.GL_SCISSOR_TEST)
+        for (seg in 0 until segments) {
+            val y0 = h * seg / segments
+            val y1 = h * (seg + 1) / segments
+            if (y1 <= y0) continue
+            GLES31.glScissor(0, y0, w, y1 - y0)
+            GLES31.glDrawArrays(GLES31.GL_TRIANGLES, 0, 3)
+            // Keep each band a separate submission for the mobile GPU watchdog.
+            GLES31.glFlush()
+        }
+        GLES31.glDisable(GLES31.GL_SCISSOR_TEST)
+    }
+
+    private fun drawDirect(
+        s: ViewState, w: Int, h: Int, tiles: Boolean,
+        tilePass: Boolean = false, segments: Int = 1
+    ) {
         val u = if (tilePass) directTile else direct
         GLES31.glUseProgram(if (tilePass) directTileProgram else directProgram)
         GLES31.glBindVertexArray(vao)
@@ -582,13 +585,13 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         GLES31.glUniform2f(u["uCenter"]!!, s.centerX.toFloat(), s.centerY.toFloat())
         GLES31.glUniform1f(u["uSpanY"]!!, s.spanY.toFloat())
 
-        GLES31.glDrawArrays(GLES31.GL_TRIANGLES, 0, 3)
+        drawSceneBands(w, h, segments)
         GLES31.glBindVertexArray(0)
     }
 
     private fun drawPerturbation(
         s: ViewState, b: OrbitBundle, w: Int, h: Int,
-        tiles: Boolean, tilePass: Boolean = false
+        tiles: Boolean, tilePass: Boolean = false, segments: Int = 1
     ) {
         val r = b.gpu.rescaled
         val u = if (r) (if (tilePass) rescaledTile else rescaled)
@@ -635,7 +638,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         bindTexture(1, blaAbTexture, u["uBlaAB"]!!)
         bindTexture(2, blaRTexture, u["uBlaR"]!!)
 
-        GLES31.glDrawArrays(GLES31.GL_TRIANGLES, 0, 3)
+        drawSceneBands(w, h, segments)
         GLES31.glBindVertexArray(0)
     }
 
