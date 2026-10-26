@@ -29,6 +29,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         set(value) {
             field = value
             paletteDirty = true
+            sceneGen++
         }
     @Volatile private var paletteDirty = true
 
@@ -82,12 +83,32 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
     private var sceneW = 0
     private var sceneH = 0
 
+    // A second target of the same size. A pan copies the last frame across into it,
+    // shifted, and the two swap -- GL cannot copy a texture onto itself.
+    private var sceneFbo2 = 0
+    private var sceneTex2 = 0
+
+    /**
+     * Bumped by anything that changes what a pixel looks like: markDirty (zoom,
+     * iterations, resolution, a new orbit, a new position) and the palette. A frame
+     * may only be reused while the generation it was drawn at is still current.
+     */
+    @Volatile private var sceneGen = 0
+
     private var snapValid = false
     private var snapCenterX: java.math.BigDecimal = java.math.BigDecimal.ZERO
     private var snapCenterY: java.math.BigDecimal = java.math.BigDecimal.ZERO
     private var snapSpanY = 1.0
     private var snapW = 0
     private var snapH = 0
+    private var snapLevel = -1
+    private var snapGen = -1
+    private var snapMaxIter = 0
+    private var snapPerturb = false
+    private var snapBundle: OrbitBundle? = null
+
+    /** Set when a gesture ends; the next idle frame decides how much refining is left. */
+    @Volatile private var settleRequested = false
 
     /** Levels are powers of two below native: 3 is eighth-size, 0 is native. */
     private var refineLevel = -1
@@ -229,7 +250,12 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         paletteDirty = true
         fbo = 0
         fboW = 0
+        // Names from the dead context must not be deleted in this one: GL may already
+        // have handed the same numbers to the textures created above.
         sceneFbo = 0
+        sceneTex = 0
+        sceneFbo2 = 0
+        sceneTex2 = 0
         sceneW = 0
         tileFbo = 0
         tileTexW = 0
@@ -275,6 +301,25 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
     /** Restart progressive refinement from the coarsest level. */
     fun markDirty() {
         refineLevel = min(3, finestLevel + COARSE_STEPS)
+        sceneGen++
+    }
+
+    /**
+     * Called when a gesture ends, instead of markDirty.
+     *
+     * The last frame drawn during the gesture is usually already exact for where the
+     * view stopped -- often at full resolution -- so restarting refinement from an
+     * eighth-size pass would redraw about 1.3 frames of work only to arrive at the
+     * same picture. The next idle frame checks and continues from what is on screen.
+     */
+    fun settleAfterGesture() {
+        refineLevel = min(3, finestLevel + COARSE_STEPS)
+        settleRequested = true
+    }
+
+    /** A new gesture began before the last one settled; that settle is moot. */
+    fun cancelSettle() {
+        settleRequested = false
     }
 
     /** Called when a gesture starts, so adaptation begins from the native target. */
@@ -300,9 +345,18 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         // measured frame time says it has to, and takes it straight back.
         if (interactive) {
             val level = motionLevel()
-            renderSceneAtLevel(level, measure = motionQuality == QUALITY_ADAPTIVE)
-            presentScene(reproject = false)
+            // A pan reuses the last frame and computes only the strip it uncovers.
+            // Anything else -- a zoom, a new level, a new orbit -- draws in full.
+            if (!panScene(level)) {
+                renderSceneAtLevel(level, measure = motionQuality == QUALITY_ADAPTIVE)
+            }
+            presentScene(reproject = true)
             return
+        }
+
+        if (settleRequested) {
+            settleRequested = false
+            settle()
         }
 
         if (refineLevel < 0) {
@@ -324,9 +378,23 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         if (sceneW == w && sceneH == h && sceneFbo != 0) return
         releaseSceneTarget()
 
+        val first = createSceneTarget(w, h)
+        sceneTex = first[0]
+        sceneFbo = first[1]
+        val second = createSceneTarget(w, h)
+        sceneTex2 = second[0]
+        sceneFbo2 = second[1]
+
+        sceneW = w
+        sceneH = h
+        snapValid = false
+    }
+
+    /** Returns (texture, framebuffer). */
+    private fun createSceneTarget(w: Int, h: Int): IntArray {
         val ids = IntArray(1)
         GLES31.glGenTextures(1, ids, 0)
-        sceneTex = ids[0]
+        val sceneTex = ids[0]
         GLES31.glBindTexture(GLES31.GL_TEXTURE_2D, sceneTex)
         GLES31.glTexImage2D(
             GLES31.GL_TEXTURE_2D, 0, GLES31.GL_RGBA8, w, h, 0,
@@ -339,16 +407,14 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         GLES31.glTexParameteri(GLES31.GL_TEXTURE_2D, GLES31.GL_TEXTURE_WRAP_T, GLES31.GL_CLAMP_TO_EDGE)
 
         GLES31.glGenFramebuffers(1, ids, 0)
-        sceneFbo = ids[0]
+        val sceneFbo = ids[0]
         GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, sceneFbo)
         GLES31.glFramebufferTexture2D(
             GLES31.GL_FRAMEBUFFER, GLES31.GL_COLOR_ATTACHMENT0,
             GLES31.GL_TEXTURE_2D, sceneTex, 0
         )
         GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, 0)
-
-        sceneW = w
-        sceneH = h
+        return intArrayOf(sceneTex, sceneFbo)
     }
 
     /** One texel per tile, sized for the largest frame we might render. */
@@ -392,7 +458,10 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         val ids = IntArray(1)
         if (sceneFbo != 0) { ids[0] = sceneFbo; GLES31.glDeleteFramebuffers(1, ids, 0); sceneFbo = 0 }
         if (sceneTex != 0) { ids[0] = sceneTex; GLES31.glDeleteTextures(1, ids, 0); sceneTex = 0 }
+        if (sceneFbo2 != 0) { ids[0] = sceneFbo2; GLES31.glDeleteFramebuffers(1, ids, 0); sceneFbo2 = 0 }
+        if (sceneTex2 != 0) { ids[0] = sceneTex2; GLES31.glDeleteTextures(1, ids, 0); sceneTex2 = 0 }
         sceneW = 0; sceneH = 0
+        snapValid = false
     }
 
     private fun motionLevel(): Int = when (motionQuality) {
@@ -435,11 +504,19 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         val w = max(1, surfaceW shr level)
         val h = max(1, surfaceH shr level)
 
+        // The UI thread keeps panning while this runs. Draw from one snapshot and record
+        // that same snapshot, so a reused frame is exactly where it says it is. The
+        // generation is read first: anything that dirties the view after this point
+        // makes the frame stale rather than silently mislabelled.
+        val gen = sceneGen
+        val state = this.state.snapshot()
+
         // Tile pass first: classify which tiles are entirely interior, so the main
         // pass can fill them without iterating. Only worth it once the frame is big
         // enough that the perimeter is a small fraction of the tile.
         val tiles = w >= TILE_MIN_WIDTH
-        val bundle = if (state.needsPerturbation(surfaceH)) {
+        val perturb = state.needsPerturbation(surfaceH)
+        val bundle = if (perturb) {
             ensureBundleAsync()
             active
         } else null
@@ -490,7 +567,133 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         snapSpanY = state.spanY
         snapW = w
         snapH = h
+        snapLevel = level
+        snapGen = gen
+        snapMaxIter = state.maxIter
+        snapPerturb = perturb
+        snapBundle = bundle
         snapValid = true
+    }
+
+    /**
+     * Whether the last frame can stand in for the current view at this level, apart
+     * from a shift of the centre: same zoom, iterations, colours, orbit and size.
+     */
+    private fun sceneReusable(level: Int): Boolean {
+        if (!snapValid || snapLevel != level || snapGen != sceneGen) return false
+        if (snapW != max(1, surfaceW shr level) || snapH != max(1, surfaceH shr level)) return false
+        if (state.spanY != snapSpanY || state.maxIter != snapMaxIter) return false
+        val perturb = state.needsPerturbation(surfaceH)
+        if (perturb != snapPerturb) return false
+        if (perturb) {
+            ensureBundleAsync()
+            if (pending != null || active !== snapBundle) return false
+        }
+        return true
+    }
+
+    /** Offset of the current centre from the last frame's, in that frame's pixels. */
+    private fun shiftInScenePixels(): DoubleArray {
+        val mc = state.mathContext
+        val pixel = snapSpanY / snapH
+        return doubleArrayOf(
+            state.centerX.subtract(snapCenterX, mc).toDouble() / pixel,
+            state.centerY.subtract(snapCenterY, mc).toDouble() / pixel
+        )
+    }
+
+    /**
+     * Serves a pan from the last frame.
+     *
+     * The frame is copied across by a whole number of pixels, which puts its pixels
+     * exactly on the new grid -- the new centre is defined as the old one plus that
+     * many pixels, so every copied pixel is the one the shader would compute there.
+     * Only the strip the pan uncovers is iterated. The fraction of a pixel left over
+     * is shown by the reprojecting blit, and absorbed when the gesture settles.
+     *
+     * Returns false when the frame cannot be reused, and the caller draws in full.
+     */
+    private fun panScene(level: Int): Boolean {
+        if (!sceneReusable(level)) return false
+        val w = snapW
+        val h = snapH
+        val shift = shiftInScenePixels()
+        if (!(abs(shift[0]) < w * MAX_PAN_REUSE && abs(shift[1]) < h * MAX_PAN_REUSE)) return false
+        val sx = Math.round(shift[0]).toInt()
+        val sy = Math.round(shift[1]).toInt()
+        if (sx == 0 && sy == 0) return true
+
+        // New pixel (x, y) is old pixel (x + sx, y + sy). Framebuffer coordinates run
+        // up from the bottom like gl_FragCoord, so no flip is needed.
+        val cw = w - abs(sx)
+        val ch = h - abs(sy)
+        val srcX = max(0, sx)
+        val srcY = max(0, sy)
+        val dstX = max(0, -sx)
+        val dstY = max(0, -sy)
+        GLES31.glBindFramebuffer(GLES31.GL_READ_FRAMEBUFFER, sceneFbo)
+        GLES31.glBindFramebuffer(GLES31.GL_DRAW_FRAMEBUFFER, sceneFbo2)
+        GLES31.glBlitFramebuffer(
+            srcX, srcY, srcX + cw, srcY + ch,
+            dstX, dstY, dstX + cw, dstY + ch,
+            GLES31.GL_COLOR_BUFFER_BIT, GLES31.GL_NEAREST
+        )
+        GLES31.glBindFramebuffer(GLES31.GL_READ_FRAMEBUFFER, 0)
+        GLES31.glBindFramebuffer(GLES31.GL_DRAW_FRAMEBUFFER, 0)
+
+        val t = sceneTex; sceneTex = sceneTex2; sceneTex2 = t
+        val f = sceneFbo; sceneFbo = sceneFbo2; sceneFbo2 = f
+
+        // The new frame's centre: exactly sx, sy pixels from the old one.
+        val mc = state.mathContext
+        val pixel = snapSpanY / h
+        snapCenterX = snapCenterX.add(java.math.BigDecimal(sx * pixel), mc)
+        snapCenterY = snapCenterY.add(java.math.BigDecimal(sy * pixel), mc)
+
+        // Iterate only what was uncovered: a column band and a row band.
+        val rects = ArrayList<Int>(8)
+        if (sx > 0) rects.addAll(listOf(w - sx, 0, sx, h))
+        if (sx < 0) rects.addAll(listOf(0, 0, -sx, h))
+        if (sy > 0) rects.addAll(listOf(0, h - sy, w, sy))
+        if (sy < 0) rects.addAll(listOf(0, 0, w, -sy))
+
+        val s = state.snapshot().also {
+            it.centerX = snapCenterX
+            it.centerY = snapCenterY
+            it.spanY = snapSpanY
+        }
+        GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, sceneFbo)
+        GLES31.glViewport(0, 0, w, h)
+        val segs = sceneSegments.coerceIn(1, MAX_SCENE_SEGMENTS)
+        if (snapPerturb) {
+            drawPerturbation(s, snapBundle!!, w, h, false, segments = segs, rects = rects.toIntArray())
+        } else {
+            drawDirect(s, w, h, false, segments = segs, rects = rects.toIntArray())
+        }
+        GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, 0)
+        GLES31.glViewport(0, 0, surfaceW, surfaceH)
+        return true
+    }
+
+    /**
+     * After a gesture: if the frame on screen is the current view, give or take less
+     * than a pixel of pan, keep it. The view centre is moved onto that frame's grid --
+     * under half a pixel, invisible -- and refinement continues from the level shown
+     * rather than starting again at an eighth of the resolution.
+     */
+    private fun settle() {
+        if (!sceneReusable(snapLevel)) return
+        var shift = shiftInScenePixels()
+        // The last move of the gesture may have arrived after its last frame. Serve it
+        // the same way a pan frame would before deciding.
+        if (abs(shift[0]) > 0.5 || abs(shift[1]) > 0.5) {
+            if (!panScene(snapLevel)) return
+            shift = shiftInScenePixels()
+        }
+        if (abs(shift[0]) > 0.5 + 1e-9 || abs(shift[1]) > 0.5 + 1e-9) return
+        state.centerX = snapCenterX
+        state.centerY = snapCenterY
+        refineLevel = if (snapLevel > finestLevel) snapLevel - 1 else -1
     }
 
     /**
@@ -552,7 +755,28 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
     }
 
     /** Submit bands without repeating shader setup or precision-sensitive state maths. */
-    private fun drawSceneBands(w: Int, h: Int, segments: Int) {
+    private fun drawSceneBands(w: Int, h: Int, segments: Int, rects: IntArray? = null) {
+        if (rects != null) {
+            // Only these rectangles (x, y, width, height), each still split into bands.
+            GLES31.glEnable(GLES31.GL_SCISSOR_TEST)
+            var i = 0
+            while (i + 3 < rects.size) {
+                val rx = rects[i]; val ry = rects[i + 1]; val rw = rects[i + 2]; val rh = rects[i + 3]
+                i += 4
+                if (rw <= 0 || rh <= 0) continue
+                val bands = segments.coerceIn(1, rh)
+                for (seg in 0 until bands) {
+                    val y0 = ry + rh * seg / bands
+                    val y1 = ry + rh * (seg + 1) / bands
+                    if (y1 <= y0) continue
+                    GLES31.glScissor(rx, y0, rw, y1 - y0)
+                    GLES31.glDrawArrays(GLES31.GL_TRIANGLES, 0, 3)
+                    GLES31.glFlush()
+                }
+            }
+            GLES31.glDisable(GLES31.GL_SCISSOR_TEST)
+            return
+        }
         if (segments <= 1) {
             GLES31.glDrawArrays(GLES31.GL_TRIANGLES, 0, 3)
             return
@@ -572,7 +796,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
 
     private fun drawDirect(
         s: ViewState, w: Int, h: Int, tiles: Boolean,
-        tilePass: Boolean = false, segments: Int = 1
+        tilePass: Boolean = false, segments: Int = 1, rects: IntArray? = null
     ) {
         val u = if (tilePass) directTile else direct
         GLES31.glUseProgram(if (tilePass) directTileProgram else directProgram)
@@ -585,13 +809,14 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         GLES31.glUniform2f(u["uCenter"]!!, s.centerX.toFloat(), s.centerY.toFloat())
         GLES31.glUniform1f(u["uSpanY"]!!, s.spanY.toFloat())
 
-        drawSceneBands(w, h, segments)
+        drawSceneBands(w, h, segments, rects)
         GLES31.glBindVertexArray(0)
     }
 
     private fun drawPerturbation(
         s: ViewState, b: OrbitBundle, w: Int, h: Int,
-        tiles: Boolean, tilePass: Boolean = false, segments: Int = 1
+        tiles: Boolean, tilePass: Boolean = false, segments: Int = 1,
+        rects: IntArray? = null
     ) {
         val r = b.gpu.rescaled
         val u = if (r) (if (tilePass) rescaledTile else rescaled)
@@ -638,7 +863,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         bindTexture(1, blaAbTexture, u["uBlaAB"]!!)
         bindTexture(2, blaRTexture, u["uBlaR"]!!)
 
-        drawSceneBands(w, h, segments)
+        drawSceneBands(w, h, segments, rects)
         GLES31.glBindVertexArray(0)
     }
 
@@ -729,10 +954,12 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
             // shader rebases at the end of the stored orbit. findNucleus declines when
             // the nucleus is out of view, in which case the view centre is used as
             // before, with a full-length orbit.
+            // Only a nucleus whose cycle really closes may cut the orbit at its
+            // period; see ReferenceOrbit.closes.
             val nucleus = try {
-                ReferenceOrbit.findNucleus(
-                    cx, cy, iter, span, ReferenceOrbit.precisionFor(span)
-                )
+                val precision = ReferenceOrbit.precisionFor(span)
+                ReferenceOrbit.findNucleus(cx, cy, iter, span, precision)
+                    ?.takeIf { ReferenceOrbit.closes(it, span, precision) }
             } catch (e: Exception) {
                 null
             }
@@ -2421,6 +2648,12 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
 
         /** Below this width the tile pass costs more than it saves. */
         const val TILE_MIN_WIDTH = 512
+
+        /**
+         * Largest pan, as a fraction of the frame, still served by shifting the last
+         * frame. Past this most of the frame is new anyway and a full draw is simpler.
+         */
+        private const val MAX_PAN_REUSE = 0.5
 
         const val QUALITY_FULL = 0
         const val QUALITY_ADAPTIVE = 1

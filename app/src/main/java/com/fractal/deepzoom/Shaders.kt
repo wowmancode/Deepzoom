@@ -480,6 +480,19 @@ object Shaders {
             return max(abs(v.x), abs(v.y));
         }
 
+        // Exponent of one term when choosing the common exponent E. A zero term must
+        // never win. expOf(0) is -127, which is only "below any real term" while the
+        // real terms are within 2^127 of the delta. After a rebase onto a nucleus the
+        // reference is exactly zero and the real terms (dz^2, dc) sit hundreds of
+        // binary orders below e, so the zero 2*Z*dz term at e - 127 won, every real
+        // term was shifted out of float range, and the pixel collapsed onto the
+        // reference -- drawn as interior, at depths and places that depend on how
+        // close the pixel's orbit comes to the nucleus.
+        const int NO_TERM = -1073741823;
+        int termExp(int base, float mag) {
+            return mag > 0.0 ? base + expOf(mag) : NO_TERM;
+        }
+
         // Radii are stored as log2(0.7 * r); the 0.7 is the same max-norm allowance
         // the fast core applies. A disabled entry holds -1e30, below any real delta.
         bool blaValid(int k, int m, float logDz) {
@@ -490,7 +503,7 @@ object Shaders {
             // dc = u * 2^ec, fixed for the pixel.
             vec2 u = uDeltaCenter + off;
             int ec = -uScaleExp;
-            int eu = ec + expOf(maxAbs(u));
+            int eu = termExp(ec, maxAbs(u));
             outN = uMaxIter;
             outZ = vec2(0.0);
 
@@ -551,9 +564,13 @@ object Shaders {
                     if (n >= 1) der = cmul(der, ab.xy);
                     vec2 aw = cmul(ab.xy, w);
                     vec2 bu = cmul(ab.zw, u);
-                    int E = max(e + expOf(maxAbs(aw)), ec + expOf(maxAbs(bu)));
-                    w = scaleBy(aw, e - E) + scaleBy(bu, ec - E);
-                    e = E;
+                    int E = max(termExp(e, maxAbs(aw)), termExp(ec, maxAbs(bu)));
+                    if (E == NO_TERM) {
+                        w = vec2(0.0);   // every term is zero; e stays as it was
+                    } else {
+                        w = scaleBy(aw, e - E) + scaleBy(bu, ec - E);
+                        e = E;
+                    }
                     n += skip;
                     m += skip;
                 } else {
@@ -561,9 +578,13 @@ object Shaders {
                     if (n >= 1) der = cmul(der, t + scaleBy(w, e + 1));
                     vec2 tw = cmul(t, w);
                     vec2 ww = cmul(w, w);
-                    int E = max(max(e + expOf(maxAbs(tw)), 2 * e + expOf(maxAbs(ww))), eu);
-                    w = scaleBy(tw, e - E) + scaleBy(ww, 2 * e - E) + scaleBy(u, ec - E);
-                    e = E;
+                    int E = max(max(termExp(e, maxAbs(tw)), termExp(2 * e, maxAbs(ww))), eu);
+                    if (E == NO_TERM) {
+                        w = vec2(0.0);
+                    } else {
+                        w = scaleBy(tw, e - E) + scaleBy(ww, 2 * e - E) + scaleBy(u, ec - E);
+                        e = E;
+                    }
                     n++;
                     m++;
                 }

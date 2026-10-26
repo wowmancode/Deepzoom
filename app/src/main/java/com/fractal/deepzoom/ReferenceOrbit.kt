@@ -368,6 +368,60 @@ class ReferenceOrbit private constructor(
             return p
         }
 
+        /**
+         * Whether a nucleus reference may be cut off after one period.
+         *
+         * At the end of the stored orbit every pixel rebases onto its full value
+         * Z_p + dz. That is exact in arithmetic, but in float the pixel's information
+         * is in dz, so Z_p has to be negligible beside it -- which only holds if the
+         * orbit really returns to zero. findNucleus cannot promise that: when the
+         * working precision cannot resolve the minibrot, Newton does not land on it,
+         * and exactPeriod's relative test then accepts a period as short as 1 (seen at
+         * c ~ i with |Z_1| ~ 1 at 1e-30 and 1e-50 spans). Truncating there throws
+         * away every pixel's delta at the first rebase and the view renders as solid
+         * interior.
+         *
+         * dz at step p is about |dZ_p/dc| times the pixel's offset, so this asks that
+         * |Z_p| sit well below that for a pixel of the finest export (span / 4096).
+         * An orbit that escapes within the period is never truncated, so it passes.
+         */
+        fun closes(n: Nucleus, spanY: Double, precision: Int): Boolean {
+            val it = FixedIter(FixedIter.limbsFor(precision))
+            it.reset(n.cx, n.cy)
+            var dx = 0.0
+            var dy = 0.0
+            var dExp = 0
+            for (i in 1..n.period) {
+                val zr = it.xDouble()
+                val zi = it.yDouble()
+                val one = Math.scalb(1.0, -dExp)
+                val ndx = 2.0 * (zr * dx - zi * dy) + one
+                val ndy = 2.0 * (zr * dy + zi * dx)
+                dx = ndx
+                dy = ndy
+                if (abs(dx) > DER_LIMIT || abs(dy) > DER_LIMIT) {
+                    dx = Math.scalb(dx, -DER_RESCALE)
+                    dy = Math.scalb(dy, -DER_RESCALE)
+                    dExp += DER_RESCALE
+                }
+                it.step()
+                if (it.normSq() > ESCAPE_SQ) return true
+            }
+            val zAbs = hypot(it.xDouble(), it.yDouble())
+            if (zAbs == 0.0) return true
+            val dAbs = hypot(dx, dy)
+            if (dAbs == 0.0) return false
+            val log2Z = kotlin.math.ln(zAbs) / LN2
+            val log2Spread = kotlin.math.ln(dAbs) / LN2 + dExp +
+                kotlin.math.ln(spanY / CLOSE_PIXELS) / LN2
+            return log2Z <= log2Spread - CLOSE_MARGIN_BITS
+        }
+
+        private const val LN2 = 0.6931471805599453
+        private const val CLOSE_PIXELS = 4096.0
+        /** |Z_p| must sit this many binary orders below one pixel's spread. */
+        private const val CLOSE_MARGIN_BITS = 10.0
+
         /** A located minibrot: its nucleus, the period of its cycle, and its scale. */
         class Minibrot(
             val cx: BigDecimal,
