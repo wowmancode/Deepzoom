@@ -147,6 +147,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
     private var lastRenderMs = 0.0
 
     private var orbitTexture = 0
+    private var orbitTinyTexture = 0
     private var blaAbTexture = 0
     private var blaRTexture = 0
     private var paletteTexture = 0
@@ -242,6 +243,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         vao = ids[0]
 
         orbitTexture = createDataTexture()
+        orbitTinyTexture = createDataTexture()
         blaAbTexture = createDataTexture()
         blaRTexture = createDataTexture()
         paletteTexture = createRampTexture()
@@ -911,6 +913,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         }
 
         bindTexture(0, orbitTexture, u["uOrbit"]!!)
+        bindTexture(7, orbitTinyTexture, u["uOrbitTiny"]!!)
         bindTexture(1, blaAbTexture, u["uBlaAB"]!!)
         bindTexture(2, blaRTexture, u["uBlaR"]!!)
 
@@ -1079,6 +1082,17 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         GLES31.glTexImage2D(
             GLES31.GL_TEXTURE_2D, 0, GLES31.GL_RG32F,
             TEX_WIDTH, rows, 0, GLES31.GL_RG, GLES31.GL_FLOAT, buf
+        )
+
+        val tbuf = floatBuffer(rows * TEX_WIDTH * 4)
+        tbuf.put(gpu.tiny, 0, points * 4)
+        while (tbuf.position() < rows * TEX_WIDTH * 4) tbuf.put(0f)
+        tbuf.position(0)
+        GLES31.glBindTexture(GLES31.GL_TEXTURE_2D, orbitTinyTexture)
+        GLES31.glPixelStorei(GLES31.GL_UNPACK_ALIGNMENT, 1)
+        GLES31.glTexImage2D(
+            GLES31.GL_TEXTURE_2D, 0, GLES31.GL_RGBA32F,
+            TEX_WIDTH, rows, 0, GLES31.GL_RGBA, GLES31.GL_FLOAT, tbuf
         )
         uploadedLen = points - 1
     }
@@ -1770,6 +1784,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
                     GLES31.glUniform1iv(u["uBlaCount[0]"]!!, uploadedBlaLevels, uploadedBlaCount, 0)
                 }
                 bindTexture(0, orbitTexture, u["uOrbit"]!!)
+        bindTexture(7, orbitTinyTexture, u["uOrbitTiny"]!!)
                 bindTexture(1, blaAbTexture, u["uBlaAB"]!!)
                 bindTexture(2, blaRTexture, u["uBlaR"]!!)
             } else {
@@ -1977,6 +1992,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
                     GLES31.glUniform1iv(u["uBlaCount[0]"]!!, uploadedBlaLevels, uploadedBlaCount, 0)
                 }
                 bindTexture(0, orbitTexture, u["uOrbit"]!!)
+        bindTexture(7, orbitTinyTexture, u["uOrbitTiny"]!!)
                 bindTexture(1, blaAbTexture, u["uBlaAB"]!!)
                 bindTexture(2, blaRTexture, u["uBlaR"]!!)
             } else {
@@ -2626,7 +2642,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         )
         private val DIRECT_UNIFORMS = SHARED_UNIFORMS + arrayOf("uCenter", "uSpanY")
         private val PERTURB_UNIFORMS = SHARED_UNIFORMS + arrayOf(
-            "uOrbit", "uBlaAB", "uBlaR", "uWidthMask", "uWidthShift", "uOrbitLen",
+            "uOrbit", "uOrbitTiny", "uBlaAB", "uBlaR", "uWidthMask", "uWidthShift", "uOrbitLen",
             "uBlaLevels", "uBlaOffset[0]", "uBlaCount[0]", "uDeltaCenter", "uPixelSpan",
             "uInvScale", "uHalfScale", "uDerLimit", "uBailoutScaled",
             // Rescaled core only. The fast programs report -1 for these, and GL

@@ -191,6 +191,7 @@ object Shaders {
      */
     private val PERTURB_CORE = """
         uniform sampler2D uOrbit;
+        uniform sampler2D uOrbitTiny;
         uniform sampler2D uBlaAB;
         uniform sampler2D uBlaR;
 
@@ -213,6 +214,33 @@ object Shaders {
         vec2 fetchZ(int i) {
             return texelFetch(uOrbit, ivec2(i & uWidthMask, i >> uWidthShift), 0).rg;
         }
+        // 2Z at index i as a mantissa t and a binary exponent tE: 2Z = t * 2^tE.
+        // A plain float everywhere except where the reference passes so close to zero
+        // that a float cannot hold it (see OrbitGpuData.tiny); only then is the
+        // second texture read, so the common path costs one compare.
+        const float TINY_Z = 5.421010862427522e-20;   // 2^-64, OrbitGpuData.TINY_Z
+        vec2 fetchZe(int i, out int tE) {
+            ivec2 at = ivec2(i & uWidthMask, i >> uWidthShift);
+            vec2 t = texelFetch(uOrbit, at, 0).rg;
+            tE = 0;
+            if (max(abs(t.x), abs(t.y)) < TINY_Z) {
+                vec4 q = texelFetch(uOrbitTiny, at, 0);
+                t = q.xy;
+                tE = int(q.z);
+            }
+            return t;
+        }
+
+        // x * 2^k exactly, in two halves so no out-of-range power is formed.
+        float fzPow2(int k) {
+            return intBitsToFloat((k + 127) << 23);
+        }
+        vec2 fzScale(vec2 x, int k) {
+            k = clamp(k, -252, 252);
+            int h = k >> 1;
+            return (x * fzPow2(h)) * fzPow2(k - h);
+        }
+
         vec4 fetchAB(int i) {
             return texelFetch(uBlaAB, ivec2(i & uWidthMask, i >> uWidthShift), 0);
         }
@@ -251,7 +279,8 @@ object Shaders {
             vec2 dz = vec2(0.0);
             int m = 0;
             int n = 0;
-            vec2 t = fetchZ(0);
+            int tE = 0;
+            vec2 t = fetchZe(0, tE);
 
             // Level the BLA search settled on last iteration. Reset whenever the pixel
             // rebases, since that restarts dz at its full value and collapses the
@@ -343,11 +372,12 @@ object Shaders {
                 } else {
                     // Twice the full value at this step, unscaled: t is already twice
                     // the reference, and dz scaled back is the pixel's offset from it.
-                    if (n >= 1) der = cmul(der, t + dz * (2.0 * uInvScale));
+                    if (n >= 1) der = cmul(der, fzScale(t, tE) + dz * (2.0 * uInvScale));
                     // d^2 in scaled units is d*(d/scale). Computed this way the
                     // intermediate stays in range; a plain d*d would overflow.
                     vec2 sq = cmul(dz, dz * uInvScale);
-                    dz = cmul(t, dz) + sq + dc;
+                    vec2 td = cmul(t, dz);
+                    dz = (tE == 0 ? td : fzScale(td, tE)) + sq + dc;
                     n++;
                     m++;
                 }
@@ -355,11 +385,12 @@ object Shaders {
                 // Squared, to avoid a square root on the hot path.
                 if (dot(der, der) < uDerLimit) return false;
 
-                t = fetchZ(m);
+                t = fetchZe(m, tE);
 
                 // True value, still scaled. Tests use the max-norm because a squared
                 // length would overflow up here.
-                vec2 zs = t * uHalfScale + dz;
+                vec2 ts = t * uHalfScale;
+                vec2 zs = (tE == 0 ? ts : fzScale(ts, tE)) + dz;
                 float zMag = max(abs(zs.x), abs(zs.y));
 
                 if (zMag > uBailoutScaled) {
@@ -372,7 +403,7 @@ object Shaders {
                 if (zMag < max(abs(dz.x), abs(dz.y)) || m >= uOrbitLen) {
                     dz = zs;
                     m = 0;
-                    t = fetchZ(0);
+                    t = fetchZe(0, tE);
                     kWarm = 0;
                 }
 
@@ -417,6 +448,7 @@ object Shaders {
      */
     private val PERTURB_RESCALED_CORE = """
         uniform sampler2D uOrbit;
+        uniform sampler2D uOrbitTiny;
         uniform sampler2D uBlaAB;
         uniform sampler2D uBlaR;
 
@@ -437,6 +469,23 @@ object Shaders {
         vec2 fetchZ(int i) {
             return texelFetch(uOrbit, ivec2(i & uWidthMask, i >> uWidthShift), 0).rg;
         }
+        // 2Z at index i as a mantissa t and a binary exponent tE: 2Z = t * 2^tE.
+        // A plain float everywhere except where the reference passes so close to zero
+        // that a float cannot hold it (see OrbitGpuData.tiny); only then is the
+        // second texture read, so the common path costs one compare.
+        const float TINY_Z = 5.421010862427522e-20;   // 2^-64, OrbitGpuData.TINY_Z
+        vec2 fetchZe(int i, out int tE) {
+            ivec2 at = ivec2(i & uWidthMask, i >> uWidthShift);
+            vec2 t = texelFetch(uOrbit, at, 0).rg;
+            tE = 0;
+            if (max(abs(t.x), abs(t.y)) < TINY_Z) {
+                vec4 q = texelFetch(uOrbitTiny, at, 0);
+                t = q.xy;
+                tE = int(q.z);
+            }
+            return t;
+        }
+
         vec4 fetchAB(int i) {
             return texelFetch(uBlaAB, ivec2(i & uWidthMask, i >> uWidthShift), 0);
         }
@@ -512,7 +561,8 @@ object Shaders {
             int e = ec;
             int m = 0;
             int n = 0;
-            vec2 t = fetchZ(0);
+            int tE = 0;
+            vec2 t = fetchZe(0, tE);
             int kWarm = 0;
 
             // The full state is (w, e, m): an exact repeat of all three is a cycle of
@@ -574,15 +624,15 @@ object Shaders {
                     n += skip;
                     m += skip;
                 } else {
-                    // dz' = 2Z dz + dz^2 + dc. t is 2Z; 2*dz is w * 2^(e+1).
-                    if (n >= 1) der = cmul(der, t + scaleBy(w, e + 1));
+                    // dz' = 2Z dz + dz^2 + dc. 2Z is t * 2^tE; 2*dz is w * 2^(e+1).
+                    if (n >= 1) der = cmul(der, scaleBy(t, tE) + scaleBy(w, e + 1));
                     vec2 tw = cmul(t, w);
                     vec2 ww = cmul(w, w);
-                    int E = max(max(termExp(e, maxAbs(tw)), termExp(2 * e, maxAbs(ww))), eu);
+                    int E = max(max(termExp(e + tE, maxAbs(tw)), termExp(2 * e, maxAbs(ww))), eu);
                     if (E == NO_TERM) {
                         w = vec2(0.0);
                     } else {
-                        w = scaleBy(tw, e - E) + scaleBy(ww, 2 * e - E) + scaleBy(u, ec - E);
+                        w = scaleBy(tw, e + tE - E) + scaleBy(ww, 2 * e - E) + scaleBy(u, ec - E);
                         e = E;
                     }
                     n++;
@@ -600,12 +650,12 @@ object Shaders {
 
                 if (dot(der, der) < uDerLimit) return false;
 
-                t = fetchZ(m);
-                vec2 Z = 0.5 * t;
+                t = fetchZe(m, tE);
+                vec2 Z = 0.5 * t;           // Z = this * 2^tE
 
                 // Full value. When dz is far below Z the scaled term is zero and this
                 // is Z itself, which is exact to float precision.
-                vec2 zf = Z + scaleBy(w, e);
+                vec2 zf = scaleBy(Z, tE) + scaleBy(w, e);
                 if (maxAbs(zf) > uBailout) {
                     outN = n;
                     outZ = zf;
@@ -619,14 +669,14 @@ object Shaders {
                 bool forced = m >= uOrbitLen;
                 bool rebase = false;
                 float zM = maxAbs(Z);
-                if (zM > 0.0 && expOf(zM) > e + 30) {
+                if (zM > 0.0 && expOf(zM) + tE > e + 30) {
                     if (forced) {
                         w = Z;
-                        e = 0;
+                        e = tE;
                         rebase = true;
                     }
                 } else {
-                    vec2 zw = w + scaleBy(Z, -e);
+                    vec2 zw = w + scaleBy(Z, tE - e);
                     if (forced || maxAbs(zw) < maxAbs(w)) {
                         w = zw;
                         rebase = true;
@@ -640,7 +690,7 @@ object Shaders {
                         e += k;
                     }
                     m = 0;
-                    t = fetchZ(0);
+                    t = fetchZe(0, tE);
                     kWarm = 0;
                 }
 
