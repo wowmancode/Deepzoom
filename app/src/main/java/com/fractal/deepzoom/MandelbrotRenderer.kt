@@ -120,6 +120,16 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
      * frame is the dangerous one, and there is no measurement to size it from yet.
      */
     private var sceneSegments = MAX_SCENE_SEGMENTS
+
+    /**
+     * Measured GPU cost of the main pass per pixel, at [costMaxIter] iterations, and of
+     * the tile pass per tile. Zero means not measured yet. Every scene pass measures
+     * itself, so the next one -- including a refinement at four times the pixels --
+     * is split from what this view actually costs, not from a cheaper frame earlier.
+     */
+    private var msPerPixel = 0.0
+    private var msPerTile = 0.0
+    private var costMaxIter = 1
     var finestLevel: Int = 0
         set(value) {
             field = value.coerceIn(0, 3)
@@ -475,21 +485,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
      * before the GPU has done the work, and the adaptation would chase noise. The stall
      * costs a little pipelining, which is a fair trade for not guessing.
      */
-    private fun updateAdaptive(startNs: Long) {
-        GLES31.glFinish()
-        lastRenderMs = (System.nanoTime() - startNs) / 1e6
-
-        // Band count for the next frame, from what this one cost per band. Rises
-        // quickly and falls by one at a time: overshooting costs a few extra
-        // submissions, while undershooting is what loses the context.
-        val perSeg = lastRenderMs / sceneSegments.coerceAtLeast(1)
-        sceneSegments = if (perSeg > SEGMENT_TARGET_MS) {
-            Math.ceil(lastRenderMs / SEGMENT_TARGET_MS).toInt()
-                .coerceIn(1, MAX_SCENE_SEGMENTS)
-        } else {
-            max(1, sceneSegments - 1)
-        }
-
+    private fun updateAdaptive() {
         if (lastRenderMs > SLOW_FRAME_MS) {
             adaptiveLevel = min(adaptiveLevel + 1, min(3, finestLevel + 3))
         } else if (lastRenderMs < FAST_FRAME_MS) {
@@ -497,9 +493,31 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         }
     }
 
+    /**
+     * Bands needed to keep each submission of `units` units of work under
+     * SEGMENT_TARGET_MS, at the measured cost per unit scaled up if the iteration limit
+     * has risen since. Unmeasured work gets the maximum.
+     *
+     * This is what stops the GPU watchdog. A submission that runs too long is cut off
+     * by the driver, and on a tiled GPU (Mali, Adreno) the screen regions it had not
+     * reached keep whatever the target held before: rectangles of the previous frame,
+     * at its zoom, left in the new one. Refinement passes used to reuse the band count
+     * from the last gesture frame, which at a quarter of the pixels was far too few.
+     */
+    private fun bandsFor(msPerUnit: Double, units: Long, maxIter: Int, cap: Int): Int {
+        if (msPerUnit <= 0.0) return cap
+        val iterScale = max(1.0, maxIter.toDouble() / costMaxIter)
+        val est = msPerUnit * units * iterScale * BAND_SAFETY
+        return ceil(est / SEGMENT_TARGET_MS).toInt().coerceIn(1, cap)
+    }
+
+    /** Rises at once to a slower measurement, falls halfway to a faster one. */
+    private fun blendCost(old: Double, measured: Double): Double =
+        if (old <= 0.0 || measured >= old) measured else 0.5 * (old + measured)
+
     /** Renders the fractal into the lower-left sub-rect of the scene texture. */
     private fun renderSceneAtLevel(level: Int, measure: Boolean) {
-        val startNs = if (measure) System.nanoTime() else 0L
+        val startNs = System.nanoTime()
         ensureSceneTarget(surfaceW, surfaceH)
         val w = max(1, surfaceW shr level)
         val h = max(1, surfaceH shr level)
@@ -528,8 +546,27 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
             GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, tileFbo)
             GLES31.glViewport(0, 0, tw, th)
             GLES31.glClear(GLES31.GL_COLOR_BUFFER_BIT)
-            if (bundle != null) drawPerturbation(state, bundle, w, h, false, tilePass = true)
-            else drawDirect(state, w, h, false, tilePass = true)
+
+            // The tile pass is split by rows of tiles too. Each of its fragments walks
+            // a whole tile border serially, so at a high iteration limit it is easily
+            // the longest submission in the frame -- and it used to be a single one.
+            val tStart = System.nanoTime()
+            val tileBands = bandsFor(msPerTile, tw.toLong() * th, state.maxIter, th)
+            val rects = IntArray(tileBands * 4)
+            for (k in 0 until tileBands) {
+                val y0 = th * k / tileBands
+                val y1 = th * (k + 1) / tileBands
+                rects[4 * k] = 0; rects[4 * k + 1] = y0
+                rects[4 * k + 2] = tw; rects[4 * k + 3] = y1 - y0
+            }
+            if (bundle != null) {
+                drawPerturbation(state, bundle, w, h, false, tilePass = true, rects = rects)
+            } else {
+                drawDirect(state, w, h, false, tilePass = true, rects = rects)
+            }
+            GLES31.glFinish()
+            val tileMs = (System.nanoTime() - tStart) / 1e6
+            msPerTile = blendCost(msPerTile, tileMs / (tw.toLong() * th))
         }
 
         GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, sceneFbo)
@@ -551,7 +588,10 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         // Banding changes nothing about the work or the result -- each band computes
         // its own fragments from gl_FragCoord exactly as before -- only how much of it
         // is handed over at a time.
-        val segs = sceneSegments.coerceIn(1, MAX_SCENE_SEGMENTS)
+        val pixels = w.toLong() * h
+        val segs = bandsFor(msPerPixel, pixels, state.maxIter, min(MAX_SCENE_SEGMENTS, h))
+        sceneSegments = segs
+        val mainStart = System.nanoTime()
         if (bundle != null) {
             drawPerturbation(state, bundle, w, h, tiles, segments = segs)
         } else {
@@ -560,7 +600,15 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
 
         GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, 0)
         GLES31.glViewport(0, 0, surfaceW, surfaceH)
-        if (measure) updateAdaptive(startNs)
+
+        // Timing needs glFinish to mean anything: without it the calls return long
+        // before the GPU has done the work.
+        GLES31.glFinish()
+        val now = System.nanoTime()
+        msPerPixel = blendCost(msPerPixel, (now - mainStart) / 1e6 / pixels)
+        costMaxIter = max(1, state.maxIter)
+        lastRenderMs = (now - startNs) / 1e6
+        if (measure) updateAdaptive()
 
         snapCenterX = state.centerX
         snapCenterY = state.centerY
@@ -664,7 +712,10 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         }
         GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, sceneFbo)
         GLES31.glViewport(0, 0, w, h)
-        val segs = sceneSegments.coerceIn(1, MAX_SCENE_SEGMENTS)
+        var area = 0L
+        var k = 0
+        while (k + 3 < rects.size) { area += rects[k + 2].toLong() * rects[k + 3]; k += 4 }
+        val segs = bandsFor(msPerPixel, area, s.maxIter, MAX_SCENE_SEGMENTS)
         if (snapPerturb) {
             drawPerturbation(s, snapBundle!!, w, h, false, segments = segs, rects = rects.toIntArray())
         } else {
@@ -1102,6 +1153,9 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
 
     fun invalidateOrbit() {
         active = null
+        // A new place can cost anything; split its first frame finely until measured.
+        msPerPixel = 0.0
+        msPerTile = 0.0
     }
 
     // --- Offscreen rendering ----------------------------------------------------------
@@ -2591,10 +2645,17 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
          * Longest a single interactive submission is allowed to be. Chosen well under
          * the couple of seconds a mobile GPU watchdog typically allows.
          */
-        private const val SEGMENT_TARGET_MS = 250.0
+        private const val SEGMENT_TARGET_MS = 150.0
 
-        /** Ceiling on the interactive band count. */
-        private const val MAX_SCENE_SEGMENTS = 32
+        /**
+         * Ceiling on the band count. High enough that even a frame costing tens of
+         * seconds at full resolution is split into submissions the watchdog allows;
+         * a band is never thinner than one row.
+         */
+        private const val MAX_SCENE_SEGMENTS = 256
+
+        /** Margin on the cost estimate: pixels within one frame vary a lot in cost. */
+        private const val BAND_SAFETY = 2.0
 
         /**
          * Squared derivative below which a pixel is taken as interior.
