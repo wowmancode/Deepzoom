@@ -49,16 +49,30 @@ class MainActivity : AppCompatActivity() {
         motionSlider = findViewById(R.id.motion_slider)
         motionLabel = findViewById(R.id.motion_label)
         readout = findViewById(R.id.readout)
+        // Hidden diagnostic: long-press the readout to colour pixels that do not escape
+        // by the reason (blue iterations, red cycle check, yellow NaN/inf, cyan tile).
+        readout.setOnLongClickListener {
+            view.renderer.debugReasons = !view.renderer.debugReasons
+            view.requestRender()
+            toast(if (view.renderer.debugReasons)
+                "Diagnostics on: blue = out of iterations, red = cycle check, " +
+                    "yellow = NaN/inf, cyan = solid tile, magenta = bad escape"
+            else "Diagnostics off")
+            true
+        }
         status = findViewById(R.id.status)
         exporter = ExportManager(view)
 
         // Log scale: deep zooms need orders of magnitude more iterations than shallow
         // ones, and a linear slider would spend its travel on values nobody wants.
         iterSlider.valueFrom = 5f      // 2^5  = 32
-        iterSlider.valueTo = 16f       // 2^16 = 65536
+        iterSlider.valueTo = 20f       // 2^20 = 1048576, ViewState.MAX_ITER
         iterSlider.stepSize = 0.5f
         iterSlider.value = 9f
-        iterSlider.addOnChangeListener { _, v, _ ->
+        iterSlider.addOnChangeListener { _, v, fromUser ->
+            // Only a drag sets the count. A programmatic set (loading a position code,
+            // reset) only moves the thumb, so a code's exact count is not rounded away.
+            if (!fromUser) return@addOnChangeListener
             view.setMaxIter(2.0.pow(v.toDouble()).roundToInt())
             updateReadout()
             wake()
@@ -188,8 +202,14 @@ class MainActivity : AppCompatActivity() {
                 } else {
                     view.applyState(parsed.state)
                     parsed.palette?.let { view.renderer.palette = it }
-                    iterSlider.value = (kotlin.math.ln(parsed.state.maxIter.toDouble()) /
-                        kotlin.math.ln(2.0)).toFloat().coerceIn(5f, 16f)
+                    // Snapped to the slider's 0.5 steps: Material's Slider throws on the
+                    // next draw for any value off its step grid, and most iteration
+                    // counts (1500, or even 1448 from this slider's own half steps)
+                    // are not exact half-powers of two.
+                    val log2Iter = kotlin.math.ln(parsed.state.maxIter.toDouble()) /
+                        kotlin.math.ln(2.0)
+                    iterSlider.value = (Math.round(log2Iter * 2.0) / 2.0).toFloat()
+                        .coerceIn(iterSlider.valueFrom, iterSlider.valueTo)
                     updateReadout()
                 }
                 wake()

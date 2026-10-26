@@ -138,6 +138,7 @@ class MandelbrotView @JvmOverloads constructor(
     private fun beginGesture() {
         if (gesturing) return
         gesturing = true
+        renderer.cancelSettle()
         renderer.interactive = true
         renderer.resetAdaptive()
     }
@@ -146,9 +147,11 @@ class MandelbrotView @JvmOverloads constructor(
         if (!gesturing) return
         gesturing = false
         renderer.interactive = false
-        // Refine back up to the target resolution now that nothing is moving.
-        renderer.markDirty()
+        // Refine back up to the target resolution now that nothing is moving --
+        // starting from what is already on screen, when that is still the view.
+        renderer.settleAfterGesture()
         requestRender()
+        onViewChanged?.invoke()
     }
 
     fun resetView() {

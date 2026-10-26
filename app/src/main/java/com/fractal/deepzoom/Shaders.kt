@@ -36,6 +36,13 @@ object Shaders {
         uniform int   uTileSize;
         uniform int   uUseTiles;
 
+        // Diagnostics (long-press the readout). Instead of the interior colour, a pixel
+        // that does not escape is coloured by why: blue ran out of iterations, red the
+        // cycle check, yellow a NaN or infinity in the iteration, cyan a tile proved
+        // solid. Magenta marks an escape whose value is not finite.
+        uniform int   uDebug;
+        int gReason = 1;
+
         // Colour depends only on the escape count, never on zoom. An escape count does
         // not change as you descend, so a pixel keeps its colour at any depth. The
         // palette is sampled with repeat wrapping, so no fract() is needed and the
@@ -150,7 +157,7 @@ object Shaders {
                 // return to within a distance that scales with the atom, so any fixed
                 // threshold starts marking escaping pixels interior once the zoom is
                 // deep enough, which shows up as black speckles.
-                if (z == hare) return false;
+                if (z == hare) { gReason = 2; return false; }
                 period--;
                 if (period == 0) {
                     hare = z;
@@ -191,6 +198,7 @@ object Shaders {
      */
     private val PERTURB_CORE = """
         uniform sampler2D uOrbit;
+        uniform sampler2D uOrbitTiny;
         uniform sampler2D uBlaAB;
         uniform sampler2D uBlaR;
 
@@ -213,6 +221,29 @@ object Shaders {
         vec2 fetchZ(int i) {
             return texelFetch(uOrbit, ivec2(i & uWidthMask, i >> uWidthShift), 0).rg;
         }
+        // 2Z at index i as a mantissa t and a binary exponent tE: 2Z = t * 2^tE.
+        // A plain float everywhere except where the reference passes so close to zero
+        // that a float cannot hold it (see OrbitGpuData.tiny); only then is the
+        // second texture read, so the common path costs one compare.
+        const float TINY_Z = 5.421010862427522e-20;   // 2^-64, OrbitGpuData.TINY_Z
+        vec2 fetchZe(int i, out int tE) {
+            ivec2 at = ivec2(i & uWidthMask, i >> uWidthShift);
+            vec2 t = texelFetch(uOrbit, at, 0).rg;
+            tE = 0;
+            if (max(abs(t.x), abs(t.y)) < TINY_Z) {
+                vec4 q = texelFetch(uOrbitTiny, at, 0);
+                t = q.xy;
+                tE = int(q.z);
+            }
+            return t;
+        }
+
+        // x * 2^k, with the exponent applied directly (see scaleBy in the rescaled core
+        // for why this is ldexp and not a product of powers).
+        vec2 fzScale(vec2 x, int k) {
+            return ldexp(x, ivec2(clamp(k, -252, 252)));
+        }
+
         vec4 fetchAB(int i) {
             return texelFetch(uBlaAB, ivec2(i & uWidthMask, i >> uWidthShift), 0);
         }
@@ -251,7 +282,8 @@ object Shaders {
             vec2 dz = vec2(0.0);
             int m = 0;
             int n = 0;
-            vec2 t = fetchZ(0);
+            int tE = 0;
+            vec2 t = fetchZe(0, tE);
 
             // Level the BLA search settled on last iteration. Reset whenever the pixel
             // rebases, since that restarts dz at its full value and collapses the
@@ -343,11 +375,12 @@ object Shaders {
                 } else {
                     // Twice the full value at this step, unscaled: t is already twice
                     // the reference, and dz scaled back is the pixel's offset from it.
-                    if (n >= 1) der = cmul(der, t + dz * (2.0 * uInvScale));
+                    if (n >= 1) der = cmul(der, fzScale(t, tE) + dz * (2.0 * uInvScale));
                     // d^2 in scaled units is d*(d/scale). Computed this way the
                     // intermediate stays in range; a plain d*d would overflow.
                     vec2 sq = cmul(dz, dz * uInvScale);
-                    dz = cmul(t, dz) + sq + dc;
+                    vec2 td = cmul(t, dz);
+                    dz = (tE == 0 ? td : fzScale(td, tE)) + sq + dc;
                     n++;
                     m++;
                 }
@@ -355,11 +388,16 @@ object Shaders {
                 // Squared, to avoid a square root on the hot path.
                 if (dot(der, der) < uDerLimit) return false;
 
-                t = fetchZ(m);
+                t = fetchZe(m, tE);
 
                 // True value, still scaled. Tests use the max-norm because a squared
                 // length would overflow up here.
-                vec2 zs = t * uHalfScale + dz;
+                vec2 ts = t * uHalfScale;
+                vec2 zs = (tE == 0 ? ts : fzScale(ts, tE)) + dz;
+                if (uDebug != 0 && (any(isnan(zs)) || any(isinf(zs)) || any(isnan(dz)))) {
+                    gReason = 3;
+                    return false;
+                }
                 float zMag = max(abs(zs.x), abs(zs.y));
 
                 if (zMag > uBailoutScaled) {
@@ -372,11 +410,11 @@ object Shaders {
                 if (zMag < max(abs(dz.x), abs(dz.y)) || m >= uOrbitLen) {
                     dz = zs;
                     m = 0;
-                    t = fetchZ(0);
+                    t = fetchZe(0, tE);
                     kWarm = 0;
                 }
 
-                if (dz == hareDz && m == hareM) return false;
+                if (dz == hareDz && m == hareM) { gReason = 2; return false; }
                 period--;
                 if (period == 0) {
                     hareDz = dz;
@@ -417,6 +455,7 @@ object Shaders {
      */
     private val PERTURB_RESCALED_CORE = """
         uniform sampler2D uOrbit;
+        uniform sampler2D uOrbitTiny;
         uniform sampler2D uBlaAB;
         uniform sampler2D uBlaR;
 
@@ -437,6 +476,23 @@ object Shaders {
         vec2 fetchZ(int i) {
             return texelFetch(uOrbit, ivec2(i & uWidthMask, i >> uWidthShift), 0).rg;
         }
+        // 2Z at index i as a mantissa t and a binary exponent tE: 2Z = t * 2^tE.
+        // A plain float everywhere except where the reference passes so close to zero
+        // that a float cannot hold it (see OrbitGpuData.tiny); only then is the
+        // second texture read, so the common path costs one compare.
+        const float TINY_Z = 5.421010862427522e-20;   // 2^-64, OrbitGpuData.TINY_Z
+        vec2 fetchZe(int i, out int tE) {
+            ivec2 at = ivec2(i & uWidthMask, i >> uWidthShift);
+            vec2 t = texelFetch(uOrbit, at, 0).rg;
+            tE = 0;
+            if (max(abs(t.x), abs(t.y)) < TINY_Z) {
+                vec4 q = texelFetch(uOrbitTiny, at, 0);
+                t = q.xy;
+                tE = int(q.z);
+            }
+            return t;
+        }
+
         vec4 fetchAB(int i) {
             return texelFetch(uBlaAB, ivec2(i & uWidthMask, i >> uWidthShift), 0);
         }
@@ -462,22 +518,35 @@ object Shaders {
             return ((floatBitsToInt(x) >> 23) & 255) - 127;
         }
 
-        // 2^k built from its bits: exact, unlike exp2(), for k in [-126, 127].
-        float pow2(int k) {
-            return intBitsToFloat((k + 127) << 23);
-        }
-
-        // x * 2^k in two exact halves, so shifts up to 252 either way never form an
-        // out-of-range power. Every call here shifts a term down to the largest one,
-        // so a shift past -252 is a term far below float precision, and 0 is right.
+        // x * 2^k. Every call here shifts a term down to the largest one, so a shift
+        // past -252 is a term far below float precision, and 0 is right.
+        //
+        // ldexp applies the exponent directly. This used to be (x * 2^h) * 2^(k-h), two
+        // in-range powers, which is only safe if the multiplications run in that order.
+        // A GPU compiler may regroup it as x * (2^h * 2^(k-h)), and then for |k| > 127
+        // the power itself overflows to infinity or flushes to zero: a small term
+        // shifted up became infinite, and 0 * inf gave NaN. On a Pixel 9 (Mali) that
+        // turned whole regions of deep views black, along straight edges through the
+        // reference where pixels rebase. ldexp cannot be regrouped.
         vec2 scaleBy(vec2 x, int k) {
-            k = clamp(k, -252, 252);
-            int h = k >> 1;
-            return (x * pow2(h)) * pow2(k - h);
+            return ldexp(x, ivec2(clamp(k, -252, 252)));
         }
 
         float maxAbs(vec2 v) {
             return max(abs(v.x), abs(v.y));
+        }
+
+        // Exponent of one term when choosing the common exponent E. A zero term must
+        // never win. expOf(0) is -127, which is only "below any real term" while the
+        // real terms are within 2^127 of the delta. After a rebase onto a nucleus the
+        // reference is exactly zero and the real terms (dz^2, dc) sit hundreds of
+        // binary orders below e, so the zero 2*Z*dz term at e - 127 won, every real
+        // term was shifted out of float range, and the pixel collapsed onto the
+        // reference -- drawn as interior, at depths and places that depend on how
+        // close the pixel's orbit comes to the nucleus.
+        const int NO_TERM = -1073741823;
+        int termExp(int base, float mag) {
+            return mag > 0.0 ? base + expOf(mag) : NO_TERM;
         }
 
         // Radii are stored as log2(0.7 * r); the 0.7 is the same max-norm allowance
@@ -490,7 +559,7 @@ object Shaders {
             // dc = u * 2^ec, fixed for the pixel.
             vec2 u = uDeltaCenter + off;
             int ec = -uScaleExp;
-            int eu = ec + expOf(maxAbs(u));
+            int eu = termExp(ec, maxAbs(u));
             outN = uMaxIter;
             outZ = vec2(0.0);
 
@@ -499,7 +568,8 @@ object Shaders {
             int e = ec;
             int m = 0;
             int n = 0;
-            vec2 t = fetchZ(0);
+            int tE = 0;
+            vec2 t = fetchZe(0, tE);
             int kWarm = 0;
 
             // The full state is (w, e, m): an exact repeat of all three is a cycle of
@@ -551,19 +621,27 @@ object Shaders {
                     if (n >= 1) der = cmul(der, ab.xy);
                     vec2 aw = cmul(ab.xy, w);
                     vec2 bu = cmul(ab.zw, u);
-                    int E = max(e + expOf(maxAbs(aw)), ec + expOf(maxAbs(bu)));
-                    w = scaleBy(aw, e - E) + scaleBy(bu, ec - E);
-                    e = E;
+                    int E = max(termExp(e, maxAbs(aw)), termExp(ec, maxAbs(bu)));
+                    if (E == NO_TERM) {
+                        w = vec2(0.0);   // every term is zero; e stays as it was
+                    } else {
+                        w = scaleBy(aw, e - E) + scaleBy(bu, ec - E);
+                        e = E;
+                    }
                     n += skip;
                     m += skip;
                 } else {
-                    // dz' = 2Z dz + dz^2 + dc. t is 2Z; 2*dz is w * 2^(e+1).
-                    if (n >= 1) der = cmul(der, t + scaleBy(w, e + 1));
+                    // dz' = 2Z dz + dz^2 + dc. 2Z is t * 2^tE; 2*dz is w * 2^(e+1).
+                    if (n >= 1) der = cmul(der, scaleBy(t, tE) + scaleBy(w, e + 1));
                     vec2 tw = cmul(t, w);
                     vec2 ww = cmul(w, w);
-                    int E = max(max(e + expOf(maxAbs(tw)), 2 * e + expOf(maxAbs(ww))), eu);
-                    w = scaleBy(tw, e - E) + scaleBy(ww, 2 * e - E) + scaleBy(u, ec - E);
-                    e = E;
+                    int E = max(max(termExp(e + tE, maxAbs(tw)), termExp(2 * e, maxAbs(ww))), eu);
+                    if (E == NO_TERM) {
+                        w = vec2(0.0);
+                    } else {
+                        w = scaleBy(tw, e + tE - E) + scaleBy(ww, 2 * e - E) + scaleBy(u, ec - E);
+                        e = E;
+                    }
                     n++;
                     m++;
                 }
@@ -579,12 +657,16 @@ object Shaders {
 
                 if (dot(der, der) < uDerLimit) return false;
 
-                t = fetchZ(m);
-                vec2 Z = 0.5 * t;
+                t = fetchZe(m, tE);
+                vec2 Z = 0.5 * t;           // Z = this * 2^tE
 
                 // Full value. When dz is far below Z the scaled term is zero and this
                 // is Z itself, which is exact to float precision.
-                vec2 zf = Z + scaleBy(w, e);
+                vec2 zf = scaleBy(Z, tE) + scaleBy(w, e);
+                if (uDebug != 0 && (any(isnan(w)) || any(isinf(w)) || any(isnan(zf)) || any(isinf(zf)))) {
+                    gReason = 3;
+                    return false;
+                }
                 if (maxAbs(zf) > uBailout) {
                     outN = n;
                     outZ = zf;
@@ -598,14 +680,14 @@ object Shaders {
                 bool forced = m >= uOrbitLen;
                 bool rebase = false;
                 float zM = maxAbs(Z);
-                if (zM > 0.0 && expOf(zM) > e + 30) {
+                if (zM > 0.0 && expOf(zM) + tE > e + 30) {
                     if (forced) {
                         w = Z;
-                        e = 0;
+                        e = tE;
                         rebase = true;
                     }
                 } else {
-                    vec2 zw = w + scaleBy(Z, -e);
+                    vec2 zw = w + scaleBy(Z, tE - e);
                     if (forced || maxAbs(zw) < maxAbs(w)) {
                         w = zw;
                         rebase = true;
@@ -619,11 +701,11 @@ object Shaders {
                         e += k;
                     }
                     m = 0;
-                    t = fetchZ(0);
+                    t = fetchZe(0, tE);
                     kWarm = 0;
                 }
 
-                if (w == hareW && e == hareE && m == hareM) return false;
+                if (w == hareW && e == hareE && m == hareM) { gReason = 2; return false; }
                 period--;
                 if (period == 0) {
                     hareW = w;
@@ -643,14 +725,26 @@ object Shaders {
 
     private val MAIN_BODY = """
         void main() {
+            gReason = 1;
             if (tileIsSolid()) {
-                fragColor = vec4(uInterior, 1.0);
+                fragColor = vec4(uDebug != 0 ? vec3(0.0, 1.0, 1.0) : uInterior, 1.0);
                 return;
             }
             int n;
             vec2 z;
             if (!escapes(gl_FragCoord.xy, n, z)) {
+                if (uDebug != 0) {
+                    vec3 c = gReason == 2 ? vec3(1.0, 0.0, 0.0)
+                           : gReason == 3 ? vec3(1.0, 1.0, 0.0)
+                           : vec3(0.0, 0.3, 1.0);
+                    fragColor = vec4(c, 1.0);
+                    return;
+                }
                 fragColor = vec4(uInterior, 1.0);
+                return;
+            }
+            if (uDebug != 0 && (any(isnan(z)) || any(isinf(z)) || isinf(dot(z, z)))) {
+                fragColor = vec4(1.0, 0.0, 1.0, 1.0);
                 return;
             }
             fragColor = vec4(shade(n, z), 1.0);
