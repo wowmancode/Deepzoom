@@ -66,7 +66,7 @@ class MainActivity : AppCompatActivity() {
         // Log scale: deep zooms need orders of magnitude more iterations than shallow
         // ones, and a linear slider would spend its travel on values nobody wants.
         iterSlider.valueFrom = 5f      // 2^5  = 32
-        iterSlider.valueTo = 16f       // 2^16 = 65536
+        iterSlider.valueTo = 20f       // 2^20 = 1048576, ViewState.MAX_ITER
         iterSlider.stepSize = 0.5f
         iterSlider.value = 9f
         iterSlider.addOnChangeListener { _, v, fromUser ->

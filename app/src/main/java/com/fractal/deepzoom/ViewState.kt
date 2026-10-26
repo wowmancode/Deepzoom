@@ -109,6 +109,16 @@ class ViewState {
 
     companion object {
         const val DEFAULT_SPAN = 3.0
+
+        /**
+         * Highest iteration limit, 2^20. What bounds it is memory, not the shader: the
+         * reference orbit and its BLA table grow with the limit, and the BLA build
+         * holds about 40 bytes per entry in doubles while merging (roughly 2 entries
+         * per iteration), so 2^20 costs on the order of 130 MB at peak. The GPU tables
+         * at this size stay within 2048 rows of 1024, the minimum texture height any
+         * OpenGL ES 3 device must support.
+         */
+        const val MAX_ITER = 1 shl 20
         const val MAX_SPAN = 8.0
 
         /** Below this span, direct float32 iteration is never used. */

@@ -46,7 +46,7 @@ object PositionCodec {
             val span = parts[3].toDouble()
             if (!span.isFinite() || span <= 0.0) return null
             s.spanY = span.coerceIn(s.minSpan(), ViewState.MAX_SPAN)
-            s.maxIter = parts[4].toInt().coerceIn(32, 65536)
+            s.maxIter = parts[4].toInt().coerceIn(32, ViewState.MAX_ITER)
 
             // A malformed palette should not cost you the position.
             val palette = if (parts[0] == V2 && parts.size >= 6)

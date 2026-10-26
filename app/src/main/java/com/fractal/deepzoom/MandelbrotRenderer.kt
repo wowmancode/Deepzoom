@@ -2636,8 +2636,11 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
 
         const val TEX_WIDTH = 1024
         const val TEX_SHIFT = 10
-        const val MAX_POINTS = 1024 * 128
-        const val MAX_BLA_ENTRIES = 1024 * 256
+        /** One orbit point per iteration plus the start; one spare row of slack. */
+        const val MAX_POINTS = ViewState.MAX_ITER + TEX_WIDTH
+
+        /** About two BLA entries per iteration: 2048 rows of 1024 at the limit. */
+        const val MAX_BLA_ENTRIES = 2 * ViewState.MAX_ITER
         const val BAILOUT = 8.0
 
         /** How many extra coarse passes precede the final one. */
