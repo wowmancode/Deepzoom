@@ -238,14 +238,10 @@ object Shaders {
             return t;
         }
 
-        // x * 2^k exactly, in two halves so no out-of-range power is formed.
-        float fzPow2(int k) {
-            return intBitsToFloat((k + 127) << 23);
-        }
+        // x * 2^k, with the exponent applied directly (see scaleBy in the rescaled core
+        // for why this is ldexp and not a product of powers).
         vec2 fzScale(vec2 x, int k) {
-            k = clamp(k, -252, 252);
-            int h = k >> 1;
-            return (x * fzPow2(h)) * fzPow2(k - h);
+            return ldexp(x, ivec2(clamp(k, -252, 252)));
         }
 
         vec4 fetchAB(int i) {
@@ -522,18 +518,18 @@ object Shaders {
             return ((floatBitsToInt(x) >> 23) & 255) - 127;
         }
 
-        // 2^k built from its bits: exact, unlike exp2(), for k in [-126, 127].
-        float pow2(int k) {
-            return intBitsToFloat((k + 127) << 23);
-        }
-
-        // x * 2^k in two exact halves, so shifts up to 252 either way never form an
-        // out-of-range power. Every call here shifts a term down to the largest one,
-        // so a shift past -252 is a term far below float precision, and 0 is right.
+        // x * 2^k. Every call here shifts a term down to the largest one, so a shift
+        // past -252 is a term far below float precision, and 0 is right.
+        //
+        // ldexp applies the exponent directly. This used to be (x * 2^h) * 2^(k-h), two
+        // in-range powers, which is only safe if the multiplications run in that order.
+        // A GPU compiler may regroup it as x * (2^h * 2^(k-h)), and then for |k| > 127
+        // the power itself overflows to infinity or flushes to zero: a small term
+        // shifted up became infinite, and 0 * inf gave NaN. On a Pixel 9 (Mali) that
+        // turned whole regions of deep views black, along straight edges through the
+        // reference where pixels rebase. ldexp cannot be regrouped.
         vec2 scaleBy(vec2 x, int k) {
-            k = clamp(k, -252, 252);
-            int h = k >> 1;
-            return (x * pow2(h)) * pow2(k - h);
+            return ldexp(x, ivec2(clamp(k, -252, 252)));
         }
 
         float maxAbs(vec2 v) {
