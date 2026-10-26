@@ -36,6 +36,13 @@ object Shaders {
         uniform int   uTileSize;
         uniform int   uUseTiles;
 
+        // Diagnostics (long-press the readout). Instead of the interior colour, a pixel
+        // that does not escape is coloured by why: blue ran out of iterations, red the
+        // cycle check, yellow a NaN or infinity in the iteration, cyan a tile proved
+        // solid. Magenta marks an escape whose value is not finite.
+        uniform int   uDebug;
+        int gReason = 1;
+
         // Colour depends only on the escape count, never on zoom. An escape count does
         // not change as you descend, so a pixel keeps its colour at any depth. The
         // palette is sampled with repeat wrapping, so no fract() is needed and the
@@ -150,7 +157,7 @@ object Shaders {
                 // return to within a distance that scales with the atom, so any fixed
                 // threshold starts marking escaping pixels interior once the zoom is
                 // deep enough, which shows up as black speckles.
-                if (z == hare) return false;
+                if (z == hare) { gReason = 2; return false; }
                 period--;
                 if (period == 0) {
                     hare = z;
@@ -391,6 +398,10 @@ object Shaders {
                 // length would overflow up here.
                 vec2 ts = t * uHalfScale;
                 vec2 zs = (tE == 0 ? ts : fzScale(ts, tE)) + dz;
+                if (uDebug != 0 && (any(isnan(zs)) || any(isinf(zs)) || any(isnan(dz)))) {
+                    gReason = 3;
+                    return false;
+                }
                 float zMag = max(abs(zs.x), abs(zs.y));
 
                 if (zMag > uBailoutScaled) {
@@ -407,7 +418,7 @@ object Shaders {
                     kWarm = 0;
                 }
 
-                if (dz == hareDz && m == hareM) return false;
+                if (dz == hareDz && m == hareM) { gReason = 2; return false; }
                 period--;
                 if (period == 0) {
                     hareDz = dz;
@@ -656,6 +667,10 @@ object Shaders {
                 // Full value. When dz is far below Z the scaled term is zero and this
                 // is Z itself, which is exact to float precision.
                 vec2 zf = scaleBy(Z, tE) + scaleBy(w, e);
+                if (uDebug != 0 && (any(isnan(w)) || any(isinf(w)) || any(isnan(zf)) || any(isinf(zf)))) {
+                    gReason = 3;
+                    return false;
+                }
                 if (maxAbs(zf) > uBailout) {
                     outN = n;
                     outZ = zf;
@@ -694,7 +709,7 @@ object Shaders {
                     kWarm = 0;
                 }
 
-                if (w == hareW && e == hareE && m == hareM) return false;
+                if (w == hareW && e == hareE && m == hareM) { gReason = 2; return false; }
                 period--;
                 if (period == 0) {
                     hareW = w;
@@ -714,14 +729,26 @@ object Shaders {
 
     private val MAIN_BODY = """
         void main() {
+            gReason = 1;
             if (tileIsSolid()) {
-                fragColor = vec4(uInterior, 1.0);
+                fragColor = vec4(uDebug != 0 ? vec3(0.0, 1.0, 1.0) : uInterior, 1.0);
                 return;
             }
             int n;
             vec2 z;
             if (!escapes(gl_FragCoord.xy, n, z)) {
+                if (uDebug != 0) {
+                    vec3 c = gReason == 2 ? vec3(1.0, 0.0, 0.0)
+                           : gReason == 3 ? vec3(1.0, 1.0, 0.0)
+                           : vec3(0.0, 0.3, 1.0);
+                    fragColor = vec4(c, 1.0);
+                    return;
+                }
                 fragColor = vec4(uInterior, 1.0);
+                return;
+            }
+            if (uDebug != 0 && (any(isnan(z)) || any(isinf(z)) || isinf(dot(z, z)))) {
+                fragColor = vec4(1.0, 0.0, 1.0, 1.0);
                 return;
             }
             fragColor = vec4(shade(n, z), 1.0);

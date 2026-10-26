@@ -138,6 +138,13 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
 
     @Volatile var interactive = false
 
+    /** Colours non-escaping pixels by the reason they stopped. See Shaders.COMMON. */
+    @Volatile var debugReasons = false
+        set(value) {
+            field = value
+            markDirty()
+        }
+
     /** 0 = always native, 1 = drop resolution only if frames get slow, 2 = always fast. */
     @Volatile var motionQuality: Int = QUALITY_ADAPTIVE
 
@@ -795,6 +802,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
     // --- Draw paths -------------------------------------------------------------------
 
     private fun applyColorUniforms(u: HashMap<String, Int>) {
+        GLES31.glUniform1i(u["uDebug"]!!, if (debugReasons) 1 else 0)
         val p = palette
         GLES31.glUniform1f(u["uCycle"]!!, p.cycleLength.coerceAtLeast(2f))
         GLES31.glUniform1f(u["uOffset"]!!, p.offset)
@@ -2636,7 +2644,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
         const val COARSE_STEPS = 2
 
         private val SHARED_UNIFORMS = arrayOf(
-            "uResolution", "uMaxIter", "uPalette", "uCycle", "uOffset", "uInterior",
+            "uResolution", "uMaxIter", "uPalette", "uCycle", "uOffset", "uInterior", "uDebug",
             "uTiles", "uTileSize", "uUseTiles",
             "uStripRBase", "uStripRowBase", "uStripStep", "uStripWidth"
         )

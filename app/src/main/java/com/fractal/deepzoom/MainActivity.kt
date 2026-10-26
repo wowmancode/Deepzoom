@@ -49,6 +49,17 @@ class MainActivity : AppCompatActivity() {
         motionSlider = findViewById(R.id.motion_slider)
         motionLabel = findViewById(R.id.motion_label)
         readout = findViewById(R.id.readout)
+        // Hidden diagnostic: long-press the readout to colour pixels that do not escape
+        // by the reason (blue iterations, red cycle check, yellow NaN/inf, cyan tile).
+        readout.setOnLongClickListener {
+            view.renderer.debugReasons = !view.renderer.debugReasons
+            view.requestRender()
+            toast(if (view.renderer.debugReasons)
+                "Diagnostics on: blue = out of iterations, red = cycle check, " +
+                    "yellow = NaN/inf, cyan = solid tile, magenta = bad escape"
+            else "Diagnostics off")
+            true
+        }
         status = findViewById(R.id.status)
         exporter = ExportManager(view)
 
