@@ -55,18 +55,20 @@ class BlaTable(
         /**
          * Tolerance for dropping the squared term.
          *
-         * The published formulation uses hardware epsilon (2^-24 for float32). Tested
-         * against high-precision ground truth that turned out to be too permissive:
-         * around 1e-16 to 1e-20 span it put a few percent of escaping pixels wrong by
-         * up to 340 iterations, because error in a delta amplifies chaotically over
-         * thousands of iterations near the boundary.
+         * The published formulation uses hardware epsilon (2^-24 for float32). This
+         * used to be 2^-44, chosen against a double-precision mirror of the loop, where
+         * plain perturbation is exact and so any BLA truncation shows. The shader runs
+         * in float32, though, and there it is not: near the boundary, at escape counts
+         * in the thousands, float32 perturbation with BLA switched off already puts
+         * 5-15% of pixels more than an iteration off truth, because rounding amplifies
+         * chaotically. Every tolerance from 2^-24 to 2^-44 lands below that rate, and
+         * they are indistinguishable from each other (tools/blatune).
          *
-         * 2^-44 was exact on every case tested, from 1e-10 down to 1e-55. It costs
-         * almost nothing where it matters: skipping drops from 100% to 100% at 1e-40,
-         * and from 99.9% to 89% at 1e-28. The loss is concentrated at shallow depths
-         * where iteration counts are low and BLA was never the bottleneck.
+         * What 2^-44 did cost was skipping: 2.3x more loop passes than 2^-28 summed
+         * over the test views, 2.8x at the seahorse 1e-16 view, 12x at 1e-28.
+         * 2^-28 keeps the dropped term a sixteenth of one float32 rounding per step.
          */
-        private const val EPS = 5.684341886080802e-14  // 2^-44
+        const val EPS = 3.725290298461914e-09  // 2^-28
 
         /** Beyond this, coefficients are treated as unusable rather than stored as inf. */
         private const val COEF_LIMIT = 1e30
@@ -83,7 +85,8 @@ class BlaTable(
             orbit: ReferenceOrbit,
             maxC: Double,
             scale: Double,
-            logRadius: Boolean = false
+            logRadius: Boolean = false,
+            eps: Double = EPS
         ): BlaTable? {
             // Level 0 starts at iteration 1: iteration 0 sits on the critical point,
             // where the validity radius is always zero.
@@ -129,7 +132,7 @@ class BlaTable(
                 bx[j] = 1.0
                 by[j] = 0.0
                 // |Z| is halved as a safety margin, following the reference write-up.
-                rr[j] = max(0.0, EPS * (absZ * 0.5 - maxC) / (a + 1.0))
+                rr[j] = max(0.0, eps * (absZ * 0.5 - maxC) / (a + 1.0))
             }
 
             for (k in 1 until levels) {

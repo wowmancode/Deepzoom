@@ -132,14 +132,31 @@ those composites at every power-of-two length, and a pixel takes the longest jum
 delta fits inside. Radii are non-increasing as levels merge, so the lookup climbs from
 level 0 and stops at the first failure rather than searching.
 
-Measured against high-precision ground truth, in loop iterations per pixel:
+Loop passes per pixel on the seahorse-valley views in `tools/blatune`, emulating the
+fast shader in float32 with denormals flushed:
 
-| span | without BLA | with BLA | speedup |
-|------|------------|----------|---------|
-| 1e-20 | 9069 | 4294 | 2.1x |
-| 1e-28 | 20000 | 3101 | 6.4x |
-| 1e-40 | 20000 | 37 | 540x |
-| 1e-55 | 20000 | 10 | 2000x |
+| span | without BLA | tolerance 2^-44 (old) | tolerance 2^-28 |
+|------|------------|------------------------|-----------------|
+| 1e-14 | 4410 | 4410 | 2367 |
+| 1e-16 | 8262 | 7458 | 2709 |
+| 1e-20 | 9071 | 4358 | 1780 |
+| 1e-24 | 16169 | 8156 | 2632 |
+| 1e-28 | 20000 | 3389 | 285 |
+
+**The tolerance.** BLA drops the squared term where it is below a tolerance times the
+linear ones. It used to be 2^-44, picked against a double-precision mirror of the loop,
+where plain perturbation is exact and any BLA error shows. The shader runs in float32,
+and there plain perturbation is not exact: near the boundary at escape counts in the
+thousands, 5-15% of pixels land more than an iteration off truth with BLA switched off
+entirely, because rounding error amplifies chaotically. Every tolerance from 2^-24 to
+2^-44 comes in below that rate, and they are indistinguishable from each other. 2^-28
+keeps the dropped term at a sixteenth of one float32 rounding per step, and takes 2.3x
+fewer loop passes than 2^-44 summed over the test views. `tools/blatune/run.sh` reruns
+the sweep and fails if the shipped tolerance adds float32 error beyond BLA off.
+
+The bound on |dc| the table is built for barely matters by comparison: building it for
+256x the view's real bound costs under 3% on every test view, so tables are not rebuilt
+tighter after zooming in.
 
 The speedup grows with depth, which is the opposite of how the naive loop behaves.
 
@@ -171,8 +188,8 @@ precision). Together with fixed-point, `findNucleus` went from about 400 ms to a
 - Raising the detail slider **extends** the orbit from its saved state instead of
   restarting it.
 - The delta scale is quantised to powers of 256, so the cheap repack happens every 256x
-  of zoom rather than every 2x, and BLA tables are built with a bound generous enough
-  to survive 16x of zooming out.
+  of zoom rather than every 2x, and BLA tables are built for twice the view's bound
+  on |dc| so small zoom-outs keep them.
 
 For a long zoom-out video this means one orbit for the entire render instead of one per
 couple of decades.
