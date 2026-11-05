@@ -47,9 +47,38 @@ object Shaders {
         // not change as you descend, so a pixel keeps its colour at any depth. The
         // palette is sampled with repeat wrapping, so no fract() is needed and the
         // seam blends.
+        float smoothCount(int n, vec2 z) {
+            return float(n) + 1.0 - log2(0.5 * log2(dot(z, z)));
+        }
+        // fract first: at counts in the hundreds of thousands a raw coordinate leaves
+        // too few bits for the sampler's sub-texel position on some GPUs.
+        vec3 shadeValue(float sn) {
+            return texture(uPalette, vec2(fract(sn / uCycle + uOffset), 0.5)).rgb;
+        }
         vec3 shade(int n, vec2 z) {
-            float sn = float(n) + 1.0 - log2(0.5 * log2(dot(z, z)));
-            return texture(uPalette, vec2(sn / uCycle + uOffset, 0.5)).rgb;
+            return shadeValue(smoothCount(n, z));
+        }
+
+        // Data output for the live view (uDataOut != 0). Instead of a colour, a pixel
+        // writes the 32 bits of its smooth escape count across RGBA8, and colour is
+        // applied when the frame is presented. A palette change then recolours the
+        // frame on screen in one cheap pass instead of iterating every pixel again.
+        //
+        // A pixel that does not escape writes a quiet-NaN pattern carrying the reason,
+        // DATA_CODE | reason: 1 out of iterations, 2 cycle check, 3 NaN/inf in the
+        // iteration, 4 solid tile, 5 an escape whose count is not finite. No finite
+        // count has those bits, so the two can never be confused.
+        //
+        // RGBA8 rather than a float target because it is always colour-renderable:
+        // float render targets need EXT_color_buffer_float. Each byte k is written as
+        // (k + 0.25) / 255: GL may convert to unorm by rounding or by truncating, and a
+        // quarter step lands on k under either, where k / 255 itself could truncate to
+        // k - 1. Dithering is disabled for these passes.
+        uniform int uDataOut;
+        const uint DATA_CODE = 0x7FC00000u;
+        vec4 packBits(uint b) {
+            return (vec4(float(b >> 24u), float((b >> 16u) & 255u),
+                         float((b >> 8u) & 255u), float(b & 255u)) + 0.25) / 255.0;
         }
 
         vec2 cmul(vec2 a, vec2 b) {
@@ -727,12 +756,14 @@ object Shaders {
         void main() {
             gReason = 1;
             if (tileIsSolid()) {
+                if (uDataOut != 0) { fragColor = packBits(DATA_CODE | 4u); return; }
                 fragColor = vec4(uDebug != 0 ? vec3(0.0, 1.0, 1.0) : uInterior, 1.0);
                 return;
             }
             int n;
             vec2 z;
             if (!escapes(gl_FragCoord.xy, n, z)) {
+                if (uDataOut != 0) { fragColor = packBits(DATA_CODE | uint(gReason)); return; }
                 if (uDebug != 0) {
                     vec3 c = gReason == 2 ? vec3(1.0, 0.0, 0.0)
                            : gReason == 3 ? vec3(1.0, 1.0, 0.0)
@@ -741,6 +772,13 @@ object Shaders {
                     return;
                 }
                 fragColor = vec4(uInterior, 1.0);
+                return;
+            }
+            if (uDataOut != 0) {
+                // Tested on the bits: a compiler may fold isnan/isinf away.
+                uint bits = floatBitsToUint(smoothCount(n, z));
+                if ((bits & 0x7F800000u) == 0x7F800000u) bits = DATA_CODE | 5u;
+                fragColor = packBits(bits);
                 return;
             }
             if (uDebug != 0 && (any(isnan(z)) || any(isinf(z)) || isinf(dot(z, z)))) {
@@ -899,28 +937,63 @@ object Shaders {
     val RESCALED_STRIP_TILE = "#version 310 es\n$COMMON\n$PERTURB_RESCALED_CORE\n$STRIP_TILE_BODY"
 
     /**
-     * Presents an already-rendered frame, optionally reprojected.
+     * Presents the live view's frame, optionally reprojected, and colours it.
      *
-     * When the view has moved since the frame was made, the old frame is resampled
-     * rather than recomputed, which costs one texture fetch per pixel.
+     * The frame holds escape data, not colour (see packBits), so this is where the
+     * palette is applied: a palette change costs one pass of this shader. When the
+     * view has moved since the frame was made, the old frame is resampled rather than
+     * recomputed. Resampling blends the four nearest pixels' colours, never their
+     * counts -- interpolating counts across a band edge or an interior pixel would
+     * invent colours that are in neither.
+     *
+     * uOrigin and uFit place the frame in a sub-rectangle of the window, for the
+     * colour editor's preview box: the frame's centre at one frame pixel per screen
+     * pixel, cropped to the box.
      */
     val BLIT = """
         #version 310 es
         precision highp float;
+        precision highp int;
         precision highp sampler2D;
 
         out vec4 fragColor;
 
         uniform sampler2D uScene;
-        uniform vec2  uResolution;
-        uniform vec2  uValidFrac;   // portion of the scene texture actually rendered
+        uniform vec2  uResolution;  // size of the area being drawn
+        uniform vec2  uOrigin;      // its lower-left corner in the window
+        uniform vec2  uFit;         // fraction of the frame shown on each axis
+        uniform vec2  uValidSize;   // pixels of the scene texture actually rendered
         uniform vec2  uShift;       // view movement since the frame was made
         uniform float uZoom;        // span ratio since the frame was made
         uniform vec3  uBackground;
 
+        uniform sampler2D uPalette;
+        uniform float uCycle;
+        uniform float uOffset;
+        uniform vec3  uInterior;
+        uniform int   uDebug;
+
+        const uint DATA_CODE = 0x7FC00000u;
+
+        vec3 colourAt(ivec2 p) {
+            uvec4 b = uvec4(texelFetch(uScene, p, 0) * 255.0 + 0.5);
+            uint bits = (b.r << 24u) | (b.g << 16u) | (b.b << 8u) | b.a;
+            if ((bits & 0x7F800000u) == 0x7F800000u) {
+                uint code = (bits & 0xFFFFFF00u) == DATA_CODE ? (bits & 255u) : 5u;
+                if (uDebug == 0) return uInterior;
+                return code == 2u ? vec3(1.0, 0.0, 0.0)
+                     : code == 3u ? vec3(1.0, 1.0, 0.0)
+                     : code == 4u ? vec3(0.0, 1.0, 1.0)
+                     : code == 5u ? vec3(1.0, 0.0, 1.0)
+                     : vec3(0.0, 0.3, 1.0);
+            }
+            float sn = uintBitsToFloat(bits);
+            return texture(uPalette, vec2(fract(sn / uCycle + uOffset), 0.5)).rgb;
+        }
+
         void main() {
-            vec2 s = gl_FragCoord.xy / uResolution;
-            vec2 q = vec2(0.5) + uShift + (s - vec2(0.5)) * uZoom;
+            vec2 s = (gl_FragCoord.xy - uOrigin) / uResolution;
+            vec2 q = vec2(0.5) + uShift + (s - vec2(0.5)) * uFit * uZoom;
 
             // Anything the old frame never covered stays background rather than
             // smearing edge pixels across newly exposed area.
@@ -928,7 +1001,22 @@ object Shaders {
                 fragColor = vec4(uBackground, 1.0);
                 return;
             }
-            fragColor = vec4(texture(uScene, q * uValidFrac).rgb, 1.0);
+
+            vec2 t = q * uValidSize - 0.5;
+            vec2 fl = floor(t);
+            vec2 f = t - fl;
+            ivec2 i0 = ivec2(fl);
+            ivec2 hi = ivec2(uValidSize) - 1;
+            ivec2 a = clamp(i0, ivec2(0), hi);
+            ivec2 c = clamp(i0 + 1, ivec2(0), hi);
+            vec3 c00 = colourAt(a);
+            // At native resolution and no movement every sample lands on a texel
+            // centre, so skip the other three fetches there.
+            if (f.x == 0.0 && f.y == 0.0) { fragColor = vec4(c00, 1.0); return; }
+            vec3 c10 = colourAt(ivec2(c.x, a.y));
+            vec3 c01 = colourAt(ivec2(a.x, c.y));
+            vec3 c11 = colourAt(c);
+            fragColor = vec4(mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y), 1.0);
         }
     """.trimIndent()
 }

@@ -39,9 +39,12 @@ supplies the Gradle CLI instead.
   ratio, resolution, frame rate, zoom-out per frame, and quality are all adjustable,
   and the dialog shows resulting frame count, duration, and bitrate before you commit.
   H.264 MP4 in Movies/DeepZoom.
-- **Colors** — nine presets, adjustable band width and rotation, custom palettes as a
-  list of hex values, and a custom interior colour. The fractal updates live as you
-  drag, which is the only honest way to judge band width.
+- **Colors** — a full-screen editor. The top of the screen stays a live preview of
+  the current spot (drag or pinch inside it to check other places), and every change
+  shows there immediately. Below it: the gradient with draggable stops (tap the bar to
+  add one, any number of them, at any position), a hue/saturation/value picker with a
+  hex field for the selected stop or the interior colour, band width and rotation,
+  and the nine presets. Apply keeps the result; Cancel or Back restores what you had.
 - **Copy position / Go to** — location and palette as a text code, and back again.
 
 Height sets the vertical span in every ratio, so a wider ratio reveals more of the
@@ -256,8 +259,19 @@ that made the whole image rotate through the palette as you zoomed. Band width i
 instead set directly, in iterations per trip around the palette.
 
 Palettes are rendered to a 1024-wide ramp texture and sampled with linear filtering and
-repeat wrapping, which is what gives the blending and a seamless wrap. Any number of
-colour stops works without touching the shader.
+repeat wrapping, which is what gives the blending and a seamless wrap. Stops can sit
+anywhere around the cycle; evenly spaced ones (every preset) build the same ramp, byte
+for byte, as before stop positions existed, and their position codes are unchanged.
+
+**The live view stores escape data, not colour.** Each pixel writes the 32 bits of its
+smooth escape count across the RGBA8 scene texture, or a NaN pattern carrying why it
+did not escape, and the present pass applies the palette. A palette change therefore
+recolours what is on screen in one cheap pass instead of iterating every pixel again,
+which is what makes the editor live. RGBA8 is used because it is always renderable
+(float targets need an extension); each byte is written as (k + 0.25)/255 so it lands
+on k whether the driver rounds or truncates, and dithering is off. Exports and the
+video strip still write colour directly. Checked on Mesa's GLES 3.2 driver: data mode
+plus present matches direct colour output within one level on every pixel.
 
 ### Interior row skipping on the strip
 
@@ -352,6 +366,11 @@ then compiles every shader with `glslangValidator`. No Android SDK or Gradle nee
 The compiler version must match `build.gradle.kts` and the script refuses to run if it
 does not — 1.9.x is K1 and 2.0+ is K2, and K2 accepts code K1 rejects. See
 `tools/harness/README.md`.
+
+`tools/present/run.sh` runs the live view's shaders on a real GLES 3.1 driver (Mesa
+llvmpipe, no GPU needed) and checks that escape data presented through the palette
+matches direct colour output, and that the colour editor's preview box is an exact
+centre crop.
 
 `tools/model_strip_freeze.py` and `tools/model_ring_contents.py` model the zoom-video
 strip pipeline — geometry, the per-frame row window, the ring-buffer bookkeeping, and

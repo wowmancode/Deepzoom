@@ -25,12 +25,26 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
     var onOrbitStateChanged: ((building: Boolean) -> Unit)? = null
     var requestRender: (() -> Unit)? = null
 
+    /**
+     * Setting this recolours the frame on screen without re-iterating it: the live
+     * view's scene holds escape data and colour is applied when it is presented. So
+     * the scene stays valid, and the next frame only has to present it.
+     */
     @Volatile var palette: PaletteSpec = Palettes.PRESETS[0]
         set(value) {
             field = value
             paletteDirty = true
-            sceneGen++
         }
+
+    /**
+     * When set, the frame is presented into this window rectangle (x, y from the
+     * bottom, width, height) instead of the whole surface: its centre at one frame
+     * pixel per screen pixel, cropped to fit. The colour editor's preview box.
+     */
+    @Volatile var previewBox: IntArray? = null
+
+    /** True while drawing the live scene, whose pixels hold data rather than colour. */
+    private var dataOut = false
     @Volatile private var paletteDirty = true
 
     private var directProgram = 0
@@ -89,9 +103,10 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
     private var sceneTex2 = 0
 
     /**
-     * Bumped by anything that changes what a pixel looks like: markDirty (zoom,
-     * iterations, resolution, a new orbit, a new position) and the palette. A frame
-     * may only be reused while the generation it was drawn at is still current.
+     * Bumped by anything that changes what a pixel holds: markDirty (zoom, iterations,
+     * resolution, a new orbit, a new position). The palette is not among them, since
+     * the scene holds escape data and colour is applied at present. A frame may only
+     * be reused while the generation it was drawn at is still current.
      */
     @Volatile private var sceneGen = 0
 
@@ -243,7 +258,13 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
 
         blitProgram = buildProgram(Shaders.VERTEX, Shaders.BLIT)
         cacheUniforms(blitProgram, blit,
-            "uScene", "uResolution", "uValidFrac", "uShift", "uZoom", "uBackground")
+            "uScene", "uResolution", "uOrigin", "uFit", "uValidSize", "uShift", "uZoom",
+            "uBackground", "uPalette", "uCycle", "uOffset", "uInterior", "uDebug")
+
+        // The live scene stores 32-bit counts across RGBA8 (Shaders.packBits). That
+        // only round-trips if each channel is written as-is; dithering is allowed to
+        // perturb it. Nothing else here benefits from dithering either.
+        GLES31.glDisable(GLES31.GL_DITHER)
 
         val ids = IntArray(1)
         GLES31.glGenVertexArrays(1, ids, 0)
@@ -526,6 +547,15 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
 
     /** Renders the fractal into the lower-left sub-rect of the scene texture. */
     private fun renderSceneAtLevel(level: Int, measure: Boolean) {
+        dataOut = true
+        try {
+            renderSceneAtLevelData(level, measure)
+        } finally {
+            dataOut = false
+        }
+    }
+
+    private fun renderSceneAtLevelData(level: Int, measure: Boolean) {
         val startNs = System.nanoTime()
         ensureSceneTarget(surfaceW, surfaceH)
         val w = max(1, surfaceW shr level)
@@ -671,6 +701,15 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
      * Returns false when the frame cannot be reused, and the caller draws in full.
      */
     private fun panScene(level: Int): Boolean {
+        dataOut = true
+        try {
+            return panSceneData(level)
+        } finally {
+            dataOut = false
+        }
+    }
+
+    private fun panSceneData(level: Int): Boolean {
         if (!sceneReusable(level)) return false
         val w = snapW
         val h = snapH
@@ -777,13 +816,27 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
             zoom = state.spanY / snapSpanY
         }
 
+        // Whole surface, or the editor's preview box: the frame's centre, one frame
+        // pixel per screen pixel, so the box crops rather than squashes.
+        val box = previewBox
+        val bx = box?.get(0) ?: 0
+        val by = box?.get(1) ?: 0
+        val bw = (box?.get(2) ?: surfaceW).coerceIn(1, surfaceW)
+        val bh = (box?.get(3) ?: surfaceH).coerceIn(1, surfaceH)
+        if (box != null) {
+            GLES31.glViewport(0, 0, surfaceW, surfaceH)
+            GLES31.glClear(GLES31.GL_COLOR_BUFFER_BIT)
+        }
+        GLES31.glViewport(bx, by, bw, bh)
+
         GLES31.glUseProgram(blitProgram)
         GLES31.glBindVertexArray(vao)
-        GLES31.glUniform2f(blit["uResolution"]!!, surfaceW.toFloat(), surfaceH.toFloat())
+        GLES31.glUniform2f(blit["uResolution"]!!, bw.toFloat(), bh.toFloat())
+        GLES31.glUniform2f(blit["uOrigin"]!!, bx.toFloat(), by.toFloat())
         GLES31.glUniform2f(
-            blit["uValidFrac"]!!,
-            snapW.toFloat() / sceneW, snapH.toFloat() / sceneH
+            blit["uFit"]!!, bw.toFloat() / surfaceW, bh.toFloat() / surfaceH
         )
+        GLES31.glUniform2f(blit["uValidSize"]!!, snapW.toFloat(), snapH.toFloat())
         GLES31.glUniform2f(blit["uShift"]!!, shiftX.toFloat(), shiftY.toFloat())
         GLES31.glUniform1f(blit["uZoom"]!!, zoom.toFloat())
         val p = palette
@@ -793,16 +846,28 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
             ((p.interior shr 8) and 0xFF) / 255f,
             (p.interior and 0xFF) / 255f
         )
+        GLES31.glUniform1f(blit["uCycle"]!!, p.cycleLength.coerceAtLeast(2f))
+        GLES31.glUniform1f(blit["uOffset"]!!, p.offset)
+        GLES31.glUniform3f(
+            blit["uInterior"]!!,
+            ((p.interior shr 16) and 0xFF) / 255f,
+            ((p.interior shr 8) and 0xFF) / 255f,
+            (p.interior and 0xFF) / 255f
+        )
+        GLES31.glUniform1i(blit["uDebug"]!!, if (debugReasons) 1 else 0)
         bindTexture(4, sceneTex, blit["uScene"]!!)
+        bindTexture(3, paletteTexture, blit["uPalette"]!!)
 
         GLES31.glDrawArrays(GLES31.GL_TRIANGLES, 0, 3)
         GLES31.glBindVertexArray(0)
+        GLES31.glViewport(0, 0, surfaceW, surfaceH)
     }
 
     // --- Draw paths -------------------------------------------------------------------
 
     private fun applyColorUniforms(u: HashMap<String, Int>) {
         GLES31.glUniform1i(u["uDebug"]!!, if (debugReasons) 1 else 0)
+        GLES31.glUniform1i(u["uDataOut"]!!, if (dataOut) 1 else 0)
         val p = palette
         GLES31.glUniform1f(u["uCycle"]!!, p.cycleLength.coerceAtLeast(2f))
         GLES31.glUniform1f(u["uOffset"]!!, p.offset)
@@ -2648,6 +2713,7 @@ class MandelbrotRenderer(private val state: ViewState) : GLSurfaceView.Renderer 
 
         private val SHARED_UNIFORMS = arrayOf(
             "uResolution", "uMaxIter", "uPalette", "uCycle", "uOffset", "uInterior", "uDebug",
+            "uDataOut",
             "uTiles", "uTileSize", "uUseTiles",
             "uStripRBase", "uStripRowBase", "uStripStep", "uStripWidth"
         )

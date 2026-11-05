@@ -122,8 +122,18 @@ class MainActivity : AppCompatActivity() {
             runOnUiThread { status.visibility = if (busy) View.VISIBLE else View.GONE }
         }
         view.setOnTouchListener { v, e ->
-            wake()
-            v.onTouchEvent(e)
+            val editor = colorEditor
+            if (editor == null) {
+                wake()
+                return@setOnTouchListener v.onTouchEvent(e)
+            }
+            // The colour editor shows the view's centre in a box at the top. Shift its
+            // touches so a pinch there zooms about the point under your fingers.
+            val dy = editor.touchOffsetY
+            e.offsetLocation(0f, dy)
+            val handled = v.onTouchEvent(e)
+            e.offsetLocation(0f, -dy)
+            handled
         }
 
         updateReadout()
@@ -346,88 +356,28 @@ class MainActivity : AppCompatActivity() {
         }.start()
     }
 
+    private var colorEditor: ColorEditor? = null
+
+    /**
+     * Opens the full-screen colour editor. The main controls step aside while it is
+     * open; the editor restores them, and the palette it started with on Cancel.
+     */
     private fun showPaletteDialog() {
-        val content = LayoutInflater.from(this).inflate(R.layout.dialog_palette, null)
-        val preview = content.findViewById<View>(R.id.c_preview)
-        val presetSlider = content.findViewById<Slider>(R.id.c_preset)
-        val cycleSlider = content.findViewById<Slider>(R.id.c_cycle)
-        val offsetSlider = content.findViewById<Slider>(R.id.c_offset)
-        val presetLabel = content.findViewById<TextView>(R.id.c_preset_label)
-        val cycleLabel = content.findViewById<TextView>(R.id.c_cycle_label)
-        val offsetLabel = content.findViewById<TextView>(R.id.c_offset_label)
-        val custom = content.findViewById<EditText>(R.id.c_custom)
-        val interior = content.findViewById<EditText>(R.id.c_interior)
+        if (colorEditor != null) return
+        controls.removeCallbacks(dimRunnable)
+        controls.visibility = View.GONE
+        val host = view.parent as android.widget.FrameLayout
+        colorEditor = ColorEditor(this, host, view) {
+            colorEditor = null
+            controls.visibility = View.VISIBLE
+            wake()
+        }.also { it.open() }
+    }
 
-        val startingPalette = view.renderer.palette
-        presetSlider.valueTo = (Palettes.PRESETS.size - 1).toFloat()
-
-        val presetIndex = Palettes.PRESETS.indexOfFirst { it.name == startingPalette.name }
-        presetSlider.value = (if (presetIndex >= 0) presetIndex else 0).toFloat()
-        // Cycle length is a log slider: the useful range spans 4 to 8192 iterations per
-        // trip, and a linear control would bunch everything usable into one end.
-        cycleSlider.value = (ln(startingPalette.cycleLength.toDouble()) / ln(2.0))
-            .toFloat().coerceIn(2f, 13f)
-        offsetSlider.value = startingPalette.offset.coerceIn(0f, 1f)
-        if (presetIndex < 0) {
-            custom.setText(startingPalette.colors.joinToString(", ") { "#%06x".format(it) })
-        }
-        interior.setText("#%06x".format(startingPalette.interior and 0xFFFFFF))
-
-        fun current(): PaletteSpec {
-            val base = Palettes.PRESETS[presetSlider.value.toInt()]
-            val typed = PaletteSpec.parseColors(custom.text.toString())
-            val inside = PaletteSpec.parseColors(
-                interior.text.toString() + "," + interior.text.toString()
-            )?.firstOrNull() ?: 0x000000
-            return base.copy(
-                name = if (typed != null) "Custom" else base.name,
-                colors = typed ?: base.colors,
-                interior = inside,
-                cycleLength = 2.0.pow(cycleSlider.value.toDouble()).toFloat(),
-                offset = offsetSlider.value
-            )
-        }
-
-        fun refresh() {
-            val spec = current()
-            presetLabel.text = "Palette — ${spec.name}"
-            cycleLabel.text = "Band width — %.0f iterations per cycle".format(spec.cycleLength)
-            offsetLabel.text = "Rotation — %.0f%%".format(spec.offset * 100)
-
-            // Repeat the first stop at the end so the preview shows the wrap-around the
-            // shader actually samples.
-            val stops = (spec.colors + spec.colors.first())
-                .map { 0xFF000000.toInt() or it }.toIntArray()
-            preview.background = GradientDrawable(
-                GradientDrawable.Orientation.LEFT_RIGHT, stops
-            )
-            // Live preview: the fractal updates as you drag, which is the only way to
-            // judge band width honestly.
-            view.renderer.palette = spec
-            view.requestRender()
-        }
-
-        presetSlider.addOnChangeListener { _, _, _ ->
-            custom.setText("")
-            refresh()
-        }
-        cycleSlider.addOnChangeListener { _, _, _ -> refresh() }
-        offsetSlider.addOnChangeListener { _, _, _ -> refresh() }
-        refresh()
-
-        AlertDialog.Builder(this)
-            .setTitle("Colours")
-            .setView(content)
-            .setNegativeButton("Cancel") { _, _ ->
-                view.renderer.palette = startingPalette
-                view.requestRender()
-            }
-            .setPositiveButton("Apply") { _, _ ->
-                view.renderer.palette = current()
-                view.requestRender()
-                wake()
-            }
-            .show()
+    @Deprecated("Back closes the colour editor first")
+    override fun onBackPressed() {
+        val editor = colorEditor
+        if (editor != null) editor.cancel() else @Suppress("DEPRECATION") super.onBackPressed()
     }
 
     // --- PNG --------------------------------------------------------------------------

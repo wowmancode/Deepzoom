@@ -22,25 +22,52 @@ data class PaletteSpec(
     val colors: List<Int>,
     val interior: Int = 0x000000,
     val cycleLength: Float = 64f,
-    val offset: Float = 0f
+    val offset: Float = 0f,
+    /**
+     * Where each stop sits around the cycle, in [0, 1), one per colour and ascending.
+     * Null means evenly spaced, which is what every preset and every older position
+     * code uses.
+     */
+    val positions: List<Float>? = null
 ) {
+    /** Stop positions, evenly spaced when none were set. */
+    fun stopPositions(): List<Float> =
+        positions?.takeIf { it.size == colors.size }
+            ?: List(colors.size) { it.toFloat() / colors.size }
+
     fun encode(): String {
         val hex = colors.joinToString(",") { "%06x".format(it and 0xFFFFFF) }
-        return "$hex;%06x;%.3f;%.4f".format(interior and 0xFFFFFF, cycleLength, offset)
+        // Locale.ROOT: in a comma-decimal locale "%.3f" writes "64,000", which neither
+        // toFloat nor the comma-separated fields below can read back.
+        val head = "$hex;%06x;%.3f;%.4f".format(
+            java.util.Locale.ROOT, interior and 0xFFFFFF, cycleLength, offset
+        )
+        // A fifth field only when the stops are not evenly spaced, so codes for even
+        // palettes stay readable by builds that predate positions.
+        val pos = positions?.takeIf { it.size == colors.size } ?: return head
+        return head + ";" + pos.joinToString(",") { "%.4f".format(java.util.Locale.ROOT, it) }
     }
 
     companion object {
         fun decode(text: String): PaletteSpec? {
             return try {
                 val parts = text.split(";")
-                if (parts.size != 4) return null
+                if (parts.size != 4 && parts.size != 5) return null
                 val colors = parseColors(parts[0]) ?: return null
+                val positions = if (parts.size == 5) {
+                    parts[4].split(",").map { it.trim().toFloat() }
+                        .takeIf { p -> p.size == colors.size && p.all { it in 0f..1f } }
+                } else null
+                // Sorted together, so a hand-edited code with stops out of order still
+                // means what it says.
+                val order = positions?.indices?.sortedBy { positions[it] }
                 PaletteSpec(
                     name = "Custom",
-                    colors = colors,
+                    colors = order?.map { colors[it] } ?: colors,
                     interior = parts[1].toInt(16),
                     cycleLength = parts[2].toFloat().coerceIn(2f, 100000f),
-                    offset = parts[3].toFloat()
+                    offset = parts[3].toFloat(),
+                    positions = order?.map { positions[it] }
                 )
             } catch (e: Exception) {
                 null
@@ -95,25 +122,59 @@ object Palettes {
      * stop counts without any shader changes.
      */
     fun buildRamp(spec: PaletteSpec): ByteArray {
-        val stops = if (spec.colors.size >= 2) spec.colors else listOf(0x000000, 0xffffff)
-        val n = stops.size
+        val valid = spec.colors.size >= 2
+        val stops = if (valid) spec.colors else listOf(0x000000, 0xffffff)
+        val pos = if (valid) exactPositions(spec) else null
         val out = ByteArray(TEXTURE_WIDTH * 4)
-
         for (i in 0 until TEXTURE_WIDTH) {
-            val p = i.toDouble() / TEXTURE_WIDTH * n
-            val seg = p.toInt()
-            val f = p - seg
-            val a = stops[seg % n]
-            val b = stops[(seg + 1) % n]
-
+            val c = colorAt(stops, pos, i.toDouble() / TEXTURE_WIDTH)
             val o = i * 4
-            out[o] = lerpChannel(a shr 16, b shr 16, f)
-            out[o + 1] = lerpChannel(a shr 8, b shr 8, f)
-            out[o + 2] = lerpChannel(a, b, f)
+            out[o] = (c shr 16).toByte()
+            out[o + 1] = (c shr 8).toByte()
+            out[o + 2] = c.toByte()
             out[o + 3] = 255.toByte()
         }
         return out
     }
+
+    /**
+     * Colour at x in [0, 1) around the cycle, blending linearly between the stops on
+     * either side and wrapping from the last stop back to the first. With evenly
+     * spaced stops this is exactly the ramp the app has always built.
+     */
+    /** Stop positions in double, or null for even spacing (see colorAt). */
+    fun exactPositions(spec: PaletteSpec): DoubleArray? {
+        val n = spec.colors.size
+        val p = spec.positions?.takeIf { it.size == n } ?: return null
+        return DoubleArray(n) { p[it].toDouble() }
+    }
+
+    fun colorAt(stops: List<Int>, pos: DoubleArray?, xIn: Double): Int {
+        val n = stops.size
+        var x = xIn - kotlin.math.floor(xIn)
+        if (pos == null) {
+            // Even spacing, computed exactly as the ramp always was.
+            val p = x * n
+            val seg = p.toInt().coerceIn(0, n - 1)
+            return blend(stops[seg], stops[(seg + 1) % n], p - seg)
+        }
+        var k = n - 1
+        while (k >= 0 && pos[k] > x) k--
+        if (k < 0) { k = n - 1; x += 1.0 }      // before the first stop: wrap segment
+        val pa = pos[k]
+        val pb = if (k + 1 < n) pos[k + 1] else pos[0] + 1.0
+        val f = if (pb > pa) ((x - pa) / (pb - pa)).coerceIn(0.0, 1.0) else 0.0
+        return blend(stops[k], stops[(k + 1) % n], f)
+    }
+
+    private fun blend(a: Int, b: Int, f: Double): Int {
+        val r = lerpChannel(a shr 16, b shr 16, f).toInt() and 0xFF
+        val g = lerpChannel(a shr 8, b shr 8, f).toInt() and 0xFF
+        val bl = lerpChannel(a, b, f).toInt() and 0xFF
+        return (r shl 16) or (g shl 8) or bl
+    }
+
+    fun colorAt(spec: PaletteSpec, x: Double): Int = colorAt(spec.colors, exactPositions(spec), x)
 
     private fun lerpChannel(a: Int, b: Int, f: Double): Byte {
         val av = (a and 0xFF).toDouble()
