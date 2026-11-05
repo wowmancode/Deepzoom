@@ -2,6 +2,9 @@
 package com.fractal.deepzoom
 
 import android.annotation.SuppressLint
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.widget.Toast
 import android.content.Context
 import android.content.res.ColorStateList
 import android.graphics.Bitmap
@@ -71,6 +74,7 @@ class ColorEditor(
     private var interior = original.interior and 0xFFFFFF
     private var cycle = original.cycleLength
     private var offset = original.offset
+    private var ease = original.ease
 
     private val overlay = FrameLayout(ctx)
     private val boxEdge = View(ctx)
@@ -88,6 +92,9 @@ class ColorEditor(
     private val cycleSlider = Slider(ctx)
     private val offsetSlider = Slider(ctx)
     private val deleteButton: TextView
+    private val easeButton: TextView
+    private val countField = EditText(ctx)
+    private val seedField = EditText(ctx)
     private var updatingHex = false
     private var boxH = 0
 
@@ -111,6 +118,7 @@ class ColorEditor(
             it.onChange = { rgb -> setTargetColor(rgb, fromPicker = true) }
         }
         deleteButton = chip("Delete stop") { deleteSelected() }
+        easeButton = chip("") { ease = !ease; push() }
         build()
     }
 
@@ -184,7 +192,8 @@ class ColorEditor(
             interior = interior,
             cycleLength = cycle,
             offset = offset,
-            positions = if (even) null else s.map { it.pos }
+            positions = if (even) null else s.map { it.pos },
+            ease = ease
         )
     }
 
@@ -195,6 +204,7 @@ class ColorEditor(
         bar.invalidate()
         nameLabel.text = name
         deleteButton.alpha = if (stops.size > 2) 1f else 0.35f
+        easeButton.text = if (ease) "KF blend: on" else "KF blend: off"
     }
 
     private fun select(s: ColorStop) {
@@ -251,8 +261,61 @@ class ColorEditor(
         push()
     }
 
+    /** Takes everything from a pasted palette: stops, band width, rotation, interior. */
+    private fun loadWhole(p: PaletteSpec) {
+        interior = p.interior and 0xFFFFFF
+        cycle = p.cycleLength
+        offset = p.offset
+        ease = p.ease
+        name = p.name
+        loadStops(p)
+        select(stops.first())
+        refreshAll()
+        push()
+    }
+
+    /** Random key colours, made the way Kalles Fraktaler makes them. */
+    private fun randomize(waves: Boolean, newSeed: Boolean) {
+        val count = countField.text.toString().trim().toIntOrNull()
+            ?.coerceIn(2, KfPalette.MAX_KEYS) ?: 12
+        var seed = seedField.text.toString().trim().toLongOrNull()?.coerceIn(0L, 0xFFFFFFFFL) ?: 0L
+        // KF draws a new seed with rand(), so 0..32767.
+        if (newSeed) seed = (Math.random() * 32768).toLong()
+        countField.setText(count.toString())
+        seedField.setText(seed.toString())
+        val colours = if (waves) KfPalette.randomWaves(count, seed).colors
+                      else KfPalette.randomKeys(count, seed)
+        name = (if (waves) "Waves " else "Random ") + seed
+        ease = true
+        loadStops(PaletteSpec(name, colours))
+        select(stops.first())
+        push()
+    }
+
+    private fun copyPalette() {
+        val clip = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        clip.setPrimaryClip(ClipData.newPlainText("DeepZoom palette", spec().encode()))
+        Toast.makeText(ctx, "Palette copied", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun pastePalette() {
+        val clip = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        val text = clip.primaryClip?.takeIf { it.itemCount > 0 }
+            ?.getItemAt(0)?.coerceToText(ctx)?.toString() ?: ""
+        val p = PalettePaste.parse(text, spec())
+        if (p == null) {
+            Toast.makeText(ctx,
+                "Nothing to paste: copy a palette code, a position code, KF palette text " +
+                    "or hex colours first", Toast.LENGTH_LONG).show()
+            return
+        }
+        loadWhole(p)
+        Toast.makeText(ctx, "Pasted ${p.colors.size} colours", Toast.LENGTH_SHORT).show()
+    }
+
     private fun loadPreset(p: PaletteSpec) {
         name = p.name
+        ease = p.ease
         loadStops(p)
         select(stops.first())
         push()
@@ -361,6 +424,11 @@ class ColorEditor(
             chip("Spread evenly") { spreadEvenly() },
             chip("Reverse") { reverse() }
         ), lp(top = 8f))
+        content.addView(row(
+            chip("Copy") { copyPalette() },
+            chip("Paste") { pastePalette() },
+            easeButton
+        ), lp(top = 6f))
 
         // What the picker edits: the selected stop or the interior. Tap to choose.
         stopLabel.text = "Stop"
@@ -442,6 +510,35 @@ class ColorEditor(
         content.addView(cycleSlider, lp())
         content.addView(offsetLabel, lp(top = 2f))
         content.addView(offsetSlider, lp())
+
+        // Random palettes, generated as Kalles Fraktaler does. The seed is shown so a
+        // result can be made again, and gives the same key colours KF gives for it.
+        content.addView(hint("Random (Kalles Fraktaler) — colours and seed"), lp(top = 10f))
+        for ((f, w) in listOf(countField to 64f, seedField to 120f)) {
+            f.textSize = 14f
+            f.setTextColor(0xFFE4E8F0.toInt())
+            f.setSingleLine()
+            f.inputType = InputType.TYPE_CLASS_NUMBER
+            f.imeOptions = EditorInfo.IME_ACTION_DONE
+            f.importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO
+            f.backgroundTintList = ColorStateList.valueOf(0xFF7FA6D8.toInt())
+            f.layoutParams = LinearLayout.LayoutParams(dp(w), ViewGroup.LayoutParams.WRAP_CONTENT)
+            f.setOnEditorActionListener { _, _, _ -> hideKeyboard(); true }
+        }
+        countField.setText(stops.size.coerceIn(2, KfPalette.MAX_KEYS).toString())
+        seedField.setText("1")
+        content.addView(LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(countField)
+            addView(View(ctx), LinearLayout.LayoutParams(dp(12f), 1))
+            addView(seedField)
+        }, lp())
+        content.addView(row(
+            chip("New seed") { randomize(waves = false, newSeed = true) },
+            chip("Use seed") { randomize(waves = false, newSeed = false) },
+            chip("Random waves") { randomize(waves = true, newSeed = true) }
+        ), lp(top = 4f))
 
         // Presets: tap to start from one. Band width, rotation and interior are kept.
         content.addView(hint("Presets"), lp(top = 8f))
@@ -525,8 +622,10 @@ class ColorEditor(
 
     private fun hideKeyboard() {
         val imm = ctx.getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
-        imm?.hideSoftInputFromWindow(hex.windowToken, 0)
+        imm?.hideSoftInputFromWindow(overlay.windowToken, 0)
         hex.clearFocus()
+        countField.clearFocus()
+        seedField.clearFocus()
     }
 
     companion object {
@@ -598,7 +697,18 @@ class GradientBarView(ctx: Context) : View(ctx) {
 
         val r = 9f * density
         val cy = barBottom() + markerZone * 0.5f
+        // A random KF palette can have hundreds of stops; draw those as ticks and keep
+        // a full marker only for the selected one.
+        if (stops.size > MANY) {
+            stroke.color = 0x90FFFFFF.toInt()
+            stroke.strokeWidth = density
+            for (st in stops) {
+                val x = xOf(st.pos)
+                canvas.drawLine(x, barBottom(), x, barBottom() + 6f * density, stroke)
+            }
+        }
         for (st in stops) {
+            if (stops.size > MANY && st !== selected) continue
             val x = xOf(st.pos)
             val sel = st === selected
             stroke.color = if (sel) 0xFFFFFFFF.toInt() else 0xB0FFFFFF.toInt()
@@ -649,7 +759,10 @@ class GradientBarView(ctx: Context) : View(ctx) {
         return super.onTouchEvent(e)
     }
 
-    companion object { private const val RAMP = 256 }
+    companion object {
+        private const val RAMP = 256
+        private const val MANY = 48
+    }
 }
 
 /**

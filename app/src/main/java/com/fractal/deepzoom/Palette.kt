@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 package com.fractal.deepzoom
 
+import kotlin.math.PI
 import kotlin.math.max
+import kotlin.math.sin
 import kotlin.math.roundToInt
 
 /**
@@ -28,7 +30,13 @@ data class PaletteSpec(
      * Null means evenly spaced, which is what every preset and every older position
      * code uses.
      */
-    val positions: List<Float>? = null
+    val positions: List<Float>? = null,
+    /**
+     * Blend between stops with Kalles Fraktaler's sine ease instead of linearly: each
+     * colour holds a little longer and the change between them is quicker. KF palettes
+     * look the way they do partly because of it.
+     */
+    val ease: Boolean = false
 ) {
     /** Stop positions, evenly spaced when none were set. */
     fun stopPositions(): List<Float> =
@@ -42,19 +50,21 @@ data class PaletteSpec(
         val head = "$hex;%06x;%.3f;%.4f".format(
             java.util.Locale.ROOT, interior and 0xFFFFFF, cycleLength, offset
         )
-        // A fifth field only when the stops are not evenly spaced, so codes for even
-        // palettes stay readable by builds that predate positions.
-        val pos = positions?.takeIf { it.size == colors.size } ?: return head
-        return head + ";" + pos.joinToString(",") { "%.4f".format(java.util.Locale.ROOT, it) }
+        // Extra fields only when used, so plain palettes stay readable by older builds:
+        // a fifth for uneven stop positions (empty if even), a sixth "k" for KF easing.
+        val pos = positions?.takeIf { it.size == colors.size }
+        if (pos == null && !ease) return head
+        val posText = pos?.joinToString(",") { "%.4f".format(java.util.Locale.ROOT, it) } ?: ""
+        return head + ";" + posText + (if (ease) ";k" else "")
     }
 
     companion object {
         fun decode(text: String): PaletteSpec? {
             return try {
                 val parts = text.split(";")
-                if (parts.size != 4 && parts.size != 5) return null
+                if (parts.size !in 4..6) return null
                 val colors = parseColors(parts[0]) ?: return null
-                val positions = if (parts.size == 5) {
+                val positions = if (parts.size >= 5 && parts[4].isNotBlank()) {
                     parts[4].split(",").map { it.trim().toFloat() }
                         .takeIf { p -> p.size == colors.size && p.all { it in 0f..1f } }
                 } else null
@@ -67,7 +77,8 @@ data class PaletteSpec(
                     interior = parts[1].toInt(16),
                     cycleLength = parts[2].toFloat().coerceIn(2f, 100000f),
                     offset = parts[3].toFloat(),
-                    positions = order?.map { positions[it] }
+                    positions = order?.map { positions[it] },
+                    ease = parts.size == 6 && parts[5].trim() == "k"
                 )
             } catch (e: Exception) {
                 null
@@ -127,7 +138,7 @@ object Palettes {
         val pos = if (valid) exactPositions(spec) else null
         val out = ByteArray(TEXTURE_WIDTH * 4)
         for (i in 0 until TEXTURE_WIDTH) {
-            val c = colorAt(stops, pos, i.toDouble() / TEXTURE_WIDTH)
+            val c = colorAt(stops, pos, i.toDouble() / TEXTURE_WIDTH, spec.ease && valid)
             val o = i * 4
             out[o] = (c shr 16).toByte()
             out[o + 1] = (c shr 8).toByte()
@@ -149,21 +160,31 @@ object Palettes {
         return DoubleArray(n) { p[it].toDouble() }
     }
 
-    fun colorAt(stops: List<Int>, pos: DoubleArray?, xIn: Double): Int {
+    fun colorAt(stops: List<Int>, pos: DoubleArray?, xIn: Double, ease: Boolean = false): Int {
         val n = stops.size
         var x = xIn - kotlin.math.floor(xIn)
         if (pos == null) {
-            // Even spacing, computed exactly as the ramp always was.
             val p = x * n
             val seg = p.toInt().coerceIn(0, n - 1)
-            return blend(stops[seg], stops[(seg + 1) % n], p - seg)
+            val a = stops[seg]
+            val b = stops[(seg + 1) % n]
+            if (ease) {
+                // CFraktalSFT::UpdateColorTable, entry for entry: the 1024-wide ramp
+                // here is KF's table, truncating casts included.
+                val t = sin((p - seg - 0.5) * PI) / 2 + 0.5
+                fun ch(sh: Int) = (t * ((b shr sh) and 255) + (1 - t) * ((a shr sh) and 255)).toInt()
+                return (ch(16) shl 16) or (ch(8) shl 8) or ch(0)
+            }
+            // Even spacing, computed exactly as the ramp always was.
+            return blend(a, b, p - seg)
         }
         var k = n - 1
         while (k >= 0 && pos[k] > x) k--
         if (k < 0) { k = n - 1; x += 1.0 }      // before the first stop: wrap segment
         val pa = pos[k]
         val pb = if (k + 1 < n) pos[k + 1] else pos[0] + 1.0
-        val f = if (pb > pa) ((x - pa) / (pb - pa)).coerceIn(0.0, 1.0) else 0.0
+        var f = if (pb > pa) ((x - pa) / (pb - pa)).coerceIn(0.0, 1.0) else 0.0
+        if (ease) f = sin((f - 0.5) * PI) / 2 + 0.5
         return blend(stops[k], stops[(k + 1) % n], f)
     }
 
@@ -174,7 +195,8 @@ object Palettes {
         return (r shl 16) or (g shl 8) or bl
     }
 
-    fun colorAt(spec: PaletteSpec, x: Double): Int = colorAt(spec.colors, exactPositions(spec), x)
+    fun colorAt(spec: PaletteSpec, x: Double): Int =
+        colorAt(spec.colors, exactPositions(spec), x, spec.ease)
 
     private fun lerpChannel(a: Int, b: Int, f: Double): Byte {
         val av = (a and 0xFF).toDouble()

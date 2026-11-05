@@ -45,6 +45,15 @@ supplies the Gradle CLI instead.
   add one, any number of them, at any position), a hue/saturation/value picker with a
   hex field for the selected stop or the interior colour, band width and rotation,
   and the nine presets. Apply keeps the result; Cancel or Back restores what you had.
+  - **Copy / Paste** — Copy puts the palette on the clipboard as a code. Paste takes
+    that code, a whole position code, Kalles Fraktaler palette text (the contents of
+    a .kfp or .kfr, or just its `Colors:` line), or a list of hex colours.
+  - **Random** — Kalles Fraktaler's two generators: random key colours from a seed
+    (the same seed gives the same colours as in KF), and random RGB sine waves with
+    prime periods. Set the number of colours, then New seed, Use seed or Random waves.
+  - **KF blend** — KF's sine ease between stops instead of a straight blend. On for
+    anything random or pasted from KF, where the 1024-entry ramp is KF's colour table
+    entry for entry.
 - **Copy position / Go to** — location and palette as a text code, and back again.
 
 Height sets the vertical span in every ratio, so a wider ratio reveals more of the
@@ -342,8 +351,14 @@ would be flagged interior.
 AGPL-3.0-or-later. Chosen over a permissive licence so improvements stay available to
 the community, and over plain GPL because it keeps the option of incorporating code
 from Kalles Fraktaler 2+ and Fraktaler 3, both AGPL, which plain GPL would not allow.
-No code from either is present; the techniques here were implemented from their
-published descriptions, and techniques are not copyrightable.
+
+`KfPalette.kt` and the eased ramp in `Palette.kt` are ported from Kalles Fraktaler 2+
+(Settings::GenerateColors, Settings::AddWave, the colour dialog's random-values button
+and CFraktalSFT::UpdateColorTable), (C) Karl Runmo, Claude Heiland-Allen et al.,
+AGPL-3.0. Checked against that code compiled as C: identical 1024-entry tables for
+both generators across key counts 2 to 1024 and six seeds. KF's MakePrime was not in
+the source used; the port takes the next prime at or above its argument. Everything
+else here was implemented from published descriptions.
 
 ### Verification
 
